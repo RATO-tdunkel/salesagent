@@ -85,7 +85,7 @@ class TestStatusesFilterReportedTruthfully:
 
             assert not result.is_error, result.error
             filters_applied = result.wire_response["query_summary"]["filters_applied"]
-            # Reported as the enum value ("approved"), not "CreativeStatus.approved".
+            # Reported as the enum value ("approved") — the coerced list the query used.
             assert "statuses=approved" in filters_applied, filters_applied
             # ...and the report is truthful: the scoped set matches what was claimed.
             returned = {c["creative_id"] for c in result.wire_response["creatives"]}

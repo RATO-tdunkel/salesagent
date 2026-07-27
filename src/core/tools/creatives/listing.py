@@ -391,8 +391,8 @@ def _list_creatives_impl(
             filters_applied.append(f"media_buy_ids={','.join(req.filters.media_buy_ids)}")
         if effective_statuses:
             # Report the value actually applied to the query (see above) so filters_applied
-            # can't drift from what scoped the result set. effective_statuses is already
-            # enum_value-coerced to "approved", not the "CreativeStatus.approved" str(enum) emits.
+            # can't drift from what scoped the result set: the same enum_value-coerced list
+            # the .in_(...) clause used.
             filters_applied.append(f"statuses={','.join(effective_statuses)}")
         if req.filters.format_ids:
             filters_applied.append(f"format_ids={','.join(str(f) for f in req.filters.format_ids)}")

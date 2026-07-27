@@ -150,6 +150,8 @@ class TestNoTransportImportsInImpl:
         ("src.core.tools.creatives._sync", "_sync_creatives_impl"),
         ("src.core.tools.creatives.listing", "_list_creatives_impl"),
         ("src.core.tools.signals", "_get_signals_impl"),
+        ("src.core.tools.accounts", "_sync_accounts_impl"),
+        ("src.core.tools.governance", "_sync_governance_impl"),
     ]
 
     @pytest.mark.parametrize("module_path,func_name", IMPL_FUNCTIONS)

@@ -36,7 +36,6 @@ from src.core.database.models import Account as DBAccount
 from src.core.database.repositories.uow import AccountUoW
 from src.core.exceptions import AdCPValidationError
 from src.core.helpers import enum_value
-from src.core.helpers.account_helpers import serialize_governance_agents
 from src.core.resolved_identity import ResolvedIdentity
 from src.core.schemas.account import (
     Account,
@@ -275,13 +274,13 @@ def _account_fields_changed(db_account: DBAccount, entry: Any) -> dict[str, Any]
     if db_sandbox != sandbox_val:
         changes["sandbox"] = entry.sandbox
 
-    # Compare governance_agents (JSON field)
-    # Both sides must be serialized to dicts for comparison — db_account.governance_agents
-    # is hydrated to list[GovernanceAgent] by JSONType, while incoming is already serialized.
-    incoming_gov = serialize_governance_agents(getattr(entry, "governance_agents", None))
-    db_gov = serialize_governance_agents(db_account.governance_agents)
-    if db_gov != incoming_gov:
-        changes["governance_agents"] = incoming_gov
+    # NOTE: governance_agents is deliberately NOT compared/updated here. It is not
+    # part of the sync_accounts request contract (the generated SyncAccountsAccount
+    # declares no such field — it is only ever seen via extra="allow", hence always
+    # absent), and it is owned by sync_governance (UC-030). Reading an absent field
+    # off `entry` yielded None, which a metadata-only re-sync then wrote back as a
+    # change → NULLing an existing governance binding (confirmed data-loss, #1682
+    # review Cluster B). sync_accounts must not touch a field outside its contract.
 
     return changes
 
@@ -562,7 +561,9 @@ async def _sync_accounts_impl(
                 # Create new account
                 billing_val = _enum_to_str(entry.billing)
                 payment_terms_val = _enum_to_str(entry.payment_terms)
-                governance_agents_val = serialize_governance_agents(getattr(entry, "governance_agents", None))
+                # governance_agents is not in the sync_accounts contract (owned by
+                # sync_governance, #1682 review Cluster B) — a fresh account starts
+                # with no binding (column defaults to NULL); it is set via UC-030.
 
                 account_id = _generate_account_id()
                 account_name = _generate_account_name(brand_domain, operator, brand_id)
@@ -605,7 +606,6 @@ async def _sync_accounts_impl(
                     billing=billing_val,
                     payment_terms=payment_terms_val,
                     sandbox=sandbox,
-                    governance_agents=governance_agents_val,
                     principal_id=principal_id,
                 )
                 repo.create(new_account)

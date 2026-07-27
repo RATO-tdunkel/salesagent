@@ -22,11 +22,13 @@ Spec grounding (pinned AdCP 3.1.1 / adcp 6.6.0):
   NEVER credentials; envelope ``status: completed`` for the synchronous path.
 - Normative MUST (sync_governance.mdx): "the seller MUST verify that the
   authenticated agent has authority over each referenced account before
-  persisting." Unknown/unresolvable accounts return per-account ``status: failed``
-  with ``ACCOUNT_NOT_FOUND``; an existing account the agent lacks authority over
-  returns ``SCOPE_INSUFFICIENT`` (standard code from the pinned error-code enum
-  that the graded BR-UC-030 storyboard checks; the .mdx prose's non-standard
-  ``UNAUTHORIZED`` is flagged upstream — see ``_sync_one_account``).
+  persisting." An account that is unknown OR exists but the agent lacks authority
+  over both return per-account ``status: failed`` with ``ACCOUNT_NOT_FOUND`` — the
+  two are indistinguishable per the ``*_NOT_FOUND`` uniform-response MUST (no
+  cross-principal enumeration oracle). This is the graded BR-UC-030
+  ``sync-no-authority`` code; ``SCOPE_INSUFFICIENT`` is NOT used (it is a
+  task-scope / ``allowed_tasks`` code this seller does not model). See
+  ``_sync_one_account`` for the full per-account error-code rationale.
 
 Credentials are never persisted: the ``accounts.governance_agents`` column model
 (core/account.json GovernanceAgent) is url-only by construction, so the binding
@@ -73,23 +75,43 @@ from src.core.validation_helpers import adcp_validation_boundary
 logger = logging.getLogger(__name__)
 
 
+# Uniform per-account response for an unresolved account. The *_NOT_FOUND
+# uniform-response MUST (pinned error-code.json: CREATIVE_NOT_FOUND /
+# SIGNAL_NOT_FOUND / PLAN_NOT_FOUND, generalized by REFERENCE_NOT_FOUND) requires
+# that "the account does not exist" and "the account exists but the caller lacks
+# authority over it" be INDISTINGUISHABLE across every observable channel —
+# otherwise the code/message is a cross-principal enumeration oracle. Both are
+# surfaced with this one code + message + suggestion (mirrors the
+# sync-governance-response.json partial-failure example).
+_UNRESOLVED_ACCOUNT_MESSAGE = "Account does not exist or is not accessible to the authenticated agent."
+_UNRESOLVED_ACCOUNT_SUGGESTION = "Use list_accounts to find accounts accessible to this agent."
+
+
 def _failed_account_result(
-    account_ref: LibraryAccountReference, code: str, exc: AdCPError
+    account_ref: LibraryAccountReference,
+    code: str,
+    *,
+    recovery: str,
+    message: str,
+    suggestion: str | None = None,
 ) -> SyncGovernanceResponseAccount:
     """Build a per-account ``failed`` result carrying a single per-account error.
 
-    ``code`` is the spec-facing per-account error code (ACCOUNT_NOT_FOUND /
-    SCOPE_INSUFFICIENT), set explicitly rather than read from the exception's wire
-    code — AdCPAuthorizationError translates to AUTH_REQUIRED on the wire, but the
-    per-account authority failure uses the standard ``SCOPE_INSUFFICIENT`` code
-    (see ``_sync_one_account`` for the spec grounding).
+    ``code`` and ``recovery`` are set together and MUST agree with the pinned
+    ``enums/error-code.json`` ``enumMetadata``. ``recovery`` is mandatory
+    (keyword-only, no default): a receiver that cannot classify an unknown code
+    falls back to ``transient`` when ``recovery`` is absent, which would auto-retry
+    a non-retryable authz/not-found failure (#1682 review A3). The code is the
+    spec-facing per-account code set explicitly, not read from the exception's wire
+    code — the authority failure is relabeled to the uniform ``ACCOUNT_NOT_FOUND``
+    (see ``_sync_one_account``).
     """
     return SyncGovernanceResponseAccount(
         account=account_ref,
         status="failed",
         errors=[
             Error(  # structural-guard: advisory per-account result in SyncGovernanceResponse.accounts[].errors[]
-                code=code, message=str(exc), suggestion=getattr(exc, "suggestion", None)
+                code=code, message=message, suggestion=suggestion, recovery=recovery
             )
         ],
     )
@@ -100,34 +122,55 @@ def _sync_one_account(
 ) -> SyncGovernanceResponseAccount:
     """Sync a single account's governance binding (authority check → persist → echo).
 
-    Per-account failures (unknown/unowned account) are returned as ``failed``
-    results, NOT raised — the overall response stays the success variant with a
-    mix of synced/failed entries (partial-failure model).
+    Per-account failures (unknown/unowned/ambiguous/blocked account) are returned
+    as ``failed`` results, NOT raised — the overall response stays the success
+    variant with a mix of synced/failed entries (partial-failure model).
 
     Per-account error codes are the standard AdCP vocabulary
-    (``enums/error-code.json``, pinned 3.1.1) that the graded BR-UC-030 storyboard
-    grades against: ``ACCOUNT_NOT_FOUND`` for an unknown/uniquely-unresolvable
-    account (matches the sync-governance-response.json partial-failure example),
-    ``SCOPE_INSUFFICIENT`` for an existing account the agent has no authority over.
-    NOTE: the sync_governance.mdx prose table names a non-standard ``UNAUTHORIZED``
-    here, which is absent from the pinned error-code enum and diverges from the
-    graded storyboard — flagged upstream for reconciliation; we emit the standard,
-    graded code.
+    (``enums/error-code.json``, pinned 3.1.1) that the graded BR-UC-030
+    ``sync-no-authority`` scenario (feature line 179) checks on the wire:
+    - ``ACCOUNT_NOT_FOUND`` (terminal) for an account that is unknown OR exists but
+      the agent has no authority over — the two are collapsed for uniform response
+      (see ``_UNRESOLVED_ACCOUNT_MESSAGE``). ``SCOPE_INSUFFICIENT`` is deliberately
+      NOT used: it is a *task-scope* code (``allowed_tasks``) per its enum
+      definition, a concept this seller does not model — ``has_access`` is a binary
+      ownership check, so a scope-shaped code would misdescribe the failure and (by
+      distinguishing exists-but-unauthorized from not-found) reintroduce the
+      enumeration oracle the uniform-response MUST forbids.
+    - ``ACCOUNT_AMBIGUOUS`` (correctable) for a natural key matching several of the
+      caller's own accounts (scoped to accessible accounts, so not an oracle).
+    - the resolver's own code + recovery for account-status blocks
+      (setup/suspended/payment), which agree by construction.
     """
     try:
         account_id = resolve_account(entry.account, identity, repo)
-    except AdCPAccountNotFoundError as e:
-        return _failed_account_result(entry.account, "ACCOUNT_NOT_FOUND", e)
-    except AdCPAuthorizationError as e:
-        return _failed_account_result(entry.account, "SCOPE_INSUFFICIENT", e)
+    except (AdCPAccountNotFoundError, AdCPAuthorizationError):
+        return _failed_account_result(
+            entry.account,
+            "ACCOUNT_NOT_FOUND",
+            recovery="terminal",
+            message=_UNRESOLVED_ACCOUNT_MESSAGE,
+            suggestion=_UNRESOLVED_ACCOUNT_SUGGESTION,
+        )
     except AdCPAccountAmbiguousError as e:
-        # A natural key matching multiple accounts cannot be resolved to a single
-        # binding target — surface as not-found (the account was not uniquely found).
-        return _failed_account_result(entry.account, "ACCOUNT_NOT_FOUND", e)
+        return _failed_account_result(
+            entry.account,
+            "ACCOUNT_AMBIGUOUS",
+            recovery="correctable",
+            message=str(e),
+            suggestion=getattr(e, "suggestion", None),
+        )
     except AdCPError as e:
         # Account-status blocks (setup/suspended/payment): honest per-account
-        # failure carrying the resolver's own code rather than a silent success.
-        return _failed_account_result(entry.account, e.error_code, e)
+        # failure carrying the resolver's own code + recovery rather than a silent
+        # success (the exception's code and recovery agree by construction).
+        return _failed_account_result(
+            entry.account,
+            e.error_code,
+            recovery=e.recovery,
+            message=str(e),
+            suggestion=getattr(e, "suggestion", None),
+        )
 
     # Project request agents to the url-only DB-column shape ONCE (credentials
     # never persisted; serialize_governance_agents structurally strips them), then

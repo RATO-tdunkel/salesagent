@@ -767,3 +767,33 @@ class TestGeoPostalAreas:
             response = _get_adcp_capabilities_impl(None, identity)
 
         assert response.media_buy.execution.targeting.geo_postal_areas is None
+
+
+class TestSupportedBillingParity:
+    """`_DEFAULT_SUPPORTED_BILLING` must stay in lockstep with the DB constraint.
+
+    The advertised default is a hand-maintained subset of BillingParty that mirrors
+    the `ck_accounts_billing` CHECK constraint (accounts.billing IN {operator,
+    agent}). If the two drift, the seller advertises a billing party its own column
+    rejects. Pin them together (#1682 review NIT).
+    """
+
+    def test_default_billing_equals_db_constraint_allowed_set(self):
+        import re
+
+        from adcp.types.generated_poc.enums.billing_party import BillingParty
+
+        from src.core.database.models import Account
+        from src.core.tools.capabilities import _DEFAULT_SUPPORTED_BILLING
+
+        # Every advertised value is a real BillingParty enum member.
+        assert all(isinstance(p, BillingParty) for p in _DEFAULT_SUPPORTED_BILLING)
+
+        constraint = next(c for c in Account.__table_args__ if getattr(c, "name", None) == "ck_accounts_billing")
+        permitted = set(re.findall(r"'([a-z_]+)'", str(constraint.sqltext)))
+        advertised = {p.value for p in _DEFAULT_SUPPORTED_BILLING}
+
+        assert advertised == permitted == {"operator", "agent"}
+        # `advertiser` is deliberately excluded — this seller has no direct
+        # advertiser-billing relationship (see ck_accounts_billing rationale).
+        assert "advertiser" not in advertised

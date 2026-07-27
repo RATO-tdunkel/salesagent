@@ -28,6 +28,8 @@ SIMPLE_MODULE_FILES = [
     "src/core/tools/properties.py",
     "src/core/tools/task_management.py",
     "src/core/tools/signals.py",
+    "src/core/tools/accounts.py",
+    "src/core/tools/governance.py",
 ]
 
 # Complex modules with many ToolError sites (salesagent-a3vf)

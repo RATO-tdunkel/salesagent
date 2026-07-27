@@ -141,6 +141,59 @@ class TestSyncAccountsUpdate:
         assert _action_value(response.accounts[0].action) == "unchanged"
 
 
+class TestSyncAccountsPreservesGovernanceBinding:
+    """Regression (#1682 review Cluster B): a metadata-only sync_accounts re-sync
+    MUST NOT wipe a governance binding written by sync_governance.
+
+    governance_agents is not part of the sync_accounts request contract (it is owned
+    by sync_governance / UC-030). Before the fix, the change-detector read an absent
+    governance_agents off the entry as None and wrote it back, NULLing the binding on
+    every metadata update — reproduced end-to-end below.
+    """
+
+    @pytest.mark.asyncio
+    async def test_metadata_resync_preserves_governance_binding(self, integration_db):
+        from src.core.database.repositories.account import AccountRepository
+        from src.core.database.repositories.uow import AccountUoW
+
+        gov_url = "https://governance.acme-buyer.com/"
+        with AccountSyncEnv(tenant_id="sync_gov", principal_id="agent_sg") as env:
+            env.setup_default_data()
+
+            # 1. Create the account via sync_accounts (establishes the natural key).
+            created = await env.call_impl_async(
+                req=SyncAccountsRequest(
+                    accounts=[{"brand": {"domain": "acme.com"}, "operator": "example.com", "billing": "operator"}]
+                )
+            )
+            account_id = created.accounts[0].account_id
+
+            # 2. Bind a governance agent (url-only — exactly what sync_governance persists).
+            with AccountUoW("sync_gov") as uow:
+                repo: AccountRepository = uow.accounts
+                repo.update_fields(account_id, governance_agents=[{"url": gov_url}])
+
+            # 3. Re-sync the SAME natural key with a metadata change (billing) and NO
+            #    governance_agents — this fires the update path (changes non-empty), the
+            #    exact condition that used to NULL the binding.
+            resync = await env.call_impl_async(
+                req=SyncAccountsRequest(
+                    accounts=[{"brand": {"domain": "acme.com"}, "operator": "example.com", "billing": "agent"}]
+                )
+            )
+            assert _action_value(resync.accounts[0].action) == "updated"
+
+            # 4. The governance binding MUST survive the metadata update.
+            with AccountUoW("sync_gov") as uow:
+                repo = uow.accounts
+                account = repo.get_by_id(account_id)
+                persisted = account.governance_agents if account else None
+
+        assert persisted, "sync_accounts wiped the governance binding on a metadata re-sync (#1682 Cluster B)"
+        assert len(persisted) == 1
+        assert str(persisted[0].url) == gov_url
+
+
 class TestSyncAccountsAuth:
     """BR-RULE-055: sync_accounts requires valid authentication."""
 

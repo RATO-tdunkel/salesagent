@@ -33,8 +33,9 @@ from pytest_bdd import given, parsers, then, when
 
 from tests.bdd.steps._outcome_helpers import _require_response, wire_dict
 from tests.bdd.steps.generic._dispatch import dispatch_request
-from tests.factories import AccountFactory, AgentAccountAccessFactory
+from tests.factories import AccountFactory
 from tests.helpers import assert_envelope_shape
+from tests.helpers.governance import governance_agent_dict, grant_account_access
 
 # A valid, well-formed idempotency_key (pattern ^[A-Za-z0-9_.:-]{16,255}$) and
 # Bearer credentials (minLength 32) for scenarios that need a well-formed request
@@ -56,8 +57,7 @@ def _tenant_principal(ctx: dict) -> tuple[Any, Any]:
 def _owned_account(ctx: dict, account_id: str) -> Any:
     """Create an account the authenticated agent has authority over (access grant)."""
     tenant, principal = _tenant_principal(ctx)
-    account = AccountFactory(tenant=tenant, account_id=account_id)
-    AgentAccountAccessFactory(tenant=tenant, principal=principal, account=account)
+    account = grant_account_access(tenant, principal, account_id)
     ctx.setdefault("gov_accounts", {})[account_id] = account
     return account
 
@@ -72,8 +72,7 @@ def _unowned_account(ctx: dict, account_id: str) -> Any:
 
 def _agent(url: str, *, cred_len: int = 64, credentials: str | None = None, scheme: str = "Bearer") -> dict[str, Any]:
     """Build a request-side governance agent dict (url + authentication)."""
-    creds = credentials if credentials is not None else "x" * cred_len
-    return {"url": url, "authentication": {"schemes": [scheme], "credentials": creds}}
+    return governance_agent_dict(url, cred_len=cred_len, credentials=credentials, scheme=scheme)
 
 
 def _account_entry(account_id: str, agents: list[dict[str, Any]]) -> dict[str, Any]:
@@ -143,7 +142,8 @@ def given_authority_over_two(ctx: dict, a: str, b: str) -> None:
 @given(parsers.parse('the agent does NOT have authority over account "{account_id}"'))
 def given_no_authority_over(ctx: dict, account_id: str) -> None:
     # The account exists in the tenant but carries no access grant for this agent,
-    # so resolve_account raises AdCPAuthorizationError -> per-account SCOPE_INSUFFICIENT.
+    # so resolve_account raises AdCPAuthorizationError, which _sync_one_account
+    # collapses to the uniform per-account ACCOUNT_NOT_FOUND (no enumeration oracle).
     _unowned_account(ctx, account_id)
 
 
@@ -362,6 +362,27 @@ def then_no_echo_auth(ctx: dict, account_id: str, idx: int) -> None:
 def then_adcp_version(ctx: dict) -> None:
     body = wire_dict(ctx)
     assert body.get("adcp_version"), f"expected an echoed adcp_version envelope field, got keys {list(body)}"
+
+
+@then("the per-account errors include a SCOPE_INSUFFICIENT or ACCOUNT_NOT_FOUND code")
+def then_per_account_authority_code(ctx: dict) -> None:
+    """Assert a failed per-account entry carries an authority-failure code on the wire.
+
+    Graduates BR-UC-030 ``sync-no-authority`` (feature line 179) from dormant (its
+    ``Then`` was undefined → auto-xfail) to executing across a2a/mcp/rest, and makes
+    the A1 error-code choice wire-graded. Production emits the uniform
+    ``ACCOUNT_NOT_FOUND`` (an existing-but-unowned account is indistinguishable from
+    a nonexistent one); ``SCOPE_INSUFFICIENT`` is also scenario-valid.
+    """
+    allowed = {"SCOPE_INSUFFICIENT", "ACCOUNT_NOT_FOUND"}
+    failed_codes = {
+        ((acct.get("errors") or [{}])[0]).get("code") for acct in _wire_accounts(ctx) if acct.get("status") == "failed"
+    }
+    # Set comparisons (not count checks): a failed per-account entry must exist
+    # (non-empty set) AND every failed code must be an allowed authority code — an
+    # absent errors[] surfaces as None, which is not a subset of `allowed`.
+    assert failed_codes != set(), f"expected a failed per-account entry, got {_wire_accounts(ctx)}"
+    assert failed_codes <= allowed, f"per-account authority code(s) {failed_codes} not all in {allowed}"
 
 
 @then(parsers.parse('each per-account error should include a "{field}" field guiding remediation'))

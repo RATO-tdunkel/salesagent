@@ -7,8 +7,10 @@ accounts/tasks/sync_governance.mdx):
 - Success variant: envelope status=completed, per-account status=synced,
   governance_agents[].url echoed, credentials NEVER echoed.
 - Persistence: url-only, replace semantics (update_fields overwrites binding).
-- Authority MUST: unknown account -> failed ACCOUNT_NOT_FOUND; unowned account
-  -> failed SCOPE_INSUFFICIENT. Partial failure stays the success variant.
+- Authority MUST: an unknown account AND an existing-but-unowned account BOTH ->
+  failed ACCOUNT_NOT_FOUND (terminal) — indistinguishable per the *_NOT_FOUND
+  uniform-response MUST (no cross-principal enumeration oracle). Partial failure
+  stays the success variant.
 - Auth required (operation-level) and empty-accounts validation.
 
 These are _impl-level tests, so they assert on the typed response (per
@@ -145,11 +147,15 @@ class TestSyncGovernanceAuthorityContract:
 
         assert resp.accounts[0].status == "failed"
         assert resp.accounts[0].errors[0].code == "ACCOUNT_NOT_FOUND"
+        # ACCOUNT_NOT_FOUND is terminal (enumMetadata) — the per-account error MUST
+        # carry recovery so a receiver does not auto-retry (else it defaults to
+        # transient). See #1682 review A3.
+        assert resp.accounts[0].errors[0].recovery == "terminal"
         # A failed account never persists a binding.
         repo.update_fields.assert_not_called()
 
     @pytest.mark.asyncio
-    async def test_unowned_account_fails_with_scope_insufficient(self):
+    async def test_unowned_account_fails_with_account_not_found(self):
         from src.core.tools.governance import _sync_governance_impl
 
         def _raise(ref, ident, r):
@@ -160,11 +166,16 @@ class TestSyncGovernanceAuthorityContract:
             resp = await _sync_governance_impl(_make_request(), _make_identity())
 
         assert resp.accounts[0].status == "failed"
-        # An existing account the agent has no authority over uses the standard
-        # SCOPE_INSUFFICIENT code (pinned error-code enum + graded BR-UC-030), not
-        # the AdCPAuthorizationError default wire code (AUTH_REQUIRED) — this
-        # asserts we set the spec/graded code explicitly, not the wire default.
-        assert resp.accounts[0].errors[0].code == "SCOPE_INSUFFICIENT"
+        # An existing account the agent has no authority over is collapsed to the
+        # SAME ACCOUNT_NOT_FOUND result as a nonexistent account — the *_NOT_FOUND
+        # uniform-response MUST (no cross-principal enumeration oracle). It is NOT
+        # SCOPE_INSUFFICIENT (a task-scope / allowed_tasks code this seller does not
+        # model) nor the AdCPAuthorizationError wire default (AUTH_REQUIRED). #1682 A1.
+        err = resp.accounts[0].errors[0]
+        assert err.code == "ACCOUNT_NOT_FOUND"
+        assert err.recovery == "terminal"
+        # Uniform: the message MUST NOT reveal that the account exists.
+        assert "does not have access" not in err.message
         repo.update_fields.assert_not_called()
 
     @pytest.mark.asyncio

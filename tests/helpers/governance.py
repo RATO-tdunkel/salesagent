@@ -1,0 +1,46 @@
+"""Shared setup helpers for sync_governance (UC-030 / #1329) tests.
+
+Single home for the two bits of governance test setup that the integration tests
+(``tests/integration/test_sync_governance.py``) and the BDD steps
+(``tests/bdd/steps/domain/uc030_governance.py``) both need: granting an agent
+authority over an account, and building a request-side governance-agent dict.
+Extracted per the #1682 review (no drift yet — kept single here so a future change
+to the access grant or the agent shape happens in one place).
+
+Must be called inside a bound harness ``with env:`` block (factories commit via
+the harness-bound session).
+"""
+
+from __future__ import annotations
+
+from typing import Any
+
+from tests.factories import AccountFactory, AgentAccountAccessFactory
+
+
+def grant_account_access(tenant: Any, principal: Any, account_id: str) -> Any:
+    """Create an account and grant ``principal`` authority over it (access row).
+
+    Returns the created account ORM instance. Mirrors what
+    ``resolve_account`` -> ``repo.has_access`` checks: an account row plus an
+    ``AgentAccountAccess`` grant for the principal.
+    """
+    account = AccountFactory(tenant=tenant, account_id=account_id)
+    AgentAccountAccessFactory(tenant=tenant, principal=principal, account=account)
+    return account
+
+
+def governance_agent_dict(
+    url: str,
+    *,
+    cred_len: int = 64,
+    credentials: str | None = None,
+    scheme: str = "Bearer",
+) -> dict[str, Any]:
+    """Build a request-side governance agent (``url`` + write-only ``authentication``).
+
+    Credentials default to ``cred_len`` ``x``s (>= the schema's minLength 32) so the
+    only thing under test is the account/authority path, not request validation.
+    """
+    creds = credentials if credentials is not None else "x" * cred_len
+    return {"url": url, "authentication": {"schemes": [scheme], "credentials": creds}}

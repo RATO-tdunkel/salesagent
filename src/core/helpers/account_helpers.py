@@ -1,7 +1,8 @@
 """Account resolution helpers.
 
 Bridges AccountReference from request payloads to validated account_id strings.
-Used by _create_media_buy_impl and _sync_creatives_impl.
+Used by _create_media_buy_impl, _sync_creatives_impl, and _sync_governance_impl
+(the latter also uses serialize_governance_agents below).
 
 beads: salesagent-8n4
 """
@@ -27,15 +28,21 @@ from src.core.resolved_identity import ResolvedIdentity
 def serialize_governance_agents(agents: Any) -> list[dict[str, Any]] | None:
     """Project governance agents to the url-only ``accounts.governance_agents`` JSON shape.
 
-    Single serializer for every writer of the ``accounts.governance_agents`` column
-    (sync_accounts change-detection + sync_governance persist/echo). The DB column
-    model (``core.account.GovernanceAgent``) is url-only BY DESIGN: credentials are
-    write-only and MUST NEVER be persisted or echoed (sync_governance.mdx;
-    sync-governance-response.json ``governance_agents.items`` = url only). The
-    request-side ``GovernanceAgent`` carries ``authentication`` (schemes +
-    credentials); this helper projects to url-only for *both* dict and model inputs,
-    so the credential-strip is a structural guarantee for every writer rather than
-    inline call-site discipline.
+    The single serializer that every writer of the ``accounts.governance_agents``
+    column MUST route through (today only sync_governance persist + echo — #1682
+    Cluster B removed sync_accounts as a writer, since the field is outside its
+    contract). The DB column model (``core.account.GovernanceAgent``) is url-only BY
+    DESIGN: credentials are write-only and MUST NEVER be persisted or echoed
+    (sync_governance.mdx; sync-governance-response.json ``governance_agents.items``
+    = url only). The request-side ``GovernanceAgent`` carries ``authentication``
+    (schemes + credentials); this helper projects to url-only for *both* dict and
+    model inputs.
+
+    The credential-strip is CALL-SITE DISCIPLINE, not a hard structural guarantee:
+    ``JSONType`` does not re-validate stored JSON down to url-only, so a writer that
+    bypasses this helper and passes a credential-bearing dict straight to
+    ``governance_agents=`` would persist credentials with nothing failing. Route
+    every write through here.
 
     Only the ``url`` is read (never re-validating the full request model through the
     url-only DB model, which would ``extra="forbid"``-reject ``authentication`` in

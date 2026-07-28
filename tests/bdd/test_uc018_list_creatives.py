@@ -29,6 +29,15 @@ The first two are pinned at v3.1-04f59d2d5 (adcp 3.1.0-beta.3).
   returned creative_ids to the seeded per-principal id sets. See the section comment
   above those steps for the full spec citation.
 
+- ``T-UC-018-inv-146-2-holds`` / ``-inv-146-2-violated`` / ``-inv-146-3-holds`` (#1502):
+  BR-RULE-146 ``filters.statuses`` match-any — an explicit statuses array scopes the
+  result set to creatives in any of those statuses via ``Creative.status.in_(...)``.
+  These grade the exact behavior #1621 fixes (threading the FULL structured list, not
+  just the flat singular status). Source: adcp ``core/creative-filters.json`` (statuses).
+  Deliberately NOT wired here: ``inv-146-1-holds`` (no-filter archival-DEFAULT exclusion)
+  is a separate, unimplemented production feature (#1738), and the ``@creative-status``
+  boundary outline's ``["deleted"]`` / ``[]`` rows are validation-error wiring (#1652).
+
 Wired to real production across all wire transports (auto-parametrized; UC-018
 -> CreativeListEnv via conftest ``_detect_uc`` / ``_harness_env``). The repo
 sunsets the IMPL pseudo-transport in BDD, so the scenario runs on a2a/mcp/rest
@@ -76,10 +85,10 @@ from tests.helpers.pinned_schema import validate_against_pinned_schema
 _SYNCED_FORMATS = ("display_300x250", "video_640x480", "audio_30s")
 
 # Bind the UC-018 feature. The wired scenarios are @list-after-sync (#1405),
-# @concept-id (#1407), and the @BR-RULE-034 isolation invariants (#1503); the
-# remaining scenarios xfail fast at the conftest _harness_env fixture. Whole-feature
-# binding via scenarios() is the repo convention the CI shard-splitter requires
-# (scripts/ci/shard_split.py).
+# @concept-id (#1407), the @BR-RULE-034 isolation invariants (#1503), and the
+# @BR-RULE-146 explicit-statuses invariants (#1502); the remaining scenarios xfail
+# fast at the conftest _harness_env fixture. Whole-feature binding via scenarios() is
+# the repo convention the CI shard-splitter requires (scripts/ci/shard_split.py).
 scenarios("features/BR-UC-018-list-creatives.feature")
 
 
@@ -143,6 +152,24 @@ def _get_or_create_tenant_and_principal(env: Any) -> tuple[Any, Any]:
         lambda: PrincipalFactory(tenant=tenant, principal_id=env._principal_id),
     )
     return tenant, principal
+
+
+def _fresh_tenant(env: Any, prefix: str) -> Any:
+    """Create a fresh uniquely-named tenant, switch *env* to it, and return it.
+
+    Scenarios that pin exact counts (the @BR-RULE-034 isolation invariants and the
+    @BR-RULE-146 statuses invariants) each seed into their own tenant so a survivor
+    from a prior e2e_rest scenario in a shared tenant can't leak into the count. The
+    uuid suffix keeps the tenant_id unique across scenarios; ``switch_tenant`` clears
+    the identity cache so the next auth resolves the buyer against the new tenant.
+    """
+    from uuid import uuid4
+
+    from tests.factories import TenantFactory
+
+    tenant = TenantFactory(tenant_id=f"{prefix}_{uuid4().hex[:8]}")
+    env.switch_tenant(tenant.tenant_id)
+    return tenant
 
 
 @given(parsers.parse('the Buyer is authenticated as principal "{principal_id}"'))
@@ -445,16 +472,12 @@ def given_principal_has_n_creatives(ctx: dict, principal_id: str, count: int) ->
     Two ``@given`` phrasings map to this one body: ``parsers.parse`` requires a
     whole-string match, so the "in the same tenant" variant needs its own decorator.
     """
-    from uuid import uuid4
-
-    from tests.factories import PrincipalFactory, TenantFactory
+    from tests.factories import PrincipalFactory
 
     env = ctx["env"]
     tenant = ctx.get("tenant")
     if tenant is None:
-        tenant_id = f"uc018_iso_{uuid4().hex[:8]}"
-        tenant = TenantFactory(tenant_id=tenant_id)
-        env.switch_tenant(tenant_id)
+        tenant = _fresh_tenant(env, "uc018_iso")
         ctx["tenant"] = tenant
     principal = PrincipalFactory(tenant=tenant, principal_id=principal_id)
     seeded: dict[str, list[str]] = ctx.setdefault(_ISOLATION_CREATIVES_KEY, {})
@@ -490,12 +513,16 @@ def _returned_creative_ids(ctx: dict) -> set[str]:
 
 
 @then(parsers.parse("the response contains exactly {count:d} creatives"))
-def then_response_contains_exactly_n_creatives(ctx: dict, count: int) -> None:
-    """Assert the wire response carries exactly *count* creatives (all fit on page 1)."""
+@then(parsers.parse("the response contains {count:d} creatives"))
+def then_response_contains_n_creatives(ctx: dict, count: int) -> None:
+    """Assert the wire response carries exactly *count* creatives (all fit on page 1).
+
+    Shared by the @BR-RULE-034 isolation "contains exactly N" (#1503) and the
+    @BR-RULE-146 statuses "contains N" (#1502) phrasings — one assertion, two bindings.
+    """
     creatives = _wire_creatives(ctx)
     assert len(creatives) == count, (
-        f"expected exactly {count} creatives, got {len(creatives)}: "
-        f"{sorted(entry.get('creative_id') for entry in creatives)}"
+        f"expected {count} creatives, got {len(creatives)}: {sorted(entry.get('creative_id') for entry in creatives)}"
     )
 
 
@@ -520,3 +547,113 @@ def then_none_belong_to(ctx: dict, principal_id: str) -> None:
     assert not leaked, (
         f"cross-principal leak: creatives owned by {principal_id!r} appeared in the response: {sorted(leaked)}"
     )
+
+
+# ── @BR-RULE-146 statuses-filter invariants (#1502) ─────────────────────
+#
+# BR-RULE-146: filters.statuses is a match-any array — a creative is returned iff its
+# status is one of the requested statuses (AdCP 3.1.1 core/creative-filters.json:
+# "match any of these statuses"). These invariants grade the exact behavior #1621
+# fixes — threading the FULL structured statuses list into Creative.status.in_(...),
+# not just the flat singular status. Wired (explicit-statuses success path):
+#   inv-146-2-holds     statuses ["archived"]            -> only archived
+#   inv-146-2-violated  statuses ["approved"]            -> approved, none archived
+#   inv-146-3-holds     statuses ["approved","rejected"] -> match-any, none archived
+#
+# Enforcement site: CreativeRepository.get_by_principal's Creative.status.in_(...),
+# fed by _list_creatives_impl.effective_statuses. Neutering either leaks the
+# out-of-filter statuses and fails these scenarios (the archived/other-status decoys
+# are the falsifiable negative controls).
+#
+# Per-scenario tenant isolation (mirrors @BR-RULE-034): the assertions pin exact
+# counts under a NON-unique status filter, so a survivor from a prior e2e_rest scenario
+# in a shared tenant would break the count. Each scenario seeds into its own fresh
+# tenant; the When re-authenticates the buyer under it (seeds now committed).
+
+
+def _seed_creative_in_status(tenant: Any, principal: Any, status: str) -> str:
+    """Seed one creative owned by *principal* in an explicit *status*; return its id.
+
+    Unlike ``_seed_creative`` (which forces the ``approved`` trait), the statuses
+    scenarios vary only the status, so it is passed through directly. CreativeFactory's
+    default ``data`` still carries realistic assets, so the row survives the
+    repository's ``data["assets"] IS NOT NULL`` guard.
+    """
+    from tests.factories import CreativeFactory
+
+    return CreativeFactory(tenant=tenant, principal=principal, status=status).creative_id
+
+
+def _seed_statuses_in_fresh_tenant(ctx: dict, counts: dict[str, int]) -> None:
+    """Seed ``{status: count}`` creatives for the Background buyer in a fresh tenant."""
+    from tests.factories import PrincipalFactory
+
+    env = ctx["env"]
+    tenant = _fresh_tenant(env, "uc018_status")
+    principal = PrincipalFactory(tenant=tenant, principal_id=ctx["principal_id"])
+    ctx["tenant"] = tenant
+    ctx["principal"] = principal
+    for status, count in counts.items():
+        for _ in range(count):
+            _seed_creative_in_status(tenant, principal, status)
+
+
+@given(
+    parsers.re(r"the authenticated principal has (?P<approved>\d+) approved and (?P<archived>\d+) archived creatives?")
+)
+def given_principal_has_approved_and_archived(ctx: dict, approved: str, archived: str) -> None:
+    """Seed N approved + M archived creatives for the Background buyer (fresh tenant)."""
+    _seed_statuses_in_fresh_tenant(ctx, {"approved": int(approved), "archived": int(archived)})
+
+
+@given(
+    parsers.re(
+        r"the authenticated principal has (?P<approved>\d+) approved, (?P<rejected>\d+) rejected, "
+        r"and (?P<archived>\d+) archived creatives?"
+    )
+)
+def given_principal_has_approved_rejected_archived(ctx: dict, approved: str, rejected: str, archived: str) -> None:
+    """Seed N approved + M rejected + K archived creatives for the Background buyer (fresh tenant)."""
+    _seed_statuses_in_fresh_tenant(
+        ctx, {"approved": int(approved), "rejected": int(rejected), "archived": int(archived)}
+    )
+
+
+@when(parsers.re(r"the Buyer Agent sends a list_creatives request with statuses filter \[(?P<status_list>[^\]]+)\]"))
+def when_list_creatives_statuses_filter(ctx: dict, status_list: str) -> None:
+    """Dispatch list_creatives with a structured filters.statuses filter.
+
+    Re-authenticates the buyer under the scenario's fresh tenant (seeds now committed)
+    — mirrors the isolation When — then sends filters.statuses as a validated
+    CreativeFilters dict through the scenario's transport (the one shape that coerces
+    back to CreativeFilters uniformly across a2a/mcp/rest server-side).
+    """
+    import re
+
+    from adcp import CreativeFilters
+
+    from tests.bdd.steps.generic.when_request import _call_via
+
+    statuses = re.findall(r'"([^"]+)"', status_list)
+    assert statuses, f"no statuses parsed from {status_list!r}"
+    authenticate_env_as(ctx, ctx["principal_id"])
+    filters = CreativeFilters(statuses=statuses).model_dump(mode="json", exclude_none=True)
+    _call_via(ctx, ctx.get("transport"), filters=filters)
+
+
+@then(parsers.parse('all returned creatives have status "{status}"'))
+def then_all_returned_have_status(ctx: dict, status: str) -> None:
+    """Assert every returned creative carries *status* (match-any includes this status)."""
+    creatives = _wire_creatives(ctx)
+    assert creatives, "list_creatives returned an empty creatives array"
+    wrong = [(c.get("creative_id"), c.get("status")) for c in creatives if c.get("status") != status]
+    assert not wrong, f"expected all returned creatives to have status {status!r}, found: {wrong}"
+
+
+@then(parsers.parse('none of the returned creatives have status "{status}"'))
+def then_none_returned_have_status(ctx: dict, status: str) -> None:
+    """Assert no returned creative carries *status* (the excluded-status negative control)."""
+    creatives = _wire_creatives(ctx)
+    assert creatives, "list_creatives returned an empty creatives array"
+    offenders = [c.get("creative_id") for c in creatives if c.get("status") == status]
+    assert not offenders, f"creatives with status {status!r} leaked into the response: {offenders}"

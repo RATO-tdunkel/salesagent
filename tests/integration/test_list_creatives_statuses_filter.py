@@ -21,7 +21,7 @@ import pytest
 
 from tests.factories import CreativeFactory
 from tests.harness import CreativeListEnv
-from tests.harness.transport import ALL_WIRE, Transport
+from tests.harness.transport import ALL_WIRE
 
 pytestmark = [pytest.mark.integration, pytest.mark.requires_db]
 
@@ -73,20 +73,24 @@ class TestStatusesFilterApplied:
 
 class TestStatusesFilterReportedTruthfully:
     """filters_applied reports statuses AND that report is now truthful — it matches the
-    actually-scoped result set. REST-only: reads the real HTTP response body."""
+    actually-scoped result set. query_summary.filters_applied is an ordinary success-
+    envelope field, so this runs on every wire transport (a2a/mcp/rest): a stale enum
+    repr leaking into filters_applied on the MCP or A2A serialization path would go
+    uncaught if this were asserted on REST alone."""
 
-    def test_filters_applied_matches_scoped_results(self, integration_db):
+    @pytest.mark.parametrize("transport", ALL_WIRE)
+    def test_filters_applied_matches_scoped_results(self, integration_db, transport):
         with CreativeListEnv() as env:
             tenant, principal = env.setup_default_data()
             keep = _seed_creative(tenant, principal, "approved")
             _seed_creative(tenant, principal, "rejected")
 
-            result = env.call_via(Transport.REST, filters={"statuses": ["approved"]})
+            result = env.call_via(transport, filters={"statuses": ["approved"]})
 
-            assert not result.is_error, result.error
+            assert not result.is_error, f"{transport}: {result.error!r}"
             filters_applied = result.wire_response["query_summary"]["filters_applied"]
             # Reported as the enum value ("approved") — the coerced list the query used.
-            assert "statuses=approved" in filters_applied, filters_applied
+            assert "statuses=approved" in filters_applied, f"{transport}: {filters_applied}"
             # ...and the report is truthful: the scoped set matches what was claimed.
             returned = {c["creative_id"] for c in result.wire_response["creatives"]}
-            assert returned == {keep}
+            assert returned == {keep}, f"{transport}: scoped set != reported filters_applied"

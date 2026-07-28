@@ -3405,8 +3405,9 @@ def _harness_env(request: pytest.FixtureRequest, ctx: dict) -> Generator[None, N
 
     elif uc == "UC-018":
         # list_creatives — the wired scenarios are @list-after-sync (#1405),
-        # @concept-id (#1407), and the @BR-RULE-034 cross-principal isolation
-        # invariants (#1503). The remaining UC-018 scenarios (main/partition/
+        # @concept-id (#1407), the @BR-RULE-034 cross-principal isolation
+        # invariants (#1503), and the @BR-RULE-146 explicit-statuses success
+        # invariants (#1502). The remaining UC-018 scenarios (main/partition/
         # boundary/other filter siblings) have no step definitions yet, so xfail
         # fast at the fixture (mirrors UC-002/006/011) rather than spinning up a
         # DB per scenario only to auto-xfail at the first missing step.
@@ -3415,7 +3416,18 @@ def _harness_env(request: pytest.FixtureRequest, ctx: dict) -> Generator[None, N
         # scenarios (see _detect_uc), so the tag never collides with the UC-006
         # BR-RULE-034 scenarios routed elsewhere.
         marker_names = {m.name for m in request.node.iter_markers()}
-        if marker_names & {"list-after-sync", "concept-id", "BR-RULE-034"}:
+        # @BR-RULE-146 explicit-statuses success invariants wired for #1502 (statuses
+        # match-any). Admitted by exact scenario id, NOT the shared @BR-RULE-146 tag:
+        # inv-146-1-holds (no-filter archival DEFAULT exclusion) is a separate,
+        # unimplemented production feature (#1738), and the @creative-status boundary
+        # outline's ["deleted"]/[] rows are validation-error wiring (#1652) — both stay
+        # xfailed here rather than routed into a failing run.
+        _wired_statuses_scenarios = {
+            "T-UC-018-inv-146-2-holds",
+            "T-UC-018-inv-146-2-violated",
+            "T-UC-018-inv-146-3-holds",
+        }
+        if marker_names & ({"list-after-sync", "concept-id", "BR-RULE-034"} | _wired_statuses_scenarios):
             # CreativeListEnv mocks only the audit logger; DB, repository, and
             # query building are real. The Background auth step switches the env
             # principal; the seed step owns the creatives under it.
@@ -3429,7 +3441,7 @@ def _harness_env(request: pytest.FixtureRequest, ctx: dict) -> Generator[None, N
         else:
             pytest.xfail(
                 "UC-018 harness wired only for the @list-after-sync (#1405), @concept-id (#1407), "
-                "and @BR-RULE-034 isolation (#1503) scenarios"
+                "@BR-RULE-034 isolation (#1503), and @BR-RULE-146 statuses invariants (#1502) scenarios"
             )
 
     elif uc == "UC-011":

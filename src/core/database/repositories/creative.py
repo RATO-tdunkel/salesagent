@@ -136,8 +136,10 @@ class CreativeRepository:
         # statuses filter (CreativeFilters.statuses in core/creative-filters.json): "match
         # any of these statuses". Applied inside the already tenant+principal-scoped
         # statement, so it can only narrow, never widen. Mirrors
-        # MediaBuyRepository.get_by_principal (same list[str] param, same `is not None` gate
-        # so an explicit [] narrows to nothing rather than being ignored).
+        # MediaBuyRepository.get_by_principal (same list[str] param, same `is not None`
+        # gate): None skips the filter. The list_creatives caller passes None (not []) to
+        # mean "unfiltered" — an empty statuses array is a minItems:1 validation error
+        # upstream (core/creative-filters.json), so [] never legitimately reaches here.
         if statuses is not None:
             stmt = stmt.where(Creative.status.in_(statuses))
 

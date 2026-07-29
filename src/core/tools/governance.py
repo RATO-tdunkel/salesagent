@@ -41,13 +41,14 @@ without replay is already resource-idempotent. Mirrors the sync_accounts
 precedent (accepts idempotency_key, no replay dedup yet).
 """
 
-import logging
+from typing import Annotated
 
 from adcp.types import AccountReference as LibraryAccountReference
 from adcp.types import ContextObject, Error
 from adcp.types.aliases import SyncGovernanceAccount as SyncGovernanceAccountInput
 from fastmcp.server.context import Context
 from fastmcp.tools.tool import ToolResult
+from pydantic import Field
 
 from src.core.audit_logger import get_audit_logger
 from src.core.auth import require_identity, require_principal_id, require_tenant
@@ -60,7 +61,7 @@ from src.core.exceptions import (
     AdCPError,
     AdCPValidationError,
 )
-from src.core.helpers.account_helpers import resolve_account, serialize_governance_agents
+from src.core.helpers.account_helpers import resolve_account
 from src.core.resolved_identity import ResolvedIdentity
 from src.core.schemas.account import (
     SyncedGovernanceAgent,
@@ -71,9 +72,6 @@ from src.core.schemas.account import (
 from src.core.tool_context import ToolContext
 from src.core.transport_helpers import resolve_identity_from_context
 from src.core.validation_helpers import adcp_validation_boundary
-
-logger = logging.getLogger(__name__)
-
 
 # Uniform per-account response for an unresolved account. The *_NOT_FOUND
 # uniform-response MUST (pinned error-code.json: CREATIVE_NOT_FOUND /
@@ -172,12 +170,11 @@ def _sync_one_account(
             suggestion=getattr(e, "suggestion", None),
         )
 
-    # Project request agents to the url-only DB-column shape ONCE (credentials
-    # never persisted; serialize_governance_agents structurally strips them), then
-    # persist and echo from that single list so the two can never disagree.
-    # update_fields overwrites the prior binding (per-account replace semantics).
-    agent_urls = serialize_governance_agents(entry.governance_agents) or []
-    repo.update_fields(account_id, governance_agents=agent_urls)
+    # Persist through the repository, which OWNS the url-only projection (credentials
+    # never persisted — #1682 review item 6) and returns the stored url-only list. Echo
+    # from that same list so persisted and echoed can never disagree.
+    # set_governance_binding replaces the prior binding (per-account replace semantics).
+    agent_urls = repo.set_governance_binding(account_id, entry.governance_agents)
 
     return SyncGovernanceResponseAccount(
         account=entry.account,
@@ -232,7 +229,10 @@ async def _sync_governance_impl(
 
 
 async def sync_governance(
-    idempotency_key: str | None = None,
+    idempotency_key: Annotated[
+        str | None,
+        Field(description="Client-generated at-most-once key (spec-required; ^[A-Za-z0-9_.:-]{16,255}$)"),
+    ] = None,
     accounts: list[SyncGovernanceAccountInput] | None = None,
     context: ContextObject | None = None,
     ctx: Context | ToolContext | None = None,

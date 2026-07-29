@@ -20,13 +20,11 @@ from src.core.schemas.account import SyncGovernanceRequest
 from tests.factories import AccountFactory, TenantFactory
 from tests.harness.governance_sync import GovernanceSyncEnv
 from tests.harness.transport import Transport
-from tests.helpers.governance import governance_agent_dict, grant_account_access
+from tests.helpers.governance import BEARER_CREDS, GOV_URL, governance_agent_dict, grant_account_access, url_eq
 
 pytestmark = [pytest.mark.integration, pytest.mark.requires_db]
 
-GOV_URL = "https://governance.pinnacle-media.com"
 GOV_URL_2 = "https://governance.new-buyer.com"
-BEARER_CREDS = "x" * 64
 
 
 def _request(
@@ -36,11 +34,6 @@ def _request(
         idempotency_key=key,
         accounts=[{"account": account_ref, "governance_agents": [governance_agent_dict(url)]}],
     )
-
-
-def _url_eq(actual: str, expected: str) -> bool:
-    """Compare urls tolerant of AnyUrl trailing-slash normalization."""
-    return (actual or "").rstrip("/") == expected.rstrip("/")
 
 
 def _persisted_agents(tenant_id: str, account_id: str) -> list:
@@ -179,7 +172,7 @@ class TestSyncGovernanceCrossTransportWire:
         acct = accounts[0]
         assert acct["status"] == "synced"
         agents = acct.get("governance_agents") or []
-        assert agents and _url_eq(agents[0].get("url"), GOV_URL), f"{transport}: url not echoed: {agents}"
+        assert agents and url_eq(agents[0].get("url"), GOV_URL), f"{transport}: url not echoed: {agents}"
         # Credentials are write-only — the wire echo MUST NOT carry authentication.
         assert "authentication" not in agents[0], f"{transport}: credentials echoed on wire: {agents[0]}"
         assert BEARER_CREDS not in str(result.wire_response), f"{transport}: credentials leaked on wire"

@@ -17,6 +17,22 @@ from typing import Any
 
 from tests.factories import AccountFactory, AgentAccountAccessFactory
 
+# Shared request-shape constants for the sync_governance test suites (#1682 review item 4):
+# one governance-agent url + Bearer credentials (>= the schema's minLength 32). Kept here so
+# the unit / integration / BDD suites assert against one source of truth for the pinned
+# 3.1.1 request shape rather than re-declaring these per file.
+GOV_URL = "https://governance.pinnacle-media.com"
+BEARER_CREDS = "x" * 64
+
+
+def url_eq(actual: str | None, expected: str) -> bool:
+    """Compare governance-agent urls tolerant of AnyUrl trailing-slash normalization.
+
+    ``actual`` is null-guarded (``AnyUrl`` may serialize with a trailing ``/``; a missing
+    echo surfaces as ``None``), so a dropped url fails rather than raising.
+    """
+    return (actual or "").rstrip("/") == expected.rstrip("/")
+
 
 def grant_account_access(tenant: Any, principal: Any, account_id: str) -> Any:
     """Create an account and grant ``principal`` authority over it (access row).

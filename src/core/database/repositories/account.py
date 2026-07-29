@@ -245,6 +245,27 @@ class AccountRepository:
         self._session.flush()
         return account
 
+    def set_governance_binding(self, account_id: str, agents: object) -> list[dict]:
+        """Replace an account's governance-agent binding; return the persisted url-only list.
+
+        The SINGLE write path for ``accounts.governance_agents``, and it OWNS the
+        credential strip. Request agents carry write-only ``authentication`` (schemes +
+        credentials) that MUST NEVER be persisted (sync_governance.mdx; the
+        ``core.account.GovernanceAgent`` column model is url-only by construction), so this
+        method projects each agent to ``{url}`` before writing. Persisting through here —
+        rather than a caller assembling the url-only list and calling
+        ``update_fields(governance_agents=...)`` directly — keeps the strip a repository-layer
+        guarantee instead of scattered call-site discipline (#1682 review item 6). Returns
+        the stored list so the caller echoes exactly what was persisted (the two can never
+        disagree). Replaces the prior binding (per-account replace semantics).
+        """
+        # Local import avoids a module-level cycle (account_helpers imports this class).
+        from src.core.helpers.account_helpers import serialize_governance_agents
+
+        urls = serialize_governance_agents(agents) or []
+        self.update_fields(account_id, governance_agents=urls)
+        return urls
+
     # ------------------------------------------------------------------
     # AgentAccountAccess methods
     # ------------------------------------------------------------------

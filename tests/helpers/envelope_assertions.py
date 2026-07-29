@@ -31,6 +31,7 @@ def assert_envelope_shape(
     *,
     recovery: str,
     message_substr: str | None = None,
+    field_substr: str | None = None,
     check_mcp_tool_error: bool = False,
 ) -> None:
     """Assert the AdCP spec two-layer error envelope shape.
@@ -52,6 +53,14 @@ def assert_envelope_shape(
         message_substr: If provided, must appear in ``errors[0].message``.
                 ``adcp_error.message`` is allowed to differ (it carries the
                 envelope-level summary).
+        field_substr: If provided, must appear in ``errors[0].field`` (the
+                structured field pointer, e.g. ``accounts[0].governance_agents``).
+                Prefer this over ``message_substr`` for field-level validation
+                errors: the MCP TypeAdapter boundary emits only the leaf Pydantic
+                message (``"String should have at least 32 characters"``) while
+                REST/A2A carry the full formatted message, but ``field`` is
+                identical across all three — so a field-name token is transport-
+                stable in ``field`` and not in ``message``.
         check_mcp_tool_error: If ``True``, additionally assert that ``target``
                 is an ``AdCPToolError`` instance before reading its envelope.
                 MCP-boundary call sites use this to pin the exception type as
@@ -84,3 +93,7 @@ def assert_envelope_shape(
     if message_substr is not None:
         actual = body["errors"][0].get("message", "")
         assert message_substr in actual, f"errors[0].message={actual!r} does not contain {message_substr!r}"
+
+    if field_substr is not None:
+        actual_field = body["errors"][0].get("field") or ""
+        assert field_substr in actual_field, f"errors[0].field={actual_field!r} does not contain {field_substr!r}"

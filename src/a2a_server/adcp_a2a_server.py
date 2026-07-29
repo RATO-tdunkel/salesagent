@@ -471,6 +471,7 @@ class AdCPRequestHandler(RequestHandler):
                 ListCreativesResponse,
                 SyncAccountsResponse,
                 SyncCreativesResponse,
+                SyncGovernanceResponse,
                 UpdateMediaBuyError,
                 UpdateMediaBuySubmitted,
                 UpdateMediaBuySuccess,
@@ -512,6 +513,7 @@ class AdCPRequestHandler(RequestHandler):
                 "get_products": GetProductsResponse,
                 "list_accounts": ListAccountsResponse,
                 "sync_accounts": SyncAccountsResponse,
+                "sync_governance": SyncGovernanceResponse,
                 "list_authorized_properties": ListAuthorizedPropertiesResponse,
                 "list_creative_formats": ListCreativeFormatsResponse,
                 "list_creatives": ListCreativesResponse,
@@ -2252,6 +2254,12 @@ def create_agent_card() -> AgentCard:
                 name="sync_accounts",
                 description="Sync billing accounts by natural key (upsert, delete_missing, dry_run)",
                 tags=["accounts", "billing", "sync", "upsert", "adcp"],
+            ),
+            AgentSkill(
+                id="sync_governance",
+                name="sync_governance",
+                description="Bind a buyer-designated governance agent per account (replace semantics)",
+                tags=["accounts", "governance", "sync", "adcp"],
             ),
             # ✅ NEW: Media Buy Management Skills (CRITICAL for campaign lifecycle)
             AgentSkill(

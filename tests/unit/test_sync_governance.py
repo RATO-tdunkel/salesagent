@@ -6,7 +6,8 @@ accounts/tasks/sync_governance.mdx):
 
 - Success variant: envelope status=completed, per-account status=synced,
   governance_agents[].url echoed, credentials NEVER echoed.
-- Persistence: url-only, replace semantics (update_fields overwrites binding).
+- Persistence: routed through the repository's single governance-write path
+  (``set_governance_binding``), which owns url-only projection + replace semantics.
 - Authority MUST: an unknown account AND an existing-but-unowned account BOTH ->
   failed ACCOUNT_NOT_FOUND (terminal) — indistinguishable per the *_NOT_FOUND
   uniform-response MUST (no cross-principal enumeration oracle). Partial failure
@@ -15,7 +16,9 @@ accounts/tasks/sync_governance.mdx):
 
 These are _impl-level tests, so they assert on the typed response (per
 tests/CLAUDE.md, wire-envelope assertions are for error-path transport tests;
-the success/persistence contract is verified against the typed payload here).
+the success/persistence contract is verified against the typed payload here). The
+url-only credential strip itself is a repository guarantee, verified end-to-end
+against a real DB in tests/integration/test_sync_governance.py (#1682 review item 6).
 """
 
 from __future__ import annotations
@@ -30,10 +33,9 @@ from src.core.exceptions import (
     AdCPAuthenticationError,
     AdCPAuthorizationError,
 )
+from src.core.helpers.account_helpers import serialize_governance_agents
 from src.core.schemas.account import SyncGovernanceRequest, SyncGovernanceResponse
-
-GOV_URL = "https://governance.pinnacle-media.com"
-BEARER_CREDS = "x" * 64  # >= 32 chars per schema minLength
+from tests.helpers.governance import BEARER_CREDS, GOV_URL, governance_agent_dict
 
 
 def _make_identity(principal_id: str | None = "principal-1", tenant_id: str = "tenant-1"):
@@ -59,9 +61,7 @@ def _make_request(
         accounts = [
             {
                 "account": account_ref or {"account_id": "acc_1"},
-                "governance_agents": [
-                    {"url": url, "authentication": {"schemes": ["Bearer"], "credentials": BEARER_CREDS}}
-                ],
+                "governance_agents": [governance_agent_dict(url)],
             }
         ]
     return SyncGovernanceRequest(idempotency_key=idempotency_key, accounts=accounts)
@@ -70,10 +70,14 @@ def _make_request(
 def _patch_deps(*, resolve_side_effect=None, repo: MagicMock | None = None) -> tuple[ExitStack, MagicMock]:
     """Patch AccountUoW, resolve_account, and the audit logger.
 
-    Returns (stack, repo_mock) — enter the stack in a `with` block.
+    Returns (stack, repo_mock) — enter the stack in a `with` block. The repo's
+    ``set_governance_binding`` mirrors production: it projects agents to url-only and
+    returns the stored list (which the tool echoes). The strip itself is the repository's
+    guarantee (integration-tested); the mock reproduces it so the tool's echo is exercised.
     """
     stack = ExitStack()
     repo = repo or MagicMock()
+    repo.set_governance_binding.side_effect = lambda account_id, agents: serialize_governance_agents(agents) or []
 
     mock_uow = MagicMock()
     mock_uow.__enter__ = MagicMock(return_value=mock_uow)
@@ -86,7 +90,7 @@ def _patch_deps(*, resolve_side_effect=None, repo: MagicMock | None = None) -> t
 
 
 class TestSyncGovernanceSuccess:
-    """Happy-path contract: synced, persisted url-only, echoed without credentials."""
+    """Happy-path contract: synced, persisted via the repo write path, echoed without credentials."""
 
     @pytest.mark.asyncio
     async def test_synced_status_and_completed_envelope(self):
@@ -103,16 +107,20 @@ class TestSyncGovernanceSuccess:
         assert resp.model_dump(mode="json")["status"] == "completed"
 
     @pytest.mark.asyncio
-    async def test_persists_url_only_with_replace_semantics(self):
+    async def test_persists_binding_via_repository_write_path(self):
         from src.core.tools.governance import _sync_governance_impl
 
+        req = _make_request(url=GOV_URL)
         stack, repo = _patch_deps(resolve_side_effect=lambda ref, ident, r: "acc_1")
         with stack:
-            await _sync_governance_impl(_make_request(url=GOV_URL), _make_identity())
+            await _sync_governance_impl(req, _make_identity())
 
-        # Persisted via update_fields (replace), and only the URL is stored —
-        # never the credentials (the DB column model is url-only by design).
-        repo.update_fields.assert_called_once_with("acc_1", governance_agents=[{"url": GOV_URL + "/"}])
+        # The tool persists through the repository's single governance-write path, which
+        # owns the url-only credential strip + replace semantics (#1682 item 6; strip
+        # verified end-to-end in tests/integration/test_sync_governance.py). It must pass
+        # the raw request agents (repo projects) and must NOT reach for generic update_fields.
+        repo.set_governance_binding.assert_called_once_with("acc_1", req.accounts[0].governance_agents)
+        repo.update_fields.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_credentials_never_echoed(self):
@@ -127,7 +135,7 @@ class TestSyncGovernanceSuccess:
         assert "authentication" not in serialized
         assert BEARER_CREDS not in serialized
         assert "credentials" not in serialized
-        # But the URL IS echoed.
+        # But the URL IS echoed (from the repo's stored url-only list).
         assert dumped["accounts"][0]["governance_agents"][0]["url"] == GOV_URL + "/"
 
 
@@ -152,7 +160,7 @@ class TestSyncGovernanceAuthorityContract:
         # transient). See #1682 review A3.
         assert resp.accounts[0].errors[0].recovery == "terminal"
         # A failed account never persists a binding.
-        repo.update_fields.assert_not_called()
+        repo.set_governance_binding.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_unowned_account_fails_with_account_not_found(self):
@@ -176,7 +184,7 @@ class TestSyncGovernanceAuthorityContract:
         assert err.recovery == "terminal"
         # Uniform: the message MUST NOT reveal that the account exists.
         assert "does not have access" not in err.message
-        repo.update_fields.assert_not_called()
+        repo.set_governance_binding.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_partial_failure_stays_success_variant(self):
@@ -188,28 +196,19 @@ class TestSyncGovernanceAuthorityContract:
             raise AdCPAccountNotFoundError("nope", suggestion="s")
 
         accounts = [
-            {
-                "account": {"account_id": "acc_ok"},
-                "governance_agents": [
-                    {"url": GOV_URL, "authentication": {"schemes": ["Bearer"], "credentials": BEARER_CREDS}}
-                ],
-            },
-            {
-                "account": {"account_id": "acc_bad"},
-                "governance_agents": [
-                    {"url": GOV_URL, "authentication": {"schemes": ["Bearer"], "credentials": BEARER_CREDS}}
-                ],
-            },
+            {"account": {"account_id": "acc_ok"}, "governance_agents": [governance_agent_dict(GOV_URL)]},
+            {"account": {"account_id": "acc_bad"}, "governance_agents": [governance_agent_dict(GOV_URL)]},
         ]
+        req = _make_request(accounts=accounts)
         stack, repo = _patch_deps(resolve_side_effect=_resolve)
         with stack:
-            resp = await _sync_governance_impl(_make_request(accounts=accounts), _make_identity())
+            resp = await _sync_governance_impl(req, _make_identity())
 
         assert len(resp.accounts) == 2
         statuses = {a.account.root.account_id: a.status for a in resp.accounts}
         assert statuses == {"acc_ok": "synced", "acc_bad": "failed"}
-        # Only the synced account persisted.
-        repo.update_fields.assert_called_once_with("acc_ok", governance_agents=[{"url": GOV_URL + "/"}])
+        # Only the synced account persisted, via the repository write path.
+        repo.set_governance_binding.assert_called_once_with("acc_ok", req.accounts[0].governance_agents)
 
 
 class TestSyncGovernanceOperationLevel:
@@ -236,14 +235,7 @@ class TestSyncGovernanceRequestSchema:
     def test_idempotency_key_required(self):
         with pytest.raises(ValueError):
             SyncGovernanceRequest(
-                accounts=[
-                    {
-                        "account": {"account_id": "acc_1"},
-                        "governance_agents": [
-                            {"url": GOV_URL, "authentication": {"schemes": ["Bearer"], "credentials": BEARER_CREDS}}
-                        ],
-                    }
-                ]
+                accounts=[{"account": {"account_id": "acc_1"}, "governance_agents": [governance_agent_dict(GOV_URL)]}]
             )
 
     def test_idempotency_key_too_short_rejected(self):
@@ -261,9 +253,7 @@ class TestSyncGovernanceRequestSchema:
                 accounts=[
                     {
                         "account": {"account_id": "acc_1"},
-                        "governance_agents": [
-                            {"url": GOV_URL, "authentication": {"schemes": ["Bearer"], "credentials": "short"}}
-                        ],
+                        "governance_agents": [governance_agent_dict(GOV_URL, credentials="short")],
                     }
                 ],
             )
@@ -276,11 +266,8 @@ class TestSyncGovernanceRequestSchema:
                     {
                         "account": {"account_id": "acc_1"},
                         "governance_agents": [
-                            {"url": GOV_URL, "authentication": {"schemes": ["Bearer"], "credentials": BEARER_CREDS}},
-                            {
-                                "url": "https://other.example.com",
-                                "authentication": {"schemes": ["Bearer"], "credentials": BEARER_CREDS},
-                            },
+                            governance_agent_dict(GOV_URL),
+                            governance_agent_dict("https://other.example.com"),
                         ],
                     }
                 ],

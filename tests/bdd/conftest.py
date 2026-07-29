@@ -3468,9 +3468,6 @@ def _harness_env(request: pytest.FixtureRequest, ctx: dict) -> Generator[None, N
             "T-UC-030-sync-idempotent-replay": "idempotency replay dedup not implemented — spec-production gap (#1329)",
             "T-UC-030-sync-idempotency-conflict": "IDEMPOTENCY_CONFLICT (same key / different payload) not implemented — spec-production gap (#1329)",
             "T-UC-030-sync-permission-denied": "per-operation granted-scope model (PERMISSION_DENIED) not implemented — spec-production gap (#1329)",
-            "T-UC-030-sync-replace": "replace-semantics pre-binding step wiring deferred (#1329 follow-up)",
-            "T-UC-030-sync-implicit-account": "natural-key implicit-account step wiring deferred (#1329 follow-up)",
-            "T-UC-030-sync-absent-account-untouched": "per-account replace-scope multi-account pre-binding step wiring deferred (#1329 follow-up)",
             "T-UC-030-storyboard-binding-used-during-create-media-buy": "requires check_governance invocation during create_media_buy — undeclared capability (#1329)",
         }
         for tag, reason in _UC030_XFAIL_TAGS.items():

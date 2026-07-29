@@ -22,7 +22,7 @@ ctx["env"] is a GovernanceSyncEnv (bound by the conftest UC-030 branch).
 ctx["response"] / ctx["error"] / ctx["wire_response"] / ctx["wire_error_envelope"]
 are populated by dispatch_request.
 
-beads: #1329 (UC-030)
+#1329 (UC-030)
 """
 
 from __future__ import annotations
@@ -33,9 +33,8 @@ from pytest_bdd import given, parsers, then, when
 
 from tests.bdd.steps._outcome_helpers import _require_response, wire_dict
 from tests.bdd.steps.generic._dispatch import dispatch_request
-from tests.factories import AccountFactory
-from tests.helpers import assert_envelope_shape
-from tests.helpers.governance import governance_agent_dict, grant_account_access
+from tests.factories import AccountFactory, AgentAccountAccessFactory
+from tests.helpers.governance import governance_agent_dict, grant_account_access, url_eq
 
 # A valid, well-formed idempotency_key (pattern ^[A-Za-z0-9_.:-]{16,255}$) and
 # Bearer credentials (minLength 32) for scenarios that need a well-formed request
@@ -108,19 +107,21 @@ def _wire_account(ctx: dict, account_id: str) -> dict[str, Any]:
     raise AssertionError(f"No wire account {account_id!r}. Available: {available}")
 
 
-def _url_eq(actual: str, expected: str) -> bool:
-    """Compare urls tolerant of AnyUrl trailing-slash normalization."""
-    return actual.rstrip("/") == expected.rstrip("/")
+def _persisted_binding(ctx: dict, account_id: str) -> dict[str, Any]:
+    """Read the persisted account row back through a fresh AccountUoW on the same DB the
+    dispatch committed to, returning ``{"account_id", "urls"}`` extracted BEFORE the session
+    closes (accessing ORM attributes after close raises DetachedInstanceError — attributes
+    expire on commit). Lets the replace/absent Then steps grade what was actually persisted
+    (below the wire), not just the response echo. ``account_id`` is None when no row exists.
+    """
+    from src.core.database.repositories.uow import AccountUoW
 
-
-def _assert_wire_validation(ctx: dict, *tokens: str) -> None:
-    """Assert a VALIDATION_ERROR wire envelope that references the given field tokens."""
-    envelope = ctx.get("wire_error_envelope")
-    assert envelope is not None, f"expected a wire error envelope; got response {ctx.get('response')!r}"
-    assert_envelope_shape(envelope, "VALIDATION_ERROR", recovery="correctable")
-    blob = str(envelope).lower()
-    for token in tokens:
-        assert token.lower() in blob, f"expected {token!r} referenced in validation envelope: {envelope}"
+    tenant_id = ctx["tenant"].tenant_id
+    with AccountUoW(tenant_id) as uow:
+        account = uow.accounts.get_by_id(account_id)
+        if account is None:
+            return {"account_id": None, "urls": []}
+        return {"account_id": account.account_id, "urls": [str(a.url) for a in (account.governance_agents or [])]}
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -156,6 +157,40 @@ def given_no_binding(ctx: dict, account_id: str) -> None:
     )
 
 
+@given(parsers.parse('account "{account_id}" is currently bound to governance agent "{url}"'))
+def given_currently_bound(ctx: dict, account_id: str, url: str) -> None:
+    """Seed a prior binding by dispatching a FIRST sync (the real write path), so the
+    scenario's When exercises genuine replace-over-existing, not bind-from-empty. The
+    account must already be owned (a prior authority Given created it). Records the prior
+    url so the "no longer present" Then knows which account was replaced.
+    """
+    _dispatch(
+        ctx,
+        ctx.get("transport"),
+        idempotency_key="uuid-v4-prebind-00000000000001",
+        accounts=[_account_entry(account_id, [_agent(url)])],
+    )
+    acct = _wire_account(ctx, account_id)
+    assert acct["status"] == "synced", f"pre-binding first sync must succeed on {account_id!r}: {acct}"
+    ctx.setdefault("prior_bindings", {})[account_id] = url
+
+
+@given(parsers.parse('the agent has authority over the implicit account for brand "{brand}" on operator "{operator}"'))
+def given_authority_over_implicit(ctx: dict, brand: str, operator: str) -> None:
+    """Seed a natural-key account (brand.domain + operator, non-sandbox) the agent owns.
+
+    Unlike ``_owned_account`` (account_id only), the implicit-account scenario resolves by
+    natural key, so the row must carry the operator + brand.domain the request references.
+    """
+    tenant, principal = _tenant_principal(ctx)
+    account_id = "acc-nk-" + f"{brand}-{operator}".replace(".", "-")
+    account = AccountFactory(
+        tenant=tenant, account_id=account_id, operator=operator, brand={"domain": brand}, sandbox=False
+    )
+    AgentAccountAccessFactory(tenant=tenant, principal=principal, account=account)
+    ctx.setdefault("gov_accounts", {})[account_id] = account
+
+
 # ═══════════════════════════════════════════════════════════════════════
 # When — sync_governance dispatch (governance-specific)
 # ═══════════════════════════════════════════════════════════════════════
@@ -167,18 +202,43 @@ def given_no_binding(ctx: dict, account_id: str) -> None:
         'and one account "{account_id}" bound to governance agent "{url}" with Bearer credentials of length {n:d}'
     )
 )
-def when_sync_one_account(ctx: dict, transport: str, key: str, account_id: str, url: str, n: int) -> None:
-    _dispatch(ctx, transport, idempotency_key=key, accounts=[_account_entry(account_id, [_agent(url, cred_len=n)])])
-
-
 @when(
     parsers.parse(
         'the Buyer Agent sends a sync_governance request via {transport} with idempotency_key "{key}" '
         'and account "{account_id}" bound to governance agent "{url}" with Bearer credentials of length {n:d}'
     )
 )
-def when_sync_account_len(ctx: dict, transport: str, key: str, account_id: str, url: str, n: int) -> None:
+@when(
+    parsers.parse(
+        'the Buyer Agent sends a sync_governance request via {transport} with idempotency_key "{key}" '
+        'naming only account "{account_id}" bound to governance agent "{url}" with Bearer credentials of length {n:d}'
+    )
+)
+def when_sync_one_account(ctx: dict, transport: str, key: str, account_id: str, url: str, n: int) -> None:
+    """Sync a single named account. Three Gherkin phrasings share one body — "one account"
+    / "account" / "naming only account" (the last is the per-account replace-scope scenario,
+    which names only one of two owned accounts)."""
     _dispatch(ctx, transport, idempotency_key=key, accounts=[_account_entry(account_id, [_agent(url, cred_len=n)])])
+
+
+@when(
+    parsers.parse(
+        'the Buyer Agent sends a sync_governance request via {transport} with idempotency_key "{key}" '
+        'and one account referenced by brand "{brand}" on operator "{operator}" bound to governance agent "{url}" '
+        "with Bearer credentials of length {n:d}"
+    )
+)
+def when_sync_natural_key_account(
+    ctx: dict, transport: str, key: str, brand: str, operator: str, url: str, n: int
+) -> None:
+    """Sync governance to an account referenced by natural key (brand + operator), not id."""
+    ref = {"brand": {"domain": brand}, "operator": operator, "sandbox": False}
+    _dispatch(
+        ctx,
+        transport,
+        idempotency_key=key,
+        accounts=[{"account": ref, "governance_agents": [_agent(url, cred_len=n)]}],
+    )
 
 
 @when(
@@ -307,10 +367,18 @@ def then_accounts_count(ctx: dict, n: int) -> None:
 
 @then("the response variant is error")
 def then_variant_error(ctx: dict) -> None:
-    assert ctx.get("error") is not None, f"expected error variant, got response {ctx.get('response')!r}"
-    envelope = ctx.get("wire_error_envelope")
+    result = ctx["result"]
+    assert result.is_error, f"expected error variant, got response {ctx.get('response')!r}"
+    envelope = result.wire_error_envelope
     assert envelope is not None, "error variant must carry a two-layer wire error envelope"
-    assert "adcp_error" in envelope and envelope.get("errors"), f"malformed wire error envelope: {envelope}"
+    # Guard the envelope STRUCTURE (the specific code is pinned by the scenario's following
+    # step — `the error code is "X"` / a `then_error_*`): both layers present, their codes
+    # non-empty and AGREEING, and a recovery hint set. A single-layer or code-less envelope
+    # (Konstantin: "flip the code to garbage and this stays green") now fails here.
+    top = (envelope.get("adcp_error") or {}).get("code")
+    leaf = (envelope.get("errors") or [{}])[0].get("code")
+    assert top and leaf and top == leaf, f"malformed/disagreeing two-layer error codes: {envelope}"
+    assert (envelope.get("errors") or [{}])[0].get("recovery"), f"error missing recovery hint: {envelope}"
 
 
 @then("the response does NOT carry an operation-level errors array")
@@ -347,7 +415,7 @@ def then_echo_url(ctx: dict, account_id: str, idx: int, url: str) -> None:
     assert acct["account"]["account_id"] == account_id, f"wire must echo the requested account ref {account_id}"
     agents = acct.get("governance_agents") or []
     actual = agents[idx]["url"]
-    assert _url_eq(actual, url), f"account {account_id}: expected echoed url {url}, got {actual}"
+    assert url_eq(actual, url), f"account {account_id}: expected echoed url {url}, got {actual}"
 
 
 @then(parsers.parse('the response account "{account_id}" does NOT echo governance_agents[{idx:d}].authentication'))
@@ -399,33 +467,94 @@ def then_per_account_suggestion(ctx: dict, field: str) -> None:
 
 
 # ═══════════════════════════════════════════════════════════════════════
+# Then — persisted binding (replace semantics; reads below the wire)
+# ═══════════════════════════════════════════════════════════════════════
+#
+# The wire echo shows the current sync's result, so proving REPLACE (prior binding gone)
+# and per-account SCOPE (an unnamed account untouched) requires reading the persisted row.
+# These read it back via _persisted_binding, matching the below-wire integration test
+# test_replace_semantics_overwrites_prior_binding (#1682 review item 3).
+
+
+@then(parsers.parse('the persisted governance agent on "{account_id}" is "{url}"'))
+def then_persisted_binding_is(ctx: dict, account_id: str, url: str) -> None:
+    persisted = _persisted_binding(ctx, account_id)
+    assert persisted["account_id"] == account_id, f"account {account_id!r} not persisted"
+    urls = persisted["urls"]
+    assert len(urls) == 1 and url_eq(urls[0], url), (
+        f"expected {account_id} persisted binding == [{url!r}] (replace overwrites), got {urls}"
+    )
+
+
+@then(parsers.parse('the previous binding to "{url}" is no longer present'))
+def then_previous_binding_absent(ctx: dict, url: str) -> None:
+    # The replace scenario binds exactly one account; read it back and confirm the old url
+    # is gone (replace overwrote, not appended).
+    prior = ctx.get("prior_bindings") or {}
+    assert prior, "no prior binding recorded by the pre-binding Given"
+    account_id = next(iter(prior))
+    urls = _persisted_binding(ctx, account_id)["urls"]
+    assert not any(url_eq(p, url) for p in urls), f"stale binding {url!r} still present on {account_id}: {urls}"
+
+
+@then(parsers.parse('the binding on account "{account_id}" remains "{url}" unchanged'))
+def then_binding_unchanged(ctx: dict, account_id: str, url: str) -> None:
+    persisted = _persisted_binding(ctx, account_id)
+    assert persisted["account_id"] == account_id, f"account {account_id!r} not persisted"
+    urls = persisted["urls"]
+    assert len(urls) == 1 and url_eq(urls[0], url), (
+        f"account {account_id} binding must remain [{url!r}] unchanged (per-account replace scope), got {urls}"
+    )
+
+
+@then(parsers.parse('the account for brand "{brand}" on operator "{operator}" has status "{status}"'))
+def then_natural_key_account_status(ctx: dict, brand: str, operator: str, status: str) -> None:
+    accounts = _wire_accounts(ctx)
+    assert len(accounts) == 1, f"expected exactly one wire account for the natural-key request, got {accounts}"
+    acct = accounts[0]
+    assert acct["status"] == status, f"expected status {status!r}, got {acct.get('status')!r}: {acct}"
+    ref = acct.get("account") or {}
+    assert (ref.get("brand") or {}).get("domain") == brand and ref.get("operator") == operator, (
+        f"wire must echo the requested natural key (brand={brand}, operator={operator}), got {ref}"
+    )
+
+
+# ═══════════════════════════════════════════════════════════════════════
 # Then — validation / boundary wire errors (governance-specific)
 # ═══════════════════════════════════════════════════════════════════════
 
 
+# These route through the harness's guarded, transport-independent error grader
+# (result.assert_wire_error) rather than scanning str(envelope): recovery defaults to the
+# pinned AdCP enum (not a hardcoded "correctable"). Field-level violations pin the STRUCTURED
+# errors[0].field (transport-stable — the MCP TypeAdapter boundary emits only the leaf message
+# "String should have at least 32 characters" while REST/A2A carry the full field path, but
+# field is identical across all three). The url https-requirement is a model validator, so its
+# field is empty but its message is transport-stable → assert the message there. Verified against
+# the real per-transport envelopes (#1682 review item 2).
 @then("the error references the url field and indicates https is required")
 def then_error_url_https(ctx: dict) -> None:
-    _assert_wire_validation(ctx, "url", "https")
+    ctx["result"].assert_wire_error("VALIDATION_ERROR", message_substr="url must use https")
 
 
 @then("the error references the credentials field")
 def then_error_credentials(ctx: dict) -> None:
-    _assert_wire_validation(ctx, "credentials")
+    ctx["result"].assert_wire_error("VALIDATION_ERROR", field_substr="credentials")
 
 
 @then("the error references the governance_agents cardinality")
 def then_error_cardinality(ctx: dict) -> None:
-    _assert_wire_validation(ctx, "governance_agents")
+    ctx["result"].assert_wire_error("VALIDATION_ERROR", field_substr="governance_agents")
 
 
 @then("the error references the accounts array size")
 def then_error_accounts_size(ctx: dict) -> None:
-    _assert_wire_validation(ctx, "accounts")
+    ctx["result"].assert_wire_error("VALIDATION_ERROR", field_substr="accounts")
 
 
 @then("the error code indicates the missing idempotency_key")
 def then_error_missing_key(ctx: dict) -> None:
-    _assert_wire_validation(ctx, "idempotency_key")
+    ctx["result"].assert_wire_error("VALIDATION_ERROR", field_substr="idempotency_key")
 
 
 @then(parsers.parse('the response outcome is "{outcome}"'))
@@ -437,7 +566,9 @@ def then_response_outcome(ctx: dict, outcome: str) -> None:
         assert ctx.get("error") is None, f"expected accepted, got error {ctx.get('error')!r}"
         _require_response(ctx)
     elif outcome == "rejected":
-        assert ctx.get("error") is not None, f"expected rejected, got response {ctx.get('response')!r}"
-        assert ctx.get("wire_error_envelope") is not None, "rejected must carry a wire error envelope"
+        # A too-short / malformed idempotency_key violates the request schema, so the
+        # rejection is a VALIDATION_ERROR on the wire. Grade the code + pinned-enum recovery
+        # via the guarded helper, not just "an envelope exists".
+        ctx["result"].assert_wire_error("VALIDATION_ERROR")
     else:
         raise AssertionError(f"unknown outcome {outcome!r}")

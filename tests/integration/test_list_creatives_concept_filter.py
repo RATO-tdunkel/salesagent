@@ -23,7 +23,7 @@ import pytest
 
 from tests.harness import CreativeListEnv
 from tests.harness.transport import ALL_WIRE, Transport
-from tests.helpers import assert_envelope_shape
+from tests.helpers.creative_test_helpers import assert_empty_array_filter_rejected
 
 pytestmark = [pytest.mark.integration, pytest.mark.requires_db]
 
@@ -63,17 +63,7 @@ class TestConceptIdsFilterValidation:
         """Wire transports surface the two-layer VALIDATION_ERROR envelope with a suggestion."""
         with CreativeListEnv() as env:
             _seed_authenticated_principal(env)
-
-            result = env.call_via(transport, filters={"concept_ids": []})
-
-            envelope = result.wire_error_envelope
-            assert envelope is not None, f"{transport}: no wire error envelope captured"
-            assert_envelope_shape(envelope, "VALIDATION_ERROR", recovery="correctable")
-            # POST-F3: the buyer is told how to recover. wire_error_envelope is always
-            # a dict here (the AdCPToolError accessor lives in assert_envelope_shape).
-            assert envelope["errors"][0].get("suggestion"), (
-                f"{transport}: VALIDATION_ERROR envelope must carry a recovery suggestion: {envelope['errors'][0]}"
-            )
+            assert_empty_array_filter_rejected(env, transport, "concept_ids")
 
 
 class TestNumericConceptCoercion:

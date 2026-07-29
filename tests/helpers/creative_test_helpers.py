@@ -11,10 +11,43 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 from datetime import UTC, datetime
+from typing import Any
 from unittest.mock import MagicMock, Mock, patch
 
 from tests.factories.creative_asset import AssetSpec, assert_assets, build_assets, image_spec
 from tests.harness import make_mock_uow
+
+
+def seed_creative_in_status(tenant: Any, principal: Any, status: str = "approved") -> str:
+    """Create one creative owned by *principal* in *status*; return its creative_id.
+
+    The single seeder for the #1502 statuses-filter integration tests (and available to
+    any test that needs one status-varying creative). Only ``status`` varies per call —
+    the remaining fields (format, data with real assets) come from CreativeFactory
+    defaults, which already satisfy the repository's ``data["assets"] IS NOT NULL`` guard.
+    """
+    from tests.factories import CreativeFactory
+
+    return CreativeFactory(tenant=tenant, principal=principal, status=status).creative_id
+
+
+def assert_empty_array_filter_rejected(env: Any, transport: Any, field: str) -> None:
+    """Assert ``filters={field: []}`` (a minItems:1 violation) is rejected with a two-layer
+    VALIDATION_ERROR envelope carrying a recovery suggestion, on the given wire transport.
+
+    Shared by the concept_ids and statuses empty-array validation tests: structurally the
+    same operation with only the filter field substituted, so it lives here once rather than
+    copy-pasted per filter (DRY). POST-F3 requires the buyer be told how to recover.
+    """
+    from tests.helpers.envelope_assertions import assert_envelope_shape
+
+    result = env.call_via(transport, filters={field: []})
+    envelope = result.wire_error_envelope
+    assert envelope is not None, f"{transport}: no wire error envelope captured for empty {field}"
+    assert_envelope_shape(envelope, "VALIDATION_ERROR", recovery="correctable")
+    assert envelope["errors"][0].get("suggestion"), (
+        f"{transport}: VALIDATION_ERROR envelope must carry a recovery suggestion: {envelope['errors'][0]}"
+    )
 
 
 def make_creative_dict(creative_id: str = "c1", name: str = "Test Banner") -> dict:

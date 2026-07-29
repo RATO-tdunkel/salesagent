@@ -214,14 +214,16 @@ def _list_creatives_impl(
 
     # Derive flat DB-query params from the structured request.
     req_filters = req.filters
-    # statuses filter (CreativeFilters.statuses in core/creative-filters.json, "match any
-    # of these"): thread the full structured list into the DB query, not just the first
-    # status — otherwise a buyer's multi-status filter is silently narrowed and the
-    # response misrepresents what shaped the result set. The flat `status` param is already
-    # folded into req_filters.statuses (flat wins) by _build_list_creatives_request, so this
-    # merged list is the single source of truth — filters_applied reports it verbatim below.
-    # CreativeStatus enums -> string values to match the String status column (mirrors
-    # MediaBuyRepository.get_by_principal's list[str]).
+    # statuses filter (CreativeFilters.statuses in core/creative-filters.json): an array
+    # with match-any semantics (grounded in the array/minItems:1 shape and the file's
+    # top-level archived-by-default description, not a verbatim per-field phrase). Thread
+    # the FULL structured list into the DB query, not just the first status — otherwise a
+    # buyer's multi-status filter is silently narrowed to its first element and the buyer
+    # receives FEWER creatives than filters_applied claims. The flat `status` param is
+    # already folded into req_filters.statuses (flat wins) by _build_list_creatives_request,
+    # so this merged list is the single source of truth — filters_applied reports it
+    # verbatim below. CreativeStatus enums -> string values to match the String status
+    # column (mirrors MediaBuyRepository.get_by_principal's list[str]).
     effective_statuses = [enum_value(s) for s in req_filters.statuses] if req_filters and req_filters.statuses else None
     tags = req_filters.tags if req_filters else None
     created_after_dt = req_filters.created_after if req_filters else None

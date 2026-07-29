@@ -195,6 +195,26 @@ class TestCreativeRepoGetByPrincipal:
             assert result.total_count == 2
             assert {c.creative_id for c in result.creatives} == {"c_approved", "c_rejected"}
 
+    def test_statuses_none_returns_all_statuses(self, integration_db):
+        """#1502: statuses=None skips the filter — every status returns, not just one.
+
+        Guards the ``if statuses is not None`` gate over a MIXED set. The count test above
+        (test_returns_creative_list_result) seeds a single uniform status, so it cannot
+        catch a gate that accidentally narrowed the no-filter path.
+        """
+        with _RepoEnv() as env:
+            tenant = TenantFactory(tenant_id="test_tenant")
+            principal = PrincipalFactory(tenant=tenant, principal_id="p1")
+            CreativeFactory(tenant=tenant, principal=principal, creative_id="c_approved", status="approved")
+            CreativeFactory(tenant=tenant, principal=principal, creative_id="c_rejected", status="rejected")
+            CreativeFactory(tenant=tenant, principal=principal, creative_id="c_archived", status="archived")
+
+            session = env.get_session()
+            repo = CreativeRepository(session, "test_tenant")
+            result = repo.get_by_principal("p1")
+
+            assert {c.creative_id for c in result.creatives} == {"c_approved", "c_rejected", "c_archived"}
+
 
 class TestCreativeRepoListByPrincipal:
     """list_by_principal — all creatives without pagination."""

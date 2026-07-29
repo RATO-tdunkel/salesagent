@@ -133,13 +133,20 @@ class CreativeRepository:
                 Creative.creative_id == CreativeAssignment.creative_id,
             ).where(CreativeAssignment.media_buy_id.in_(media_buy_ids))
 
-        # statuses filter (CreativeFilters.statuses in core/creative-filters.json): "match
-        # any of these statuses". Applied inside the already tenant+principal-scoped
-        # statement, so it can only narrow, never widen. Mirrors
+        # statuses filter (CreativeFilters.statuses in core/creative-filters.json). It is an
+        # array with match-any semantics — a creative matches if its status is any one of
+        # the requested statuses. (That semantics comes from the array/minItems:1 shape and
+        # the file's top-level "archived ... excluded by default ... unless in the statuses
+        # array" description; the per-field description is only "Filter by creative approval
+        # statuses", so match-any is not verbatim spec text.) Applied inside the already
+        # tenant+principal-scoped statement, so it can only narrow, never widen. Mirrors
         # MediaBuyRepository.get_by_principal (same list[str] param, same `is not None`
-        # gate): None skips the filter. The list_creatives caller passes None (not []) to
-        # mean "unfiltered" — an empty statuses array is a minItems:1 validation error
-        # upstream (core/creative-filters.json), so [] never legitimately reaches here.
+        # gate): None skips the filter. The `is not None` gate deliberately diverges from
+        # the truthy-gate siblings below (concept_ids/tags/created_*): it holds the
+        # MediaBuyRepository parity, and is behaviorally identical on the reachable domain
+        # anyway — the list_creatives caller passes None (not []) for "unfiltered", and an
+        # empty statuses array is a minItems:1 validation error upstream, so [] never
+        # legitimately reaches here.
         if statuses is not None:
             stmt = stmt.where(Creative.status.in_(statuses))
 

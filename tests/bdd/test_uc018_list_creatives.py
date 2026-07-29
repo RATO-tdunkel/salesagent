@@ -32,11 +32,18 @@ The first two are pinned at v3.1-04f59d2d5 (adcp 3.1.0-beta.3).
 - ``T-UC-018-inv-146-2-holds`` / ``-inv-146-2-violated`` / ``-inv-146-3-holds`` (#1502):
   BR-RULE-146 ``filters.statuses`` match-any — an explicit statuses array scopes the
   result set to creatives in any of those statuses via ``Creative.status.in_(...)``.
-  These grade the exact behavior #1621 fixes (threading the FULL structured list, not
-  just the flat singular status). Source: adcp ``core/creative-filters.json`` (statuses).
-  Deliberately NOT wired here: ``inv-146-1-holds`` (no-filter archival-DEFAULT exclusion)
-  is a separate, unimplemented production feature (#1738), and the ``@creative-status``
-  boundary outline's ``["deleted"]`` / ``[]`` rows are validation-error wiring (#1652).
+  ``inv-146-3-holds`` is the one that grades the exact bug #1502 fixes: its "contains 3
+  creatives" COUNT assertion reddens under the real regression — a multi-value array
+  ``["approved", "rejected"]`` narrowed to its first element ``["approved"]`` drops the
+  rejected creative, so 2 come back, not 3 (its "none archived" assertion still holds, so
+  it is specifically the count that grades this). The other two pin single-status match-any
+  (archived returned when requested; excluded when not) and would pass on the unfixed code,
+  where a single-element filter was already applied. Source: adcp
+  ``core/creative-filters.json`` (statuses). Deliberately NOT wired here:
+  ``inv-146-1-holds`` (no-filter archival-DEFAULT exclusion) is a separate, unimplemented
+  production feature (#1738); the ``@creative-status`` boundary outline's ``["deleted"]``
+  row and the ``@boundary-default-query`` outline's ``[]`` (empty-array) row are
+  validation-error wiring (#1652).
 
 Wired to real production across all wire transports (auto-parametrized; UC-018
 -> CreativeListEnv via conftest ``_detect_uc`` / ``_harness_env``). The repo
@@ -97,23 +104,23 @@ def _seed_creative(
     principal: Any,
     fmt: str | None = None,
     *,
+    status: str = "approved",
     concept_id: str | None = None,
     concept_name: str | None = None,
 ) -> Any:
-    """Seed one approved creative owned by *principal*, optionally concept-tagged.
+    """Seed one creative owned by *principal* in *status*, optionally concept-tagged.
 
-    The single place this module assembles a creative: the ``approved`` trait
-    supplies ``status="approved"`` and CreativeFactory's realistic default ``assets``
-    (which already satisfy the repository's ``data["assets"] IS NOT NULL`` guard — an
-    empty ``{"assets": {}}`` is unnecessary). When a concept is given, its
-    ``concept_id`` / ``concept_name`` are layered onto those realistic assets in this
-    one merge site. Replaces the per-seeder ``status=`` + ``data={"assets": {}}``
-    hand-rolls with a single factory idiom.
+    The single place this module assembles a creative. ``status`` defaults to
+    ``"approved"`` (what every list-all / concept / isolation caller wants); the statuses
+    scenarios pass an explicit status to vary it. CreativeFactory's realistic default
+    ``assets`` already satisfy the repository's ``data["assets"] IS NOT NULL`` guard, so an
+    empty ``{"assets": {}}`` is unnecessary. When a concept is given, its ``concept_id`` /
+    ``concept_name`` are layered onto those realistic assets in this one merge site.
     """
     from tests.factories import CreativeFactory
     from tests.factories.creative_asset import build_assets, image_spec
 
-    kwargs: dict[str, Any] = {"tenant": tenant, "principal": principal, "approved": True}
+    kwargs: dict[str, Any] = {"tenant": tenant, "principal": principal, "status": status}
     if fmt is not None:
         kwargs["format"] = fmt
     if concept_id or concept_name:
@@ -199,7 +206,6 @@ def given_recently_synced_three_creatives(ctx: dict) -> None:
     tenant, principal = _get_or_create_tenant_and_principal(env)
     synced_ids = [_seed_creative(tenant, principal, fmt).creative_id for fmt in _SYNCED_FORMATS]
     ctx["tenant"] = tenant
-    ctx["principal"] = principal
     ctx["synced_creative_ids"] = synced_ids
 
 
@@ -211,9 +217,10 @@ def when_list_creatives_no_filters(ctx: dict) -> None:
     """Dispatch list_creatives with no filters through the scenario's transport.
 
     Reuses the canonical generic dispatch helper (``env.call_via`` + ctx stash of
-    ``response`` / ``wire_response`` / ``error``) rather than re-implementing it.
-    No filter kwargs are passed, so the listing runs unfiltered; the helper maps a
-    missing transport to IMPL.
+    ``response`` / ``wire_response`` / ``error``) rather than re-implementing it. No filter
+    kwargs are passed, so the listing runs unfiltered. Every wired scenario is parametrized
+    with a wire transport (a2a/mcp/rest); ``_call_via`` raises on a missing or unrecognized
+    transport rather than silently falling back to IMPL.
     """
     from tests.bdd.steps.generic.when_request import _call_via
 
@@ -334,21 +341,26 @@ def given_creatives_grouped_under_concept(ctx: dict, concept_id: str) -> None:
     _seed_creative(tenant, principal, _CONCEPT_FORMATS[0])
 
     ctx["tenant"] = tenant
-    ctx["principal"] = principal
     ctx["concept_id"] = concept_id
     ctx["in_concept_creative_ids"] = in_concept_ids
 
 
-@when(parsers.re(r"the Buyer Agent sends list_creatives with filters\.concept_ids \[(?P<concept_list>.+)\]"))
-def when_list_creatives_concept_ids(ctx: dict, concept_list: str) -> None:
-    """Dispatch list_creatives with a structured filters.concept_ids filter.
+def _dispatch_structured_filter(ctx: dict, field: str, bracketed: str) -> list[str]:
+    """Parse a bracketed ``"a", "b"`` list from step text, dispatch list_creatives with
+    ``filters.<field>`` set to it through the scenario's transport, and return the values.
 
-    Parses the bracketed concept-id list from the step text and dispatches the
-    structured filter through the scenario's transport via the canonical helper.
-    The filter travels as a JSON dict (built through CreativeFilters so minItems/
-    field validation runs); each wire transport coerces it back to CreativeFilters
-    server-side (FastMCP TypeAdapter / A2A skill / REST body), so a dict is the one
-    shape that works uniformly across a2a/mcp/rest (IMPL is sunsetted in BDD).
+    Both structured-filter When steps (concept_ids, statuses) are the same operation with
+    only the field name substituted: parse the quoted values, build a validated
+    ``CreativeFilters`` dict (so minItems / enum validation runs client-side), and forward
+    it as a dict — the one shape that coerces back to CreativeFilters uniformly across
+    a2a/mcp/rest server-side (FastMCP TypeAdapter / A2A skill / REST body; IMPL is sunsetted
+    in BDD).
+
+    NOTE: the filter is built client-side through ``CreativeFilters``, so a bracketed value
+    that violates the schema (the gated boundary rows ``["deleted"]`` / ``[]``) raises a
+    Pydantic error HERE rather than producing a wire ``VALIDATION_ERROR``. Wiring those rows
+    (#1652) needs a dict-passthrough dispatch that skips this client-side build, not this
+    helper.
     """
     import re
 
@@ -356,11 +368,18 @@ def when_list_creatives_concept_ids(ctx: dict, concept_list: str) -> None:
 
     from tests.bdd.steps.generic.when_request import _call_via
 
-    concept_ids = re.findall(r'"([^"]+)"', concept_list)
-    assert concept_ids, f"no concept ids parsed from {concept_list!r}"
-    ctx["requested_concept_ids"] = concept_ids
-    filters = CreativeFilters(concept_ids=concept_ids).model_dump(mode="json", exclude_none=True)
+    values = re.findall(r'"([^"]+)"', bracketed)
+    assert values, f"no {field} values parsed from {bracketed!r}"
+    filters = CreativeFilters(**{field: values}).model_dump(mode="json", exclude_none=True)
     _call_via(ctx, ctx.get("transport"), filters=filters)
+    return values
+
+
+@when(parsers.re(r"the Buyer Agent sends list_creatives with filters\.concept_ids \[(?P<concept_list>.+)\]"))
+def when_list_creatives_concept_ids(ctx: dict, concept_list: str) -> None:
+    """Dispatch list_creatives with a structured filters.concept_ids filter (see
+    ``_dispatch_structured_filter``). Records the requested ids for the Then steps."""
+    ctx["requested_concept_ids"] = _dispatch_structured_filter(ctx, "concept_ids", concept_list)
 
 
 def _wire_creatives(ctx: dict) -> list[dict[str, Any]]:
@@ -552,18 +571,25 @@ def then_none_belong_to(ctx: dict, principal_id: str) -> None:
 # ── @BR-RULE-146 statuses-filter invariants (#1502) ─────────────────────
 #
 # BR-RULE-146: filters.statuses is a match-any array — a creative is returned iff its
-# status is one of the requested statuses (AdCP 3.1.1 core/creative-filters.json:
-# "match any of these statuses"). These invariants grade the exact behavior #1621
-# fixes — threading the FULL structured statuses list into Creative.status.in_(...),
-# not just the flat singular status. Wired (explicit-statuses success path):
+# status is one of the requested statuses (AdCP 3.1.1 core/creative-filters.json — the
+# array/minItems:1 shape plus the file's top-level archived-by-default description; the
+# per-field description is only "Filter by creative approval statuses"). Wired
+# (explicit-statuses success path):
 #   inv-146-2-holds     statuses ["archived"]            -> only archived
 #   inv-146-2-violated  statuses ["approved"]            -> approved, none archived
 #   inv-146-3-holds     statuses ["approved","rejected"] -> match-any, none archived
 #
-# Enforcement site: CreativeRepository.get_by_principal's Creative.status.in_(...),
-# fed by _list_creatives_impl.effective_statuses. Neutering either leaks the
-# out-of-filter statuses and fails these scenarios (the archived/other-status decoys
-# are the falsifiable negative controls).
+# What grades the #1502 fix: inv-146-3-holds, specifically its "contains 3 creatives" COUNT
+# assertion. Pre-fix the multi-value array was narrowed to its first element ["approved"],
+# dropping the rejected creative -> 2 returned, not 3, so the count reddens (its "none
+# archived" assertion holds either way). The other two pin single-status match-any and pass
+# on the unfixed code (a single-element filter was already applied), so they guard the
+# semantics, not the regression.
+#
+# Enforcement site: CreativeRepository.get_by_principal's Creative.status.in_(...), fed by
+# _list_creatives_impl.effective_statuses. Reverting the full-list threading (back to
+# statuses[0]) reddens inv-146-3-holds's count; the archived/other-status decoys are the
+# falsifiable negative controls for the "none/all returned have status" assertions.
 #
 # Per-scenario tenant isolation (mirrors @BR-RULE-034): the assertions pin exact
 # counts under a NON-unique status filter, so a survivor from a prior e2e_rest scenario
@@ -571,31 +597,25 @@ def then_none_belong_to(ctx: dict, principal_id: str) -> None:
 # tenant; the When re-authenticates the buyer under it (seeds now committed).
 
 
-def _seed_creative_in_status(tenant: Any, principal: Any, status: str) -> str:
-    """Seed one creative owned by *principal* in an explicit *status*; return its id.
-
-    Unlike ``_seed_creative`` (which forces the ``approved`` trait), the statuses
-    scenarios vary only the status, so it is passed through directly. CreativeFactory's
-    default ``data`` still carries realistic assets, so the row survives the
-    repository's ``data["assets"] IS NOT NULL`` guard.
-    """
-    from tests.factories import CreativeFactory
-
-    return CreativeFactory(tenant=tenant, principal=principal, status=status).creative_id
-
-
 def _seed_statuses_in_fresh_tenant(ctx: dict, counts: dict[str, int]) -> None:
-    """Seed ``{status: count}`` creatives for the Background buyer in a fresh tenant."""
+    """Seed ``{status: count}`` creatives for the Background buyer in a fresh tenant.
+
+    Each statuses scenario has exactly one Given, so the fresh tenant is created
+    unconditionally. The assert guards against a future two-Given scenario silently
+    re-pointing ``env`` at a second tenant and orphaning the first Given's rows — the
+    exact-count Thens would then grade against the wrong data and pass vacuously. Seeds via
+    the shared ``_seed_creative`` (status passed through; return value unused here).
+    """
     from tests.factories import PrincipalFactory
 
+    assert ctx.get("tenant") is None, "statuses seeder expects a single Given per scenario (no pre-existing tenant)"
     env = ctx["env"]
     tenant = _fresh_tenant(env, "uc018_status")
     principal = PrincipalFactory(tenant=tenant, principal_id=ctx["principal_id"])
     ctx["tenant"] = tenant
-    ctx["principal"] = principal
     for status, count in counts.items():
         for _ in range(count):
-            _seed_creative_in_status(tenant, principal, status)
+            _seed_creative(tenant, principal, status=status)
 
 
 @given(
@@ -621,24 +641,14 @@ def given_principal_has_approved_rejected_archived(ctx: dict, approved: str, rej
 
 @when(parsers.re(r"the Buyer Agent sends a list_creatives request with statuses filter \[(?P<status_list>[^\]]+)\]"))
 def when_list_creatives_statuses_filter(ctx: dict, status_list: str) -> None:
-    """Dispatch list_creatives with a structured filters.statuses filter.
+    """Dispatch list_creatives with a structured filters.statuses filter (see
+    ``_dispatch_structured_filter``).
 
-    Re-authenticates the buyer under the scenario's fresh tenant (seeds now committed)
-    — mirrors the isolation When — then sends filters.statuses as a validated
-    CreativeFilters dict through the scenario's transport (the one shape that coerces
-    back to CreativeFilters uniformly across a2a/mcp/rest server-side).
+    The one distinct line: re-authenticate the buyer under the scenario's fresh tenant
+    (seeds now committed) before dispatching — mirrors the isolation When.
     """
-    import re
-
-    from adcp import CreativeFilters
-
-    from tests.bdd.steps.generic.when_request import _call_via
-
-    statuses = re.findall(r'"([^"]+)"', status_list)
-    assert statuses, f"no statuses parsed from {status_list!r}"
     authenticate_env_as(ctx, ctx["principal_id"])
-    filters = CreativeFilters(statuses=statuses).model_dump(mode="json", exclude_none=True)
-    _call_via(ctx, ctx.get("transport"), filters=filters)
+    _dispatch_structured_filter(ctx, "statuses", status_list)
 
 
 @then(parsers.parse('all returned creatives have status "{status}"'))

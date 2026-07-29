@@ -3419,9 +3419,10 @@ def _harness_env(request: pytest.FixtureRequest, ctx: dict) -> Generator[None, N
         # @BR-RULE-146 explicit-statuses success invariants wired for #1502 (statuses
         # match-any). Admitted by exact scenario id, NOT the shared @BR-RULE-146 tag:
         # inv-146-1-holds (no-filter archival DEFAULT exclusion) is a separate,
-        # unimplemented production feature (#1738), and the @creative-status boundary
-        # outline's ["deleted"]/[] rows are validation-error wiring (#1652) — both stay
-        # xfailed here rather than routed into a failing run.
+        # unimplemented production feature (#1738; named xfail below), and the boundary
+        # validation-error rows — the @creative-status outline's ["deleted"] row and the
+        # @boundary-default-query outline's [] (empty-array) row — are wiring tracked in
+        # #1652. All stay xfailed here rather than routed into a failing run.
         _wired_statuses_scenarios = {
             "T-UC-018-inv-146-2-holds",
             "T-UC-018-inv-146-2-violated",
@@ -3438,6 +3439,11 @@ def _harness_env(request: pytest.FixtureRequest, ctx: dict) -> Generator[None, N
                 yield
         elif "T-UC-018-ext-c" in marker_names:
             pytest.xfail("T-UC-018-ext-c list_creatives validation harness wiring is tracked in #1652")
+        elif "T-UC-018-inv-146-1-holds" in marker_names:
+            pytest.xfail(
+                "BR-RULE-146 INV-1 (no-filter archival-DEFAULT exclusion) is an unimplemented "
+                "production feature tracked in #1738, not a test-wiring gap"
+            )
         else:
             pytest.xfail(
                 "UC-018 harness wired only for the @list-after-sync (#1405), @concept-id (#1407), "

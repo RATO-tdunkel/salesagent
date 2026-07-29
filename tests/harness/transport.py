@@ -72,8 +72,10 @@ class Transport(StrEnum):
 
 # The three real wire transports (A2A, MCP, REST) — excludes IMPL (no wire) and the
 # E2E variants (need a live Docker stack). Shared by wire-level integration tests that
-# parametrize the same behavior across every transport a buyer can reach.
-ALL_WIRE = [Transport.A2A, Transport.MCP, Transport.REST]
+# parametrize the same behavior across every transport a buyer can reach. A tuple (not a
+# list) so a stray in-place mutation in one consumer can't silently re-parametrize every
+# other module that imports it; works unchanged with @pytest.mark.parametrize.
+ALL_WIRE: tuple[Transport, ...] = (Transport.A2A, Transport.MCP, Transport.REST)
 
 
 # Maps Transport → ResolvedIdentity.protocol value

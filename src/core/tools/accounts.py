@@ -14,7 +14,6 @@ beads: salesagent-hl0, salesagent-619
 """
 
 import base64
-import logging
 import uuid
 from datetime import UTC
 from typing import Annotated, Any
@@ -47,8 +46,6 @@ from src.core.schemas.account import (
 )
 from src.core.tool_context import ToolContext
 from src.core.transport_helpers import resolve_identity_from_context
-
-logger = logging.getLogger(__name__)
 
 
 def _db_account_to_schema(db_account: DBAccount) -> Account:
@@ -562,7 +559,7 @@ async def _sync_accounts_impl(
                 billing_val = _enum_to_str(entry.billing)
                 payment_terms_val = _enum_to_str(entry.payment_terms)
                 # governance_agents is not in the sync_accounts contract (owned by
-                # sync_governance, #1682 review Cluster B) — a fresh account starts
+                # sync_governance, #1329) — a fresh account starts
                 # with no binding (column defaults to NULL); it is set via UC-030.
 
                 account_id = _generate_account_id()

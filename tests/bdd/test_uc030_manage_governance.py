@@ -7,7 +7,7 @@ an undeclared capability) and the deferred/idempotency/boundary scenarios are
 routed to ``_UC030_XFAIL_TAGS`` with documented reasons. Step definitions come
 from ``tests.bdd.steps.domain.uc030_governance`` (+ shared generic steps).
 
-beads: #1329 (UC-030)
+#1329 (UC-030)
 """
 
 from __future__ import annotations

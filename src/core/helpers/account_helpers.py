@@ -2,15 +2,11 @@
 
 Bridges AccountReference from request payloads to validated account_id strings.
 Used by _create_media_buy_impl, _sync_creatives_impl, and _sync_governance_impl.
-``serialize_governance_agents`` below is the url-only projection that
-``AccountRepository.set_governance_binding`` uses to strip credentials on write.
 
 beads: salesagent-8n4
 """
 
 from __future__ import annotations
-
-from typing import Any
 
 from adcp.types import AccountReference, AccountReferenceById, AccountReferenceByNaturalKey
 
@@ -24,40 +20,6 @@ from src.core.exceptions import (
     AdCPAuthorizationError,
 )
 from src.core.resolved_identity import ResolvedIdentity
-
-
-def serialize_governance_agents(agents: Any) -> list[dict[str, Any]] | None:
-    """Project governance agents to the url-only ``accounts.governance_agents`` JSON shape.
-
-    The projection used by ``AccountRepository.set_governance_binding`` — the single write
-    path for ``accounts.governance_agents`` — to strip credentials before persisting. The
-    DB column model (``core.account.GovernanceAgent``) is url-only BY DESIGN: credentials
-    are write-only and MUST NEVER be persisted or echoed (sync_governance.mdx;
-    sync-governance-response.json ``governance_agents.items`` = url only). The request-side
-    ``GovernanceAgent`` carries ``authentication`` (schemes + credentials); this projects to
-    url-only for *both* dict and model inputs.
-
-    The credential strip is owned by the repository method, not scattered call-site
-    discipline (#1682 review item 6): governance bindings are persisted only via
-    ``set_governance_binding``, which routes through this projection. (A raw
-    ``update_fields(governance_agents=<credential dict>)`` would still bypass it — ``JSONType``
-    does not re-validate stored JSON down to url-only — but there is exactly one governance
-    writer and it goes through the repository method.)
-
-    Only the ``url`` is read (never re-validating the full request model through the
-    url-only DB model, which would ``extra="forbid"``-reject ``authentication`` in
-    dev/CI). ``AnyUrl`` is normalized to ``str`` via ``model_dump(mode="json")``.
-    Returns ``None`` for ``None`` input (unset field), mirroring the prior behavior.
-    """
-    from adcp.types.generated_poc.core.account import GovernanceAgent  # url-only DB column model
-
-    if agents is None:
-        return None
-    result: list[dict[str, Any]] = []
-    for agent in agents:
-        url = agent["url"] if isinstance(agent, dict) else agent.url
-        result.append(GovernanceAgent(url=url).model_dump(mode="json"))
-    return result
 
 
 def resolve_account(

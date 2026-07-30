@@ -129,7 +129,7 @@ Feature: BR-UC-030 Manage Governance Binding
     Given the Buyer Agent has an authenticated connection
     When the Buyer Agent sends a sync_governance request via MCP with idempotency_key "uuid-v4-maxitems-0000000000009" and account "acct-social-001" bound to TWO governance agents "https://governance.pinnacle-media.com" and "https://governance.acme-buyer.com"
     Then the response variant is error
-    And the error references the governance_agents cardinality
+    And the error references the governance_agents maximum cardinality
     # PRE-B4, BR-2
     # @source repo=adcp ref=v3.1-04f59d2d5 commit=04f59d2d5 path=static/schemas/source/account/sync-governance-request.json
 
@@ -138,7 +138,7 @@ Feature: BR-UC-030 Manage Governance Binding
     Given the Buyer Agent has an authenticated connection
     When the Buyer Agent sends a sync_governance request via MCP with idempotency_key "uuid-v4-minitems-0000000000010" and account "acct-social-001" with an empty governance_agents array
     Then the response variant is error
-    And the error references the governance_agents cardinality
+    And the error references the governance_agents minimum cardinality
     # PRE-B4, BR-2
     # @source repo=adcp ref=v3.1-04f59d2d5 commit=04f59d2d5 path=static/schemas/source/account/sync-governance-request.json
 
@@ -176,7 +176,9 @@ Feature: BR-UC-030 Manage Governance Binding
     When the Buyer Agent sends a sync_governance request via MCP with idempotency_key "uuid-v4-noauthor-0000000000013" and one account "acct-not-mine" bound to governance agent "https://governance.pinnacle-media.com" with Bearer credentials of length 64
     Then the response variant is success
     And the account "acct-not-mine" has status "failed"
-    And the per-account errors include a SCOPE_INSUFFICIENT or ACCOUNT_NOT_FOUND code
+    And the per-account errors include an ACCOUNT_NOT_FOUND code
+    And each per-account error should include a "recovery" field guiding remediation
+    And the per-account error message does not reveal whether the account exists
     # PRE-B8, BR-7
 
   @T-UC-030-sync-partial @sync @partial-failure @ext-b

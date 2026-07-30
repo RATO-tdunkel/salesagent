@@ -168,10 +168,12 @@ class TestSyncAccountsPreservesGovernanceBinding:
             )
             account_id = created.accounts[0].account_id
 
-            # 2. Bind a governance agent (url-only — exactly what sync_governance persists).
+            # 2. Bind a governance agent via the single governance-write path
+            #    (update_fields now refuses governance_agents; set_governance_binding
+            #    owns the url-only projection — #1682 review B).
             with AccountUoW("sync_gov") as uow:
                 repo: AccountRepository = uow.accounts
-                repo.update_fields(account_id, governance_agents=[{"url": gov_url}])
+                repo.set_governance_binding(account_id, [{"url": gov_url}])
 
             # 3. Re-sync the SAME natural key with a metadata change (billing) and NO
             #    governance_agents — this fires the update path (changes non-empty), the

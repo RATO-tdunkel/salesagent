@@ -797,3 +797,21 @@ class TestSupportedBillingParity:
         # `advertiser` is deliberately excluded — this seller has no direct
         # advertiser-billing relationship (see ck_accounts_billing rationale).
         assert "advertiser" not in advertised
+
+    def test_configured_billing_outside_permitted_set_is_filtered(self):
+        """A tenant-configured billing party outside {operator, agent} is dropped, not
+        advertised: the filter is the PERMITTED set, not the full BillingParty enum, so
+        the seller never claims a party sync_accounts would reject (#1682 review F)."""
+        from src.core.tools.capabilities import _build_account_capability
+
+        # `advertiser` is a valid enum member but NOT permitted → filtered → falls back.
+        cap = _build_account_capability({"supported_billing": ["advertiser"]})
+        assert {p.value for p in cap.supported_billing} == {"operator", "agent"}
+
+        # A permitted subset is honored (narrowing within {operator, agent}).
+        narrowed = _build_account_capability({"supported_billing": ["operator"]})
+        assert [p.value for p in narrowed.supported_billing] == ["operator"]
+
+        # A bogus value falls back to the default rather than advertising it.
+        bogus = _build_account_capability({"supported_billing": ["bogus"]})
+        assert {p.value for p in bogus.supported_billing} == {"operator", "agent"}

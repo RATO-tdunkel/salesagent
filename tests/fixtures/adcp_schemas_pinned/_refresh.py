@@ -2,12 +2,21 @@
 """Refresh the pinned AdCP JSON-schema fixtures used by test_pydantic_schema_alignment.
 
 Source of truth: adcontextprotocol/adcp @ commit
-    04f59d2d56d3d77033162c310e99a1188e4eb419  (tag v3.1-04f59d2d5, 2026-05-13)
+    04f59d2d56d3d77033162c310e99a1188e4eb419  (2026-05-13)
 
-This commit is an INTENTIONAL, frozen reference point for AdCP 3.1 semantics. The
-upstream adcp repo ships constantly and `/schemas/latest` drifts; we deliberately do
-NOT track it. The commit is immutable on GitHub, so the schemas are vendored here
-(committed) — the alignment test reads them offline and never fetches `/schemas/latest`.
+This commit is an INTENTIONAL, frozen reference point. The upstream adcp repo ships
+constantly and `/schemas/latest` drifts; we deliberately do NOT track it. The commit
+is immutable on GitHub, so the schemas are vendored here (committed) — the alignment
+test reads them offline and never fetches `/schemas/latest`.
+
+HONEST SCOPE (do not overcite): this SHA is a 3.0.x-era snapshot — its `package.json`
+version is 3.0.3 and `dist/schemas/` has no 3.1.x directory (tops out at 3.0.12). It
+is pinned for the STABLE semantics the tests actually read — the error-code enum's
+`recovery` classifications and the request-schema field constraints — which are
+identical to 3.1.1 for every code/field present in both. It is NOT a full 3.1.1 mirror:
+3.1.1-only artifacts (e.g. the protocol-envelope `status` field, error codes added
+after 3.0.x) are absent, so do not cite this fixture as "the pinned 3.1.1 schema" for
+those. Advancing the pin to a true 3.1.1 SHA is a separate, reviewed change.
 
 Layout: schema `$id`/`$ref` namespace is `/schemas/<rest>`; each is written to
 `<this dir>/<rest>` (so `/schemas/core/account-ref.json` -> `core/account-ref.json`).

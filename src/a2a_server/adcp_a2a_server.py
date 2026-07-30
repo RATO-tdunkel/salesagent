@@ -589,7 +589,13 @@ class AdCPRequestHandler(RequestHandler):
         Returns:
             Task object or Message response
         """
-        logger.info("Handling message/send request: %s", params)
+        # Log only the message id, never the raw params: a sync_governance DataPart
+        # carries write-only credentials (authentication.credentials) that must not
+        # reach the application log (#1329).
+        logger.info(
+            "Handling message/send request (message_id=%s)",
+            getattr(getattr(params, "message", None), "message_id", None),
+        )
 
         # Parse message for both text and structured data parts
         message = params.message
@@ -706,7 +712,10 @@ class AdCPRequestHandler(RequestHandler):
                 for invocation in skill_invocations:
                     skill_name = invocation["skill"]
                     parameters = invocation["parameters"]
-                    logger.info("Processing explicit skill: %s with parameters: %s", skill_name, parameters)
+                    # Keys only, never values: parameters may carry write-only
+                    # credentials (sync_governance authentication.credentials).
+                    # Matches the keys-only sibling at _handle_explicit_skill (#1329).
+                    logger.info("Processing explicit skill: %s with parameters: %s", skill_name, sorted(parameters))
 
                     try:
                         result = await self._handle_explicit_skill(
@@ -1950,7 +1959,7 @@ class AdCPRequestHandler(RequestHandler):
         """
         from src.core.schemas.account import ListAccountsRequest
 
-        # Same context string as the REST route's boundary (klkg parity).
+        # Same context string as the REST route's boundary (A2A/REST parity).
         with adcp_validation_boundary(context="list_accounts request"):
             request = ListAccountsRequest(
                 status=parameters.get("status"),
@@ -1967,7 +1976,7 @@ class AdCPRequestHandler(RequestHandler):
         """
         from src.core.schemas.account import SyncAccountsRequest
 
-        # Same context string as the REST route's boundary (klkg parity).
+        # Same context string as the REST route's boundary (A2A/REST parity).
         with adcp_validation_boundary(context="sync_accounts request"):
             request = SyncAccountsRequest(
                 accounts=parameters.get("accounts", []),
@@ -2017,7 +2026,7 @@ class AdCPRequestHandler(RequestHandler):
                 "This parameter was removed in AdCP 2.5 and will be ignored."
             )
 
-        # Same context string as the REST route's boundary (klkg parity).
+        # Same context string as the REST route's boundary (A2A/REST parity).
         with adcp_validation_boundary(context="list_authorized_properties request"):
             request = ListAuthorizedPropertiesRequest(context=parameters.get("context"))
 

@@ -14,6 +14,11 @@ import re
 
 import pytest
 
+# Repo root, anchored to THIS file — not the cwd. A cwd-relative path made the
+# guard vacuous when pytest ran from src/ (every file "not found" → zero sites →
+# green while scanning nothing). Mirrors test_architecture_repository_pattern (#1682 review G).
+ROOT = pathlib.Path(__file__).resolve().parents[2]
+
 # Files that should have zero ToolError raises in _impl functions
 SIMPLE_MODULE_FILES = [
     "src/core/main.py",
@@ -46,9 +51,10 @@ def _find_toolerror_raises(filepath: str) -> list[tuple[int, str]]:
 
     Returns list of (line_number, code_snippet) tuples.
     """
-    path = pathlib.Path(filepath)
-    if not path.exists():
-        return []
+    path = ROOT / filepath
+    # Loud, not vacuous: a scanned file that has moved/renamed must redden the guard,
+    # not silently skip (the old cwd-relative `not exists -> return []` masked that).
+    assert path.exists(), f"scanned _impl file not found (moved/renamed?): {filepath}"
 
     source = path.read_text()
     try:

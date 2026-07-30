@@ -31,6 +31,7 @@ def assert_envelope_shape(
     *,
     recovery: str,
     message_substr: str | None = None,
+    field: str | None = None,
     field_substr: str | None = None,
     check_mcp_tool_error: bool = False,
 ) -> None:
@@ -53,14 +54,18 @@ def assert_envelope_shape(
         message_substr: If provided, must appear in ``errors[0].message``.
                 ``adcp_error.message`` is allowed to differ (it carries the
                 envelope-level summary).
-        field_substr: If provided, must appear in ``errors[0].field`` (the
-                structured field pointer, e.g. ``accounts[0].governance_agents``).
-                Prefer this over ``message_substr`` for field-level validation
-                errors: the MCP TypeAdapter boundary emits only the leaf Pydantic
-                message (``"String should have at least 32 characters"``) while
-                REST/A2A carry the full formatted message, but ``field`` is
-                identical across all three — so a field-name token is transport-
-                stable in ``field`` and not in ``message``.
+        field: If provided, must EXACTLY equal the structured field pointer on
+                BOTH layers (``errors[0].field`` and the mirrored
+                ``adcp_error.field``). Prefer this over ``field_substr``: a
+                substring token like ``accounts`` or ``governance_agents`` is a
+                prefix of several governance field paths, so it stays green on a
+                field wrong for the scenario (e.g. the credentials path). Exact
+                equality on both layers is transport-stable (the MCP TypeAdapter
+                boundary diverges on ``message``, not ``field``) and strictly
+                stronger (#1682 review D).
+        field_substr: If provided, must appear in ``errors[0].field``. Weaker than
+                ``field`` (substring, one layer) — kept for cases where the exact
+                path is not stable. Prefer ``field`` for field-level validation.
         check_mcp_tool_error: If ``True``, additionally assert that ``target``
                 is an ``AdCPToolError`` instance before reading its envelope.
                 MCP-boundary call sites use this to pin the exception type as
@@ -93,6 +98,13 @@ def assert_envelope_shape(
     if message_substr is not None:
         actual = body["errors"][0].get("message", "")
         assert message_substr in actual, f"errors[0].message={actual!r} does not contain {message_substr!r}"
+
+    if field is not None:
+        # Exact equality on BOTH layers — errors[0] and its adcp_error mirror.
+        actual_leaf = body["errors"][0].get("field")
+        assert actual_leaf == field, f"errors[0].field={actual_leaf!r}, expected exactly {field!r}"
+        actual_env = body["adcp_error"].get("field")
+        assert actual_env == field, f"adcp_error.field={actual_env!r}, expected exactly {field!r}"
 
     if field_substr is not None:
         actual_field = body["errors"][0].get("field") or ""

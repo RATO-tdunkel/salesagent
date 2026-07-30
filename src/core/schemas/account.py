@@ -30,6 +30,7 @@ from pydantic import ConfigDict, model_validator
 
 from src.core.config import get_pydantic_extra_mode
 from src.core.schemas._base import NestedModelSerializerMixin, SalesAgentBaseModel
+from src.core.security.url_validator import check_url_ssrf
 
 # ---------------------------------------------------------------------------
 # Core domain Account (used in ListAccountsResponse.accounts)
@@ -193,20 +194,43 @@ class SyncGovernanceRequest(LibrarySyncGovernanceRequest):
     model_config = ConfigDict(extra=get_pydantic_extra_mode())
 
     @model_validator(mode="after")
-    def _require_https_agent_urls(self) -> "SyncGovernanceRequest":
-        """Enforce the schema's ``url: ^https://`` constraint on governance agents.
+    def _validate_governance_agent_urls(self) -> "SyncGovernanceRequest":
+        """Enforce https, reject embedded credentials, and SSRF-validate agent urls.
 
-        The pinned 3.1.1 request schema marks the agent ``url`` ``pattern: ^https://``,
-        but the generated ``AnyUrl`` field does not carry that constraint (SDK codegen
-        gap) — an ``http://`` url would otherwise slip through. The spec is
-        authoritative, so we enforce it here at construction, uniformly across every
-        transport (MCP/A2A/REST all build this type).
+        Three construction-time gates, uniform across every transport (MCP/A2A/REST
+        all build this type):
+
+        1. **https** — the pinned 3.1.1 request schema marks the agent ``url``
+           ``pattern: ^https://``, but the generated ``AnyUrl`` field does not carry
+           that constraint (SDK codegen gap), so an ``http://`` url would slip
+           through. The spec is authoritative; enforce it here.
+        2. **no userinfo** — ``https://user:pass@host/`` embeds a credential in the
+           url, which SSRF hostname checks skip (they read only the host) and which
+           would otherwise be persisted verbatim and echoed on the wire. Reject it
+           so no credential rides in the url (#1329).
+        3. **SSRF** — the persisted url is a future ``check_governance`` target;
+           reject private/internal/loopback/metadata hosts at bind time so a
+           poisoned binding is never stored (#1329). ``resolve_dns=False``
+           mirrors the webhook-registration convention (#1697): literal-IP + blocked
+           -hostname checks apply, but fixture hostnames are not NXDOMAIN-rejected;
+           a use-time DNS pin belongs with ``check_governance``.
         """
         for account in self.accounts:
             for agent in account.governance_agents:
-                if not str(agent.url).startswith("https://"):
+                url = agent.url
+                url_str = str(url)
+                if not url_str.startswith("https://"):
                     raise ValueError(
-                        f"governance agent url must use https:// (field: governance_agents[].url, got '{agent.url}')"
+                        f"governance agent url must use https:// (field: governance_agents[].url, got '{url}')"
+                    )
+                if getattr(url, "username", None) or getattr(url, "password", None):
+                    raise ValueError(
+                        "governance agent url must not embed userinfo credentials (field: governance_agents[].url)"
+                    )
+                ok, reason = check_url_ssrf(url_str, require_https=True, resolve_dns=False)
+                if not ok:
+                    raise ValueError(
+                        f"governance agent url targets a disallowed host: {reason} (field: governance_agents[].url)"
                     )
         return self
 

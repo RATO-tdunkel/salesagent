@@ -3464,12 +3464,15 @@ def _harness_env(request: pytest.FixtureRequest, ctx: dict) -> Generator[None, N
                 "check_governance (governance enforcement) is an undeclared capability "
                 "(governance-aware-seller) — out of scope for the sync_governance PR (#1329)"
             )
-        # Boundary-value abstract-"verdict" outlines are covered concretely by the
-        # T-UC-030-sync-* scenarios below; their generic verdict-step wiring is a follow-up.
+        # Boundary-value abstract-"verdict" outlines: the generic verdict-step wiring is a
+        # follow-up. The boundary VALUES themselves (schemes empty/two/outside-enum/absent,
+        # credentials absent, url non-uri/absent, accounts 100) are graded at construction
+        # time by tests/unit/test_sync_governance.py::TestSyncGovernanceBoundaryValues — NOT
+        # by the T-UC-030-sync-* scenarios, which exercise one nominal value each (#1329/#1682 review I).
         if "bva" in marker_names:
             pytest.xfail(
-                "BR-UC-030 @bva boundary outlines are covered concretely by the "
-                "T-UC-030-sync-* scenarios; abstract verdict-step wiring deferred (#1329)"
+                "BR-UC-030 @bva abstract verdict-step wiring deferred (#1329); boundary values "
+                "graded at construction time by TestSyncGovernanceBoundaryValues"
             )
         _UC030_XFAIL_TAGS: dict[str, str] = {
             # POST-S4 "adcp_version echoed on every response" is not populated on sync-tool

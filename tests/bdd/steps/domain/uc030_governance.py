@@ -99,6 +99,13 @@ def _wire_accounts(ctx: dict) -> list[dict[str, Any]]:
 
 
 def _wire_account(ctx: dict, account_id: str) -> dict[str, Any]:
+    """Return the wire per-account entry whose echoed ref matches ``account_id``.
+
+    Finding the entry by its requested id IS the account-ref echo grade: if the wire
+    did not echo the requested ref, this raises "No wire account". Callers therefore do
+    NOT re-assert ``acct["account"]["account_id"] == account_id`` — that would be
+    tautological against this lookup (#1682 review H).
+    """
     for acct in _wire_accounts(ctx):
         ref = acct.get("account") or {}
         if ref.get("account_id") == account_id:
@@ -374,7 +381,7 @@ def then_variant_error(ctx: dict) -> None:
     # Guard the envelope STRUCTURE (the specific code is pinned by the scenario's following
     # step — `the error code is "X"` / a `then_error_*`): both layers present, their codes
     # non-empty and AGREEING, and a recovery hint set. A single-layer or code-less envelope
-    # (Konstantin: "flip the code to garbage and this stays green") now fails here.
+    # ("flip the code to garbage and this stays green" no longer holds) now fails here.
     top = (envelope.get("adcp_error") or {}).get("code")
     leaf = (envelope.get("errors") or [{}])[0].get("code")
     assert top and leaf and top == leaf, f"malformed/disagreeing two-layer error codes: {envelope}"
@@ -385,14 +392,24 @@ def then_variant_error(ctx: dict) -> None:
 def then_no_operation_errors(ctx: dict) -> None:
     # Success (partial-failure) variant: per-account errors live under accounts[].errors,
     # never as a top-level operation-level errors[] (spec oneOf: accounts XOR errors).
-    assert "errors" not in wire_dict(ctx), f"success variant must not carry top-level errors: {wire_dict(ctx)}"
+    body = wire_dict(ctx)
+    # Falsifiable form of the oneOf: the ERROR variant WOULD carry adcp_error, so pinning
+    # its absence grades that this is genuinely the success variant. `"errors" not in body`
+    # alone is vacuous — SyncGovernanceResponse (extra='forbid') has no top-level errors
+    # field, so it can never be present (#1682 review H).
+    assert body.get("adcp_error") is None, f"expected success variant, got an error envelope: {body}"
+    assert "errors" not in body, f"success variant must not carry a top-level errors array: {body}"
 
 
 @then(parsers.parse('the account "{account_id}" has status "{status}"'))
 @then(parsers.parse('account "{account_id}" has status "{status}" and echoes the governance_agents URL'))
 def then_account_status(ctx: dict, account_id: str, status: str) -> None:
+    # The wire MUST echo the requested account ref — graded explicitly here against the full
+    # wire (a dropped/wrong ref fails this), THEN _wire_account fetches the matching entry.
+    assert account_id in {a.get("account", {}).get("account_id") for a in _wire_accounts(ctx)}, (
+        f"wire must echo the requested account ref {account_id}"
+    )
     acct = _wire_account(ctx, account_id)
-    assert acct["account"]["account_id"] == account_id, f"wire must echo the requested account ref {account_id}"
     assert acct["status"] == status, f"account {account_id}: expected status {status}, got {acct['status']}"
     if status == "synced":
         agents = acct.get("governance_agents") or []
@@ -403,16 +420,20 @@ def then_account_status(ctx: dict, account_id: str, status: str) -> None:
 
 @then(parsers.parse('account "{account_id}" has status "{status}" and carries a per-account errors array'))
 def then_account_status_with_errors(ctx: dict, account_id: str, status: str) -> None:
+    assert account_id in {a.get("account", {}).get("account_id") for a in _wire_accounts(ctx)}, (
+        f"wire must echo the requested account ref {account_id}"
+    )
     acct = _wire_account(ctx, account_id)
-    assert acct["account"]["account_id"] == account_id, f"wire must echo the requested account ref {account_id}"
     assert acct["status"] == status, f"account {account_id}: expected status {status}, got {acct['status']}"
     assert acct.get("errors"), f"failed account {account_id} must carry a per-account errors array: {acct}"
 
 
 @then(parsers.parse('the response account "{account_id}" echoes governance_agents[{idx:d}].url "{url}"'))
 def then_echo_url(ctx: dict, account_id: str, idx: int, url: str) -> None:
+    assert account_id in {a.get("account", {}).get("account_id") for a in _wire_accounts(ctx)}, (
+        f"wire must echo the requested account ref {account_id}"
+    )
     acct = _wire_account(ctx, account_id)
-    assert acct["account"]["account_id"] == account_id, f"wire must echo the requested account ref {account_id}"
     agents = acct.get("governance_agents") or []
     actual = agents[idx]["url"]
     assert url_eq(actual, url), f"account {account_id}: expected echoed url {url}, got {actual}"
@@ -420,8 +441,10 @@ def then_echo_url(ctx: dict, account_id: str, idx: int, url: str) -> None:
 
 @then(parsers.parse('the response account "{account_id}" does NOT echo governance_agents[{idx:d}].authentication'))
 def then_no_echo_auth(ctx: dict, account_id: str, idx: int) -> None:
+    assert account_id in {a.get("account", {}).get("account_id") for a in _wire_accounts(ctx)}, (
+        f"wire must echo the requested account ref {account_id}"
+    )
     acct = _wire_account(ctx, account_id)
-    assert acct["account"]["account_id"] == account_id, f"wire must echo the requested account ref {account_id}"
     agents = acct.get("governance_agents") or []
     assert "authentication" not in agents[idx], f"credentials must not be echoed: {agents[idx]}"
 
@@ -432,17 +455,19 @@ def then_adcp_version(ctx: dict) -> None:
     assert body.get("adcp_version"), f"expected an echoed adcp_version envelope field, got keys {list(body)}"
 
 
-@then("the per-account errors include a SCOPE_INSUFFICIENT or ACCOUNT_NOT_FOUND code")
+@then("the per-account errors include an ACCOUNT_NOT_FOUND code")
 def then_per_account_authority_code(ctx: dict) -> None:
-    """Assert a failed per-account entry carries an authority-failure code on the wire.
+    """Assert a failed per-account entry carries ACCOUNT_NOT_FOUND on the wire.
 
     Graduates BR-UC-030 ``sync-no-authority`` (feature line 179) from dormant (its
     ``Then`` was undefined → auto-xfail) to executing across a2a/mcp/rest, and makes
-    the A1 error-code choice wire-graded. Production emits the uniform
-    ``ACCOUNT_NOT_FOUND`` (an existing-but-unowned account is indistinguishable from
-    a nonexistent one); ``SCOPE_INSUFFICIENT`` is also scenario-valid.
+    the error-code choice wire-graded. Production emits the SINGLE uniform
+    ``ACCOUNT_NOT_FOUND`` code — an existing-but-unowned account is indistinguishable
+    from a nonexistent one (the ``*_NOT_FOUND`` uniform-response MUST). ``SCOPE_INSUFFICIENT``
+    is deliberately NOT accepted here: ``governance.py`` emits it nowhere and admitting
+    it on the wire would let the exact value the fix removed pass (#1682 review C).
     """
-    allowed = {"SCOPE_INSUFFICIENT", "ACCOUNT_NOT_FOUND"}
+    allowed = {"ACCOUNT_NOT_FOUND"}
     failed_codes = {
         ((acct.get("errors") or [{}])[0]).get("code") for acct in _wire_accounts(ctx) if acct.get("status") == "failed"
     }
@@ -451,6 +476,24 @@ def then_per_account_authority_code(ctx: dict) -> None:
     # absent errors[] surfaces as None, which is not a subset of `allowed`.
     assert failed_codes != set(), f"expected a failed per-account entry, got {_wire_accounts(ctx)}"
     assert failed_codes <= allowed, f"per-account authority code(s) {failed_codes} not all in {allowed}"
+
+
+@then("the per-account error message does not reveal whether the account exists")
+def then_per_account_message_uniform(ctx: dict) -> None:
+    """Grade the uniform-response MUST on the wire: the failed per-account message MUST
+    NOT carry the authorization-specific ``does not have access to account 'X'`` phrasing
+    (which would distinguish exists-but-unowned from not-found — a cross-principal
+    enumeration oracle). Restoring the leaky message now reddens a WIRE test, not just
+    off-wire unit/integration (#1682 review C)."""
+    accounts = _wire_accounts(ctx)
+    statuses = {a.get("status") for a in accounts}
+    assert "failed" in statuses, f"expected a failed per-account entry, got statuses {statuses}"
+    for acct in accounts:
+        if acct.get("status") != "failed":
+            continue
+        for err in acct.get("errors") or []:
+            message = err.get("message") or ""
+            assert "does not have access" not in message, f"per-account message leaks account existence: {message!r}"
 
 
 @then(parsers.parse('each per-account error should include a "{field}" field guiding remediation'))
@@ -477,13 +520,15 @@ def then_per_account_suggestion(ctx: dict, field: str) -> None:
 
 
 @then(parsers.parse('the persisted governance agent on "{account_id}" is "{url}"'))
+@then(parsers.parse('the binding on account "{account_id}" remains "{url}" unchanged'))
 def then_persisted_binding_is(ctx: dict, account_id: str, url: str) -> None:
+    # One body, two phrasings (replace-overwrites vs per-account-scope-unchanged): both
+    # assert the persisted binding on the account is EXACTLY [url]. Stacked parsers rather
+    # than two identical bodies (#1682 review H; mirrors the stacked @when parsers).
     persisted = _persisted_binding(ctx, account_id)
     assert persisted["account_id"] == account_id, f"account {account_id!r} not persisted"
     urls = persisted["urls"]
-    assert len(urls) == 1 and url_eq(urls[0], url), (
-        f"expected {account_id} persisted binding == [{url!r}] (replace overwrites), got {urls}"
-    )
+    assert len(urls) == 1 and url_eq(urls[0], url), f"expected {account_id} persisted binding == [{url!r}], got {urls}"
 
 
 @then(parsers.parse('the previous binding to "{url}" is no longer present'))
@@ -495,16 +540,6 @@ def then_previous_binding_absent(ctx: dict, url: str) -> None:
     account_id = next(iter(prior))
     urls = _persisted_binding(ctx, account_id)["urls"]
     assert not any(url_eq(p, url) for p in urls), f"stale binding {url!r} still present on {account_id}: {urls}"
-
-
-@then(parsers.parse('the binding on account "{account_id}" remains "{url}" unchanged'))
-def then_binding_unchanged(ctx: dict, account_id: str, url: str) -> None:
-    persisted = _persisted_binding(ctx, account_id)
-    assert persisted["account_id"] == account_id, f"account {account_id!r} not persisted"
-    urls = persisted["urls"]
-    assert len(urls) == 1 and url_eq(urls[0], url), (
-        f"account {account_id} binding must remain [{url!r}] unchanged (per-account replace scope), got {urls}"
-    )
 
 
 @then(parsers.parse('the account for brand "{brand}" on operator "{operator}" has status "{status}"'))
@@ -527,34 +562,52 @@ def then_natural_key_account_status(ctx: dict, brand: str, operator: str, status
 # These route through the harness's guarded, transport-independent error grader
 # (result.assert_wire_error) rather than scanning str(envelope): recovery defaults to the
 # pinned AdCP enum (not a hardcoded "correctable"). Field-level violations pin the STRUCTURED
-# errors[0].field (transport-stable — the MCP TypeAdapter boundary emits only the leaf message
-# "String should have at least 32 characters" while REST/A2A carry the full field path, but
-# field is identical across all three). The url https-requirement is a model validator, so its
-# field is empty but its message is transport-stable → assert the message there. Verified against
-# the real per-transport envelopes (#1682 review item 2).
+# errors[0].field EXACTLY (both layers, via field=) — a substring token like "accounts" or
+# "governance_agents" is a prefix of several governance paths and would stay green on a field
+# wrong for the scenario (#1682 review D). field is transport-stable (the MCP TypeAdapter
+# boundary diverges on message, not field). The url https-requirement is a model validator, so
+# its field is empty → assert the message there. Every request-validation rejection also carries
+# a top-level suggestion (require_suggestion=True). Verified against the real per-transport
+# envelopes (#1682 review item 2/D).
+_CREDENTIALS_FIELD = "accounts[0].governance_agents[0].authentication.credentials"
+_AGENTS_FIELD = "accounts[0].governance_agents"
+
+
 @then("the error references the url field and indicates https is required")
 def then_error_url_https(ctx: dict) -> None:
-    ctx["result"].assert_wire_error("VALIDATION_ERROR", message_substr="url must use https")
+    ctx["result"].assert_wire_error("VALIDATION_ERROR", message_substr="url must use https", require_suggestion=True)
 
 
 @then("the error references the credentials field")
 def then_error_credentials(ctx: dict) -> None:
-    ctx["result"].assert_wire_error("VALIDATION_ERROR", field_substr="credentials")
+    ctx["result"].assert_wire_error("VALIDATION_ERROR", field=_CREDENTIALS_FIELD, require_suggestion=True)
 
 
-@then("the error references the governance_agents cardinality")
-def then_error_cardinality(ctx: dict) -> None:
-    ctx["result"].assert_wire_error("VALIDATION_ERROR", field_substr="governance_agents")
+@then("the error references the governance_agents maximum cardinality")
+def then_error_cardinality_max(ctx: dict) -> None:
+    # maxItems 1 and minItems 1 both point at the same field (accounts[0].governance_agents);
+    # the distinguishing token lives in the message ("at most" / "at least 1 item") on all
+    # three transports (#1682 review D).
+    ctx["result"].assert_wire_error(
+        "VALIDATION_ERROR", field=_AGENTS_FIELD, message_substr="at most 1 item", require_suggestion=True
+    )
+
+
+@then("the error references the governance_agents minimum cardinality")
+def then_error_cardinality_min(ctx: dict) -> None:
+    ctx["result"].assert_wire_error(
+        "VALIDATION_ERROR", field=_AGENTS_FIELD, message_substr="at least 1 item", require_suggestion=True
+    )
 
 
 @then("the error references the accounts array size")
 def then_error_accounts_size(ctx: dict) -> None:
-    ctx["result"].assert_wire_error("VALIDATION_ERROR", field_substr="accounts")
+    ctx["result"].assert_wire_error("VALIDATION_ERROR", field="accounts", require_suggestion=True)
 
 
 @then("the error code indicates the missing idempotency_key")
 def then_error_missing_key(ctx: dict) -> None:
-    ctx["result"].assert_wire_error("VALIDATION_ERROR", field_substr="idempotency_key")
+    ctx["result"].assert_wire_error("VALIDATION_ERROR", field="idempotency_key", require_suggestion=True)
 
 
 @then(parsers.parse('the response outcome is "{outcome}"'))
@@ -568,7 +621,7 @@ def then_response_outcome(ctx: dict, outcome: str) -> None:
     elif outcome == "rejected":
         # A too-short / malformed idempotency_key violates the request schema, so the
         # rejection is a VALIDATION_ERROR on the wire. Grade the code + pinned-enum recovery
-        # via the guarded helper, not just "an envelope exists".
-        ctx["result"].assert_wire_error("VALIDATION_ERROR")
+        # + a non-empty top-level suggestion via the guarded helper, not just "an envelope exists".
+        ctx["result"].assert_wire_error("VALIDATION_ERROR", field="idempotency_key", require_suggestion=True)
     else:
         raise AssertionError(f"unknown outcome {outcome!r}")

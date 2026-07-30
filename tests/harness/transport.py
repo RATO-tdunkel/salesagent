@@ -33,7 +33,10 @@ def _pinned_error_metadata() -> dict[str, dict[str, str]]:
 
     The pinned enum (@04f59d2d5) is the authoritative recovery classification;
     the installed SDK ships fewer codes and diverges on several recovery values,
-    so it is NOT used here (pin-wins).
+    so it is NOT used here (pin-wins). The SHA is a 3.0.x-era snapshot (see
+    tests/fixtures/adcp_schemas_pinned/_refresh.py), but every code's `recovery`
+    is identical to 3.1.1, so pin-wins is safe for the recovery classification
+    this reader provides (#1682 review J).
     """
     return json.loads(_PINNED_ERROR_ENUM.read_text())["enumMetadata"]
 
@@ -148,6 +151,7 @@ class TransportResult:
         recovery: str | None = None,
         require_suggestion: bool = False,
         message_substr: str | None = None,
+        field: str | None = None,
         field_substr: str | None = None,
     ) -> None:
         """Assert this result carries the AdCP two-layer wire error ``code``.
@@ -177,7 +181,12 @@ class TransportResult:
             "succeeded or errored before reaching a transport."
         )
         assert_envelope_shape(
-            envelope, code, recovery=expected_recovery, message_substr=message_substr, field_substr=field_substr
+            envelope,
+            code,
+            recovery=expected_recovery,
+            message_substr=message_substr,
+            field=field,
+            field_substr=field_substr,
         )
         if require_suggestion:
             suggestion = extract_wire_suggestion(envelope)

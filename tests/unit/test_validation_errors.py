@@ -185,3 +185,60 @@ def test_validation_error_formatting_extra_field_with_dict():
         # The full URL should be visible, not truncated like "ht...id"
         assert "https://creative.adcontextprotocol.org/" in error_msg
         assert "display_300x250" in error_msg
+
+
+def test_validation_error_redacts_credential_under_authentication():
+    """A typo'd extra field under authentication must NOT echo the secret value.
+
+    Regression for #1682 review BLOCKER A: format_validation_error feeds
+    errors[0].message, which reaches the buyer wire (REST/A2A) and the
+    error-log + audit sinks. A buyer typo (`credential` for `credentials`)
+    still carries the bearer token, so the value MUST be redacted while the
+    actionable field PATH is preserved.
+    """
+    secret = "SUPERSECRETcredential00000000000000"
+    try:
+        raise ValidationError.from_exception_data(
+            "SyncGovernanceRequest",
+            [
+                {
+                    "type": "extra_forbidden",
+                    "loc": ("accounts", 0, "governance_agents", 0, "authentication", "credential"),
+                    "msg": "Extra inputs are not permitted",
+                    "input": secret,
+                }
+            ],
+        )
+    except ValidationError as e:
+        error_msg = format_validation_error(e)
+
+        assert secret not in error_msg, f"credential leaked into validation message: {error_msg!r}"
+        assert "[redacted]" in error_msg
+        # The field path is still actionable.
+        assert "authentication.credential: Extra field not allowed by AdCP spec" in error_msg
+
+
+def test_validation_error_redacts_nested_secret_under_unknown_field():
+    """An unknown top-level field carrying a nested credential must be redacted.
+
+    Closes the nesting escape where the offending loc segment is innocuous but
+    the echoed value nests a sensitive key (#1682 review BLOCKER A).
+    """
+    secret = "NESTEDbearerSECRET00000000000000000"
+    try:
+        raise ValidationError.from_exception_data(
+            "SyncGovernanceRequest",
+            [
+                {
+                    "type": "extra_forbidden",
+                    "loc": ("extra_config",),
+                    "msg": "Extra inputs are not permitted",
+                    "input": {"authentication": {"credentials": secret}},
+                }
+            ],
+        )
+    except ValidationError as e:
+        error_msg = format_validation_error(e)
+
+        assert secret not in error_msg, f"nested credential leaked: {error_msg!r}"
+        assert "[redacted]" in error_msg

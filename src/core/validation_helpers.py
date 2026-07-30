@@ -23,6 +23,56 @@ from src.core.exceptions import (
 
 logger = logging.getLogger(__name__)
 
+# Field-name tokens that mark a credential-bearing context. When an
+# ``extra_forbidden`` rejection sits under (or carries a value nested under) any
+# of these, the offending value is a candidate write-only secret — e.g. a buyer
+# typo of ``credentials`` -> ``credential`` still carries the bearer token — so
+# ``format_validation_error`` redacts the ``Received value:`` echo rather than
+# reflecting it onto the buyer wire / into the error-log + audit sinks that
+# persist ``errors[0].message`` (#1329). The field *path* stays; only
+# the value is withheld. ``governance_agents`` is deliberately absent: it is
+# url-only (echoed on the wire anyway), and its sole secret leaf,
+# ``authentication.credentials``, is already covered by the tokens below.
+_SENSITIVE_VALUE_TOKENS: frozenset[str] = frozenset(
+    {
+        "authentication",
+        "credentials",
+        "credential",
+        "authorization",
+        "secret",
+        "token",
+        "password",
+        "push_notification_config",
+    }
+)
+
+
+def _value_has_sensitive_key(value: object) -> bool:
+    """True if ``value`` (a decoded JSON scalar/dict/list) nests a sensitive key.
+
+    Closes the nesting escape where an *unknown top-level* field carries a secret
+    inside it (its own loc segment is innocuous, but ``{"authentication": {...}}``
+    still holds the credential).
+    """
+    if isinstance(value, dict):
+        if any(str(k).lower() in _SENSITIVE_VALUE_TOKENS for k in value):
+            return True
+        return any(_value_has_sensitive_key(v) for v in value.values())
+    if isinstance(value, list):
+        return any(_value_has_sensitive_key(item) for item in value)
+    return False
+
+
+def _is_sensitive_extra_field(loc: tuple, input_val: object) -> bool:
+    """Whether an ``extra_forbidden`` value must be withheld from the echo.
+
+    Sensitive if any loc segment names a credential-bearing context OR the value
+    itself nests a sensitive key.
+    """
+    if any(str(seg).lower() in _SENSITIVE_VALUE_TOKENS for seg in loc):
+        return True
+    return _value_has_sensitive_key(input_val)
+
 
 @contextmanager
 def adcp_validation_boundary(context: str = "parameters", field: str | None = None) -> Iterator[None]:
@@ -198,8 +248,19 @@ def format_validation_error(validation_error: ValidationError, context: str = "r
         elif "missing" in error_type:
             error_details.append(f"  • {field_path}: Required field is missing")
         elif "extra_forbidden" in error_type:
-            # For extra_forbidden, show the actual value to help debug what was passed
-            if input_val is not None:
+            # For extra_forbidden, echo the actual value to help debug what was
+            # passed — EXCEPT under a credential-bearing context, where the value
+            # may be a write-only secret (a typo'd `credential` still carries the
+            # bearer token). There the field PATH is the actionable part and is
+            # always safe; the value is redacted so it never reaches the buyer
+            # wire or the message-persisting log/audit sinks (#1329).
+            if input_val is None:
+                error_details.append(f"  • {field_path}: Extra field not allowed by AdCP spec")
+            elif _is_sensitive_extra_field(error["loc"], input_val):
+                error_details.append(
+                    f"  • {field_path}: Extra field not allowed by AdCP spec.\n    Received value: [redacted]"
+                )
+            else:
                 # Format the input value more verbosely for debugging
                 try:
                     input_repr = json.dumps(input_val, indent=2, default=str)
@@ -208,8 +269,6 @@ def format_validation_error(validation_error: ValidationError, context: str = "r
                 error_details.append(
                     f"  • {field_path}: Extra field not allowed by AdCP spec.\n    Received value: {input_repr}"
                 )
-            else:
-                error_details.append(f"  • {field_path}: Extra field not allowed by AdCP spec")
         else:
             error_details.append(f"  • {field_path}: {msg}")
 

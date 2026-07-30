@@ -13,7 +13,7 @@ convention the base harness dispatch assumes, so the REST leg is exercised in th
 test via ``get_rest_client().get(...)`` directly; MCP/A2A go through the standard
 harness hooks (which stash the real success-path wire).
 
-beads: #1329 (UC-010 account/sandbox honesty)
+#1329 (UC-010 account/sandbox honesty)
 """
 
 from __future__ import annotations

@@ -20,7 +20,11 @@ import pytest
 
 from tests.unit._architecture_helpers import assert_violations_match_allowlist, iter_call_expressions
 
-TOOLS_DIR = Path("src/core/tools")
+# Repo root anchored to THIS file, not the cwd: a cwd-relative path made the guard
+# vacuous when pytest ran from src/ (every module file "not found" → no call-arg sets →
+# green while scanning nothing). Mirrors test_architecture_repository_pattern (#1682 review G).
+ROOT = Path(__file__).resolve().parents[2]
+TOOLS_DIR = ROOT / "src/core/tools"
 
 # All _impl functions and their modules
 IMPL_REGISTRY = [
@@ -51,13 +55,13 @@ BOUNDARY_RESOLVED_PARAMS = {"identity"}
 
 
 def _module_to_filepath(module_path: str) -> Path:
-    """Convert dotted module path to filesystem path."""
+    """Convert dotted module path to a repo-root-anchored filesystem path."""
     parts = module_path.replace(".", "/")
-    path = Path(f"{parts}.py")
+    path = ROOT / f"{parts}.py"
     if path.exists():
         return path
     # Try as package __init__
-    pkg_path = Path(parts) / "__init__.py"
+    pkg_path = ROOT / parts / "__init__.py"
     if pkg_path.exists():
         return pkg_path
     return path

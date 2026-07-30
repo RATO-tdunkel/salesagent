@@ -27,15 +27,23 @@ from contextlib import ExitStack
 from unittest.mock import MagicMock, patch
 
 import pytest
+from pydantic import ValidationError
 
+from src.core.database.repositories.account import _serialize_governance_agents as serialize_governance_agents
 from src.core.exceptions import (
     AdCPAccountNotFoundError,
     AdCPAuthenticationError,
     AdCPAuthorizationError,
 )
-from src.core.helpers.account_helpers import serialize_governance_agents
 from src.core.schemas.account import SyncGovernanceRequest, SyncGovernanceResponse
+from tests.harness.transport import _pinned_error_metadata
 from tests.helpers.governance import BEARER_CREDS, GOV_URL, governance_agent_dict
+
+# Recovery expected on the uniform ACCOUNT_NOT_FOUND per-account error, DERIVED from
+# the pinned spec enum (the authority) — not the literal "terminal" and not the
+# production constant (that would be vacuous). If production drifts from the pinned
+# recovery, these tests catch it (#1682 review C).
+_ACCOUNT_NOT_FOUND_RECOVERY = _pinned_error_metadata()["ACCOUNT_NOT_FOUND"]["recovery"]
 
 
 def _make_identity(principal_id: str | None = "principal-1", tenant_id: str = "tenant-1"):
@@ -48,6 +56,18 @@ def _make_identity(principal_id: str | None = "principal-1", tenant_id: str = "t
         tenant=tenant,
         protocol="mcp",
     )
+
+
+def _first_schema_error(build) -> dict:
+    """Run a request-schema construction expected to fail; return its first error dict.
+
+    Asserting on ``ValidationError.errors()[0]`` (loc + type) pins the SPECIFIC rule
+    each test names — a bare ``pytest.raises(ValueError)`` stays green when an
+    unrelated field is what actually broke (#1682 review H).
+    """
+    with pytest.raises(ValidationError) as exc_info:
+        build()
+    return exc_info.value.errors()[0]
 
 
 def _make_request(
@@ -155,10 +175,10 @@ class TestSyncGovernanceAuthorityContract:
 
         assert resp.accounts[0].status == "failed"
         assert resp.accounts[0].errors[0].code == "ACCOUNT_NOT_FOUND"
-        # ACCOUNT_NOT_FOUND is terminal (enumMetadata) — the per-account error MUST
-        # carry recovery so a receiver does not auto-retry (else it defaults to
-        # transient). See #1682 review A3.
-        assert resp.accounts[0].errors[0].recovery == "terminal"
+        # ACCOUNT_NOT_FOUND recovery is pinned by the enumMetadata (terminal) — the
+        # per-account error MUST carry it so a receiver does not auto-retry (else it
+        # defaults to transient). Derived from the pinned enum. See #1682 review A3/C.
+        assert resp.accounts[0].errors[0].recovery == _ACCOUNT_NOT_FOUND_RECOVERY
         # A failed account never persists a binding.
         repo.set_governance_binding.assert_not_called()
 
@@ -181,7 +201,7 @@ class TestSyncGovernanceAuthorityContract:
         # model) nor the AdCPAuthorizationError wire default (AUTH_REQUIRED). #1682 A1.
         err = resp.accounts[0].errors[0]
         assert err.code == "ACCOUNT_NOT_FOUND"
-        assert err.recovery == "terminal"
+        assert err.recovery == _ACCOUNT_NOT_FOUND_RECOVERY
         # Uniform: the message MUST NOT reveal that the account exists.
         assert "does not have access" not in err.message
         repo.set_governance_binding.assert_not_called()
@@ -225,30 +245,61 @@ class TestSyncGovernanceOperationLevel:
     def test_empty_accounts_rejected_at_schema(self):
         # The request schema enforces accounts minItems:1, so an empty array is a
         # construction-time validation error — it never reaches the impl.
-        with pytest.raises(ValueError):
-            SyncGovernanceRequest(idempotency_key="uuid-v4-unit-00000000000000001", accounts=[])
+        err = _first_schema_error(
+            lambda: SyncGovernanceRequest(idempotency_key="uuid-v4-unit-00000000000000001", accounts=[])
+        )
+        assert err["type"] == "too_short", err
+        assert err["loc"][-1] == "accounts", err
 
 
 class TestSyncGovernanceRequestSchema:
     """Request schema enforces the spec's idempotency_key + agent constraints."""
 
     def test_idempotency_key_required(self):
-        with pytest.raises(ValueError):
-            SyncGovernanceRequest(
+        err = _first_schema_error(
+            lambda: SyncGovernanceRequest(
                 accounts=[{"account": {"account_id": "acc_1"}, "governance_agents": [governance_agent_dict(GOV_URL)]}]
             )
+        )
+        assert err["type"] == "missing", err
+        assert err["loc"][-1] == "idempotency_key", err
 
     def test_idempotency_key_too_short_rejected(self):
-        with pytest.raises(ValueError):
-            _make_request(idempotency_key="short")  # < 16 chars
+        err = _first_schema_error(lambda: _make_request(idempotency_key="short"))  # < 16 chars
+        assert err["type"] == "string_too_short", err
+        assert err["loc"][-1] == "idempotency_key", err
 
     def test_non_https_agent_url_rejected(self):
-        with pytest.raises(ValueError):
-            _make_request(url="http://governance.pinnacle-media.com")
+        # url https-requirement is a model validator (empty loc), so pin the message.
+        err = _first_schema_error(lambda: _make_request(url="http://governance.pinnacle-media.com"))
+        assert err["type"] == "value_error", err
+        assert "https" in err["msg"], err
+
+    def test_agent_url_with_userinfo_rejected(self):
+        # A credential embedded in the url (userinfo) must be rejected — it bypasses
+        # SSRF hostname checks and would be persisted/echoed (#1682 review B).
+        err = _first_schema_error(lambda: _make_request(url="https://svc:SuperSecret123@governance.example.com/hook"))
+        assert err["type"] == "value_error", err
+        assert "userinfo" in err["msg"], err
+
+    @pytest.mark.parametrize(
+        "url",
+        [
+            "https://localhost/hook",
+            "https://127.0.0.1:8000/hook",
+            "https://169.254.169.254/latest/meta-data",
+        ],
+    )
+    def test_agent_url_ssrf_target_rejected(self, url):
+        # A persisted governance url is a future check_governance target; internal /
+        # loopback / metadata hosts are rejected at bind time (#1682 review B7).
+        err = _first_schema_error(lambda: _make_request(url=url))
+        assert err["type"] == "value_error", err
+        assert "disallowed host" in err["msg"], err
 
     def test_credentials_below_min_length_rejected(self):
-        with pytest.raises(ValueError):
-            SyncGovernanceRequest(
+        err = _first_schema_error(
+            lambda: SyncGovernanceRequest(
                 idempotency_key="uuid-v4-unit-00000000000000001",
                 accounts=[
                     {
@@ -257,10 +308,13 @@ class TestSyncGovernanceRequestSchema:
                     }
                 ],
             )
+        )
+        assert err["type"] == "string_too_short", err
+        assert err["loc"][-1] == "credentials", err
 
     def test_more_than_one_agent_per_account_rejected(self):
-        with pytest.raises(ValueError):
-            SyncGovernanceRequest(
+        err = _first_schema_error(
+            lambda: SyncGovernanceRequest(
                 idempotency_key="uuid-v4-unit-00000000000000001",
                 accounts=[
                     {
@@ -272,3 +326,67 @@ class TestSyncGovernanceRequestSchema:
                     }
                 ],
             )
+        )
+        assert err["type"] == "too_long", err
+        assert err["loc"][-1] == "governance_agents", err
+
+
+class TestSyncGovernanceBoundaryValues:
+    """Construction-time schema asserts for the @bva boundary VALUES (#1682 review I).
+
+    The UC-030 ``@bva`` outlines are xfailed (abstract verdict-step wiring is deferred),
+    and the old conftest reason claimed the boundary values are "covered concretely by the
+    T-UC-030-sync-* scenarios" — which they are NOT (those exercise one nominal value each).
+    These construction-time asserts are the honest coverage the corrected reason points at:
+    the request schema enforces every boundary structurally.
+    """
+
+    _KEY = "uuid-v4-unit-00000000000000001"
+
+    def _reject(self, agent: dict) -> dict:
+        return _first_schema_error(
+            lambda: SyncGovernanceRequest(
+                idempotency_key=self._KEY,
+                accounts=[{"account": {"account_id": "a"}, "governance_agents": [agent]}],
+            )
+        )
+
+    @pytest.mark.parametrize(
+        ("authentication", "loc_token", "err_type"),
+        [
+            ({"schemes": [], "credentials": "x" * 40}, "schemes", "too_short"),
+            ({"schemes": ["Bearer", "Basic"], "credentials": "x" * 40}, "schemes", "too_long"),
+            ({"schemes": ["Nonsense"], "credentials": "x" * 40}, "schemes", "enum"),
+            ({"credentials": "x" * 40}, "schemes", "missing"),
+            ({"schemes": ["Bearer"]}, "credentials", "missing"),
+        ],
+        ids=["schemes-empty", "schemes-two", "schemes-outside-enum", "schemes-absent", "credentials-absent"],
+    )
+    def test_authentication_boundary_rejected(self, authentication: dict, loc_token: str, err_type: str):
+        err = self._reject({"url": "https://gov.example.com", "authentication": authentication})
+        assert err["type"] == err_type, err
+        assert loc_token in err["loc"], err
+
+    @pytest.mark.parametrize(
+        ("agent", "err_type"),
+        [
+            ({"url": "not a uri", "authentication": {"schemes": ["Bearer"], "credentials": "x" * 40}}, "url_parsing"),
+            ({"authentication": {"schemes": ["Bearer"], "credentials": "x" * 40}}, "missing"),
+        ],
+        ids=["url-non-uri", "url-absent"],
+    )
+    def test_url_boundary_rejected(self, agent: dict, err_type: str):
+        err = self._reject(agent)
+        assert err["type"] == err_type, err
+        assert "url" in err["loc"], err
+
+    def test_accounts_exactly_100_is_valid(self):
+        # maxItems 100 — the inclusive upper boundary is accepted (the @bva "valid" row).
+        req = SyncGovernanceRequest(
+            idempotency_key=self._KEY,
+            accounts=[
+                {"account": {"account_id": f"a{i}"}, "governance_agents": [governance_agent_dict(GOV_URL)]}
+                for i in range(100)
+            ],
+        )
+        assert len(req.accounts) == 100

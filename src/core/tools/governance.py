@@ -34,11 +34,16 @@ Credentials are never persisted: the ``accounts.governance_agents`` column model
 (core/account.json GovernanceAgent) is url-only by construction, so the binding
 stores the durable agent identity (url) and nothing sensitive.
 
-Idempotency replay + IDEMPOTENCY_CONFLICT (same key / different payload) are
-graded only by the richer UC-030 BDD ledger (deferred follow-up), not by the
-pinned 3.1.1 storyboards; because sync is a side-effect-free replace, persisting
-without replay is already resource-idempotent. Mirrors the sync_accounts
-precedent (accepts idempotency_key, no replay dedup yet).
+Idempotency replay + IDEMPOTENCY_CONFLICT (same key / different payload) are NOT
+implemented here — a genuine deferred gap, tracked by the xfailed UC-030 replay/
+conflict scenarios (#1329 follow-up). "Side-effect-free replace ⇒ resource-idempotent"
+answers only the side-effect half; security.mdx L1 rule 4 requires returning the
+STORED inner response WITHOUT re-executing, and replay is observably different from
+re-execution here because per-account authority can change between calls (a replay
+could flip an account synced -> failed). create_media_buy is the sibling that DOES
+dedup (uow.idempotency_attempts); sync_accounts shares this same gap. The agent-wide
+Idempotency(supported=True) capability is honored by create_media_buy (the mutating
+tool with real spend), which is why it stays declared.
 """
 
 from typing import Annotated
@@ -73,16 +78,29 @@ from src.core.tool_context import ToolContext
 from src.core.transport_helpers import resolve_identity_from_context
 from src.core.validation_helpers import adcp_validation_boundary
 
-# Uniform per-account response for an unresolved account. The *_NOT_FOUND
+# Uniform per-account RESPONSE for an unresolved account. The *_NOT_FOUND
 # uniform-response MUST (pinned error-code.json: CREATIVE_NOT_FOUND /
 # SIGNAL_NOT_FOUND / PLAN_NOT_FOUND, generalized by REFERENCE_NOT_FOUND) requires
 # that "the account does not exist" and "the account exists but the caller lacks
-# authority over it" be INDISTINGUISHABLE across every observable channel —
-# otherwise the code/message is a cross-principal enumeration oracle. Both are
-# surfaced with this one code + message + suggestion (mirrors the
-# sync-governance-response.json partial-failure example).
+# authority over it" be indistinguishable on the RESPONSE channel — same code,
+# message, and suggestion — otherwise the response is a cross-principal enumeration
+# oracle. Both are surfaced with this one code + message + suggestion (mirrors the
+# sync-governance-response.json partial-failure example). NOTE: this closes the
+# response channel only. A second channel — response TIMING — is not closed here:
+# _resolve_by_id raises not-found BEFORE running the access check, so a not-found is
+# a shorter path than an exists-but-unauthorized. That timing side channel is shared
+# with create_media_buy/sync_creatives (_resolve_by_id) and tracked separately
+# (#1329 follow-up); it is not introduced by this tool.
 _UNRESOLVED_ACCOUNT_MESSAGE = "Account does not exist or is not accessible to the authenticated agent."
 _UNRESOLVED_ACCOUNT_SUGGESTION = "Use list_accounts to find accounts accessible to this agent."
+
+# Code + recovery for the uniform unresolved-account result are DERIVED from the
+# canonical AdCPAccountNotFoundError class metadata, not copied as literals, so the
+# per-account wire code/recovery cannot drift from the exception the rest of the
+# codebase raises for ACCOUNT_NOT_FOUND (#1329). The class docstring pins
+# recovery=terminal against the pinned enumMetadata.
+_UNRESOLVED_ACCOUNT_CODE = AdCPAccountNotFoundError._default_error_code
+_UNRESOLVED_ACCOUNT_RECOVERY = AdCPAccountNotFoundError._default_recovery
 
 
 def _failed_account_result(
@@ -99,7 +117,7 @@ def _failed_account_result(
     ``enums/error-code.json`` ``enumMetadata``. ``recovery`` is mandatory
     (keyword-only, no default): a receiver that cannot classify an unknown code
     falls back to ``transient`` when ``recovery`` is absent, which would auto-retry
-    a non-retryable authz/not-found failure (#1682 review A3). The code is the
+    a non-retryable authz/not-found failure (#1329). The code is the
     spec-facing per-account code set explicitly, not read from the exception's wire
     code — the authority failure is relabeled to the uniform ``ACCOUNT_NOT_FOUND``
     (see ``_sync_one_account``).
@@ -143,18 +161,24 @@ def _sync_one_account(
     try:
         account_id = resolve_account(entry.account, identity, repo)
     except (AdCPAccountNotFoundError, AdCPAuthorizationError):
+        # Both collapse to the uniform ACCOUNT_NOT_FOUND (no enumeration oracle). The
+        # code + recovery are the uniform ACCOUNT_NOT_FOUND's — NOT the caught
+        # exception's (AdCPAuthorizationError's recovery differs, and leaking it would
+        # re-open the oracle via recovery) — derived from the canonical class metadata.
         return _failed_account_result(
             entry.account,
-            "ACCOUNT_NOT_FOUND",
-            recovery="terminal",
+            _UNRESOLVED_ACCOUNT_CODE,
+            recovery=_UNRESOLVED_ACCOUNT_RECOVERY,
             message=_UNRESOLVED_ACCOUNT_MESSAGE,
             suggestion=_UNRESOLVED_ACCOUNT_SUGGESTION,
         )
     except AdCPAccountAmbiguousError as e:
+        # code + recovery derived from the caught exception (they agree by construction),
+        # not copied literals.
         return _failed_account_result(
             entry.account,
-            "ACCOUNT_AMBIGUOUS",
-            recovery="correctable",
+            e.error_code,
+            recovery=e.recovery,
             message=str(e),
             suggestion=getattr(e, "suggestion", None),
         )
@@ -171,7 +195,7 @@ def _sync_one_account(
         )
 
     # Persist through the repository, which OWNS the url-only projection (credentials
-    # never persisted — #1682 review item 6) and returns the stored url-only list. Echo
+    # never persisted — #1329) and returns the stored url-only list. Echo
     # from that same list so persisted and echoed can never disagree.
     # set_governance_binding replaces the prior binding (per-account replace semantics).
     agent_urls = repo.set_governance_binding(account_id, entry.governance_agents)

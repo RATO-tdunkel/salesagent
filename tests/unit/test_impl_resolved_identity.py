@@ -111,6 +111,27 @@ class TestImplSignaturesAcceptResolvedIdentity:
         assert param is not None, "_list_creatives_impl must have 'identity' parameter"
 
     @pytest.mark.arch_guard
+    def test_list_accounts_impl_accepts_resolved_identity(self):
+        from src.core.tools.accounts import _list_accounts_impl
+
+        param = self._get_identity_param(_list_accounts_impl)
+        assert param is not None, "_list_accounts_impl must have 'identity' parameter"
+
+    @pytest.mark.arch_guard
+    def test_sync_accounts_impl_accepts_resolved_identity(self):
+        from src.core.tools.accounts import _sync_accounts_impl
+
+        param = self._get_identity_param(_sync_accounts_impl)
+        assert param is not None, "_sync_accounts_impl must have 'identity' parameter"
+
+    @pytest.mark.arch_guard
+    def test_sync_governance_impl_accepts_resolved_identity(self):
+        from src.core.tools.governance import _sync_governance_impl
+
+        param = self._get_identity_param(_sync_governance_impl)
+        assert param is not None, "_sync_governance_impl must have 'identity' parameter"
+
+    @pytest.mark.arch_guard
     def test_signals_get_impl_accepts_resolved_identity(self):
         from src.core.tools.signals import _get_signals_impl
 

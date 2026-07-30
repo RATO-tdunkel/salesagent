@@ -9,7 +9,7 @@ Requires: integration_db fixture (creates test PostgreSQL DB).
 Mirrors AccountSyncEnv (sibling account-domain write tool). Used by the
 sync_governance integration tests and, later, the UC-030 BDD ledger.
 
-beads: #1329
+#1329
 """
 
 from __future__ import annotations

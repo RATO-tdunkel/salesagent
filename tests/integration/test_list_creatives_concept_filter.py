@@ -32,16 +32,6 @@ pytestmark = [pytest.mark.integration, pytest.mark.requires_db]
 # not in _impl).
 
 
-def _seed_authenticated_principal(env: CreativeListEnv):
-    """Seed (and return) the tenant+principal the env authenticates as, so the
-    request reaches filter validation / listing rather than failing auth first."""
-    from tests.factories import PrincipalFactory, TenantFactory
-
-    tenant = TenantFactory(tenant_id=env._tenant_id)
-    principal = PrincipalFactory(tenant=tenant, principal_id=env._principal_id)
-    return tenant, principal
-
-
 class TestConceptIdsFilterValidation:
     """Malformed concept_ids filter is rejected, with a spec envelope on every wire transport."""
 
@@ -49,7 +39,7 @@ class TestConceptIdsFilterValidation:
     def test_empty_concept_ids_array_is_rejected(self, integration_db, transport):
         """filters={'concept_ids': []} violates minItems:1 → rejected on every transport."""
         with CreativeListEnv() as env:
-            _seed_authenticated_principal(env)
+            env.setup_default_data()
 
             result = env.call_via(transport, filters={"concept_ids": []})
 
@@ -62,7 +52,7 @@ class TestConceptIdsFilterValidation:
     def test_empty_concept_ids_emits_validation_envelope(self, integration_db, transport):
         """Wire transports surface the two-layer VALIDATION_ERROR envelope with a suggestion."""
         with CreativeListEnv() as env:
-            _seed_authenticated_principal(env)
+            env.setup_default_data()
             assert_empty_array_filter_rejected(env, transport, "concept_ids")
 
 
@@ -75,7 +65,7 @@ class TestNumericConceptCoercion:
         from tests.factories import CreativeFactory
 
         with CreativeListEnv() as env:
-            tenant, principal = _seed_authenticated_principal(env)
+            tenant, principal = env.setup_default_data()
             CreativeFactory(
                 tenant=tenant,
                 principal=principal,
@@ -102,7 +92,7 @@ class TestNonScalarConceptValueDropped:
         from tests.factories import CreativeFactory
 
         with CreativeListEnv() as env:
-            tenant, principal = _seed_authenticated_principal(env)
+            tenant, principal = env.setup_default_data()
             CreativeFactory(
                 tenant=tenant,
                 principal=principal,
@@ -158,7 +148,7 @@ class TestSellerConceptEnrichmentIsFilterable:
         from tests.factories import CreativeFactory
 
         with CreativeListEnv() as env:
-            tenant, principal = _seed_authenticated_principal(env)
+            tenant, principal = env.setup_default_data()
             CreativeFactory(
                 tenant=tenant,
                 principal=principal,

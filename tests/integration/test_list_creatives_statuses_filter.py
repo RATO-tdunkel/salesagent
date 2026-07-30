@@ -29,7 +29,7 @@ from tests.helpers.creative_test_helpers import assert_empty_array_filter_reject
 pytestmark = [pytest.mark.integration, pytest.mark.requires_db]
 
 
-def _returned_ids(result: TransportResult) -> set[str]:
+def _returned_creative_ids(result: TransportResult) -> set[str]:
     """The set of creative_ids in the success-path wire response."""
     return {c["creative_id"] for c in result.wire_response["creatives"]}
 
@@ -56,7 +56,9 @@ class TestStatusesFilterApplied:
             result = env.call_via(transport, filters={"statuses": ["approved"]})
 
             assert not result.is_error, f"{transport}: {result.error!r}"
-            assert _returned_ids(result) == {keep}, f"{transport}: rejected decoy leaked — statuses filter not applied"
+            assert _returned_creative_ids(result) == {keep}, (
+                f"{transport}: rejected decoy leaked — statuses filter not applied"
+            )
 
     @pytest.mark.parametrize("transport", ALL_WIRE)
     def test_multi_value_statuses_matches_any(self, integration_db, transport):
@@ -76,7 +78,7 @@ class TestStatusesFilterApplied:
             result = env.call_via(transport, filters={"statuses": ["approved", "rejected"]})
 
             assert not result.is_error, f"{transport}: {result.error!r}"
-            assert _returned_ids(result) == {approved, rejected}, (
+            assert _returned_creative_ids(result) == {approved, rejected}, (
                 f"{transport}: expected only the two matching statuses"
             )
 
@@ -105,7 +107,7 @@ class TestStatusesFilterReportedTruthfully:
             # Reported as the enum value ("approved") — the coerced list the query used.
             assert "statuses=approved" in filters_applied, f"{transport}: {filters_applied}"
             # ...and the report is truthful: the scoped set matches what was claimed.
-            assert _returned_ids(result) == {keep}, f"{transport}: scoped set != reported filters_applied"
+            assert _returned_creative_ids(result) == {keep}, f"{transport}: scoped set != reported filters_applied"
 
 
 class TestStatusesFilterValidation:

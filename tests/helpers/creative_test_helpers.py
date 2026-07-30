@@ -11,11 +11,15 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 from datetime import UTC, datetime
-from typing import Any
+from typing import TYPE_CHECKING, Any
 from unittest.mock import MagicMock, Mock, patch
 
 from tests.factories.creative_asset import AssetSpec, assert_assets, build_assets, image_spec
 from tests.harness import make_mock_uow
+
+if TYPE_CHECKING:
+    from tests.harness._base import BaseTestEnv
+    from tests.harness.transport import Transport
 
 
 def seed_creative_in_status(tenant: Any, principal: Any, status: str = "approved") -> str:
@@ -31,23 +35,20 @@ def seed_creative_in_status(tenant: Any, principal: Any, status: str = "approved
     return CreativeFactory(tenant=tenant, principal=principal, status=status).creative_id
 
 
-def assert_empty_array_filter_rejected(env: Any, transport: Any, field: str) -> None:
+def assert_empty_array_filter_rejected(env: BaseTestEnv, transport: Transport, field: str) -> None:
     """Assert ``filters={field: []}`` (a minItems:1 violation) is rejected with a two-layer
     VALIDATION_ERROR envelope carrying a recovery suggestion, on the given wire transport.
 
     Shared by the concept_ids and statuses empty-array validation tests: structurally the
     same operation with only the filter field substituted, so it lives here once rather than
     copy-pasted per filter (DRY). POST-F3 requires the buyer be told how to recover.
-    """
-    from tests.helpers.envelope_assertions import assert_envelope_shape
 
-    result = env.call_via(transport, filters={field: []})
-    envelope = result.wire_error_envelope
-    assert envelope is not None, f"{transport}: no wire error envelope captured for empty {field}"
-    assert_envelope_shape(envelope, "VALIDATION_ERROR", recovery="correctable")
-    assert envelope["errors"][0].get("suggestion"), (
-        f"{transport}: VALIDATION_ERROR envelope must carry a recovery suggestion: {envelope['errors'][0]}"
-    )
+    Routes through the harness-provided ``TransportResult.assert_wire_error`` rather than
+    hand-rolling the envelope: ``recovery`` defaults to the pinned AdCP enum's classification
+    for VALIDATION_ERROR (pin-wins — no hardcoded ``"correctable"`` to drift if the pin
+    reclassifies), and ``require_suggestion`` owns the POST-F3 suggestion check.
+    """
+    env.call_via(transport, filters={field: []}).assert_wire_error("VALIDATION_ERROR", require_suggestion=True)
 
 
 def make_creative_dict(creative_id: str = "c1", name: str = "Test Banner") -> dict:

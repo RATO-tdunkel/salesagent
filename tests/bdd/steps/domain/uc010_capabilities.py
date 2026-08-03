@@ -1,0 +1,98 @@
+"""Domain step definitions for UC-010: the account/sandbox honesty capability.
+
+Wires ONLY the BR-UC-010 ``@T-UC-010-v31-account-sandbox`` grader (the account section's
+sandbox flag) against CapabilitiesEnv, so get_adcp_capabilities' honest sandbox declaration
+executes and asserts on the real a2a/mcp/rest wire — mirroring the UC-030 governance wiring
+(``dispatch_request`` + ``wire_dict``). The rest of BR-UC-010 stays dormant (routed to xfail
+in the conftest UC-010 branch).
+
+Honesty contract (#1329 gap 13): this seller declares ``account.sandbox=false``
+UNCONDITIONALLY. A media buy under a sandbox account routes to the exact same live adapter
+path as production, so ``account.sandbox`` is the seller's honest "no behavioral isolation"
+declaration, not a reflection of any account's stored flag. get_adcp_capabilities is a
+TENANT-level, no-argument discovery endpoint (it does not read account rows or perform
+provisioning), so the outline's four boundary rows map onto two graded outcomes (see
+``then_capabilities_sandbox_flag``): the three ``expected=valid`` rows (sandbox true / absent /
+explicit-false) are graded against the honest, unconditional ``sandbox=false`` on the wire
+(falsifiable — a dishonest ``sandbox=true`` reddens them across a2a/mcp/rest), and the single
+``expected=invalid`` row (row 4, a rejected sandbox-provisioning request) is xfailed as not
+observable through this discovery call rather than allowed to collapse into a silent
+guaranteed-pass.
+
+ctx["env"] is a CapabilitiesEnv (bound by the conftest UC-010 branch).
+#1329 (UC-010) / #1682 review item 1.
+"""
+
+from __future__ import annotations
+
+import pytest
+from pytest_bdd import given, parsers, then, when
+
+from tests.bdd.steps._outcome_helpers import wire_dict
+from tests.bdd.steps.generic._dispatch import dispatch_request
+
+
+@given(parsers.parse("the tenant account is configured for {boundary_point}"))
+def given_account_configured_for(ctx: dict, boundary_point: str) -> None:
+    """Record the boundary point under test.
+
+    get_adcp_capabilities is a TENANT-level discovery endpoint — ``account.sandbox`` on the
+    response is the seller's honest capability declaration (#1329), NOT a reflection of any
+    account's stored sandbox flag, so the account configuration named here deliberately does
+    not alter the response. The unconditional honest ``sandbox=false`` is what the Then grades.
+    """
+    ctx["sandbox_boundary"] = boundary_point
+
+
+@when("the Buyer Agent calls get_adcp_capabilities MCP tool")
+def when_call_get_capabilities(ctx: dict) -> None:
+    """Dispatch get_adcp_capabilities through the parametrized wire transport.
+
+    The "MCP tool" wording is the Gherkin's; the actual transport (a2a/mcp/rest) is driven by
+    ``pytest_generate_tests`` via ctx["transport"] (the scenario carries no transport tag), so
+    the honesty declaration is graded on every wire — mirrors the UC-030 dispatch convention.
+    get_adcp_capabilities is an auth-optional, no-argument discovery call (no request body).
+    """
+    dispatch_request(ctx)
+    # Discovery is read-only and auth-optional (POST-F1): it must SUCCEED for every boundary
+    # point (all four resolve to the same honest response). Assert that here so an auth/wiring
+    # regression surfaces as this step, not as a confusing missing-account-section in the Then.
+    assert ctx.get("error") is None, f"get_adcp_capabilities discovery must not error: {ctx.get('error')!r}"
+
+
+@then(parsers.parse("the capabilities response should be {expected} for the sandbox flag"))
+def then_capabilities_sandbox_flag(ctx: dict, expected: str) -> None:
+    """Grade the #1329 sandbox honesty on the real wire, per the outline's ``expected`` verdict.
+
+    This seller has no behavioral sandbox isolation, so get_adcp_capabilities (a tenant-level,
+    no-argument discovery endpoint) declares ``account.sandbox=false`` UNCONDITIONALLY — it does
+    not read per-account state, so the boundary_point's hypothetical response shape does not
+    drive the grade. The four Examples rows map onto two graded outcomes via ``expected``:
+
+    - ``expected == "valid"`` (rows 1-3: sandbox true / absent / explicit-false): the seller's
+      honest declaration IS a spec-valid response — assert ``account.sandbox is False`` on the
+      wire. Falsifiable: a regression to a dishonest ``sandbox=true`` reddens this across
+      a2a/mcp/rest.
+    - ``expected == "invalid"`` (row 4: "capability not declared, sandbox provisioning
+      requested"): the outline's "invalid" is a REJECTED provisioning request, but this
+      discovery endpoint takes no request body, performs no provisioning, and issues no
+      rejection — so that outcome is not observable here. Xfailed as ungraded-at-this-boundary
+      rather than left to collapse into a silent guaranteed-pass (#1682 review — vacuous
+      partition step).
+    """
+    if expected == "invalid":
+        pytest.xfail(
+            "get_adcp_capabilities is a no-argument, read-only discovery endpoint: it cannot grade "
+            "a rejected sandbox-provisioning request (the outline's 'invalid' row). Its honest "
+            "sandbox=false is a capability signal, not a rejection — that path, if modeled, belongs "
+            "to a spend/provisioning tool, not this discovery call (#1329)."
+        )
+    if expected != "valid":
+        raise AssertionError(f"unknown expected verdict {expected!r} for the sandbox-flag outline")
+    body = wire_dict(ctx)
+    account = body.get("account")
+    assert account is not None, f"capabilities response must include an account section: {body}"
+    assert account.get("sandbox") is False, (
+        f"account.sandbox must be an honest False for boundary {ctx.get('sandbox_boundary')!r} "
+        f"(expected valid); got {account.get('sandbox')!r}"
+    )

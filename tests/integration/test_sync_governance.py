@@ -17,10 +17,11 @@ import pytest
 from src.core.database.repositories.account import AccountRepository
 from src.core.database.repositories.uow import AccountUoW
 from src.core.schemas.account import SyncGovernanceRequest
-from tests.factories import AccountFactory, AgentAccountAccessFactory, TenantFactory
+from tests.factories import AccountFactory, TenantFactory
 from tests.harness.governance_sync import GovernanceSyncEnv
 from tests.harness.transport import Transport, _pinned_error_metadata
-from tests.helpers.governance import BEARER_CREDS, GOV_URL, governance_agent_dict, grant_account_access, url_eq
+from tests.helpers.accounts import seed_account_with_access
+from tests.helpers.governance import BEARER_CREDS, GOV_URL, governance_agent_dict, url_eq
 
 pytestmark = [pytest.mark.integration, pytest.mark.requires_db]
 
@@ -69,7 +70,7 @@ class TestSyncGovernancePersistence:
     async def test_owned_account_synced_and_persisted_url_only(self, integration_db):
         with GovernanceSyncEnv(tenant_id="gov_t1", principal_id="gov_agent1") as env:
             tenant, principal = env.setup_default_data()
-            grant_account_access(tenant, principal, "acc_gov_1")
+            seed_account_with_access(tenant, principal, account_id="acc_gov_1")
 
             resp = await env.call_impl_async(req=_request({"account_id": "acc_gov_1"}))
 
@@ -90,7 +91,7 @@ class TestSyncGovernancePersistence:
     async def test_replace_semantics_overwrites_prior_binding(self, integration_db):
         with GovernanceSyncEnv(tenant_id="gov_t2", principal_id="gov_agent2") as env:
             tenant, principal = env.setup_default_data()
-            grant_account_access(tenant, principal, "acc_gov_2")
+            seed_account_with_access(tenant, principal, account_id="acc_gov_2")
 
             await env.call_impl_async(req=_request({"account_id": "acc_gov_2"}, url=GOV_URL))
             # Second sync with a different agent replaces the first.
@@ -168,10 +169,9 @@ class TestSyncGovernanceAuthority:
             tenant, principal = env.setup_default_data()
             # Two OWNED accounts sharing one natural key (operator + brand.domain + sandbox).
             for aid in ("acc_amb_1", "acc_amb_2"):
-                account = AccountFactory(
-                    tenant=tenant, account_id=aid, operator="pinnacle.com", brand={"domain": "spark"}, sandbox=False
+                seed_account_with_access(
+                    tenant, principal, account_id=aid, operator="pinnacle.com", brand_domain="spark", sandbox=False
                 )
-                AgentAccountAccessFactory(tenant=tenant, principal=principal, account=account)
             ref = {"brand": {"domain": "spark"}, "operator": "pinnacle.com", "sandbox": False}
             resp = await env.call_impl_async(
                 req=SyncGovernanceRequest(
@@ -195,8 +195,7 @@ class TestSyncGovernanceAuthority:
         """
         with GovernanceSyncEnv(tenant_id="gov_susp", principal_id="gov_agent_susp") as env:
             tenant, principal = env.setup_default_data()
-            account = AccountFactory(tenant=tenant, account_id="acc_susp", status="suspended")
-            AgentAccountAccessFactory(tenant=tenant, principal=principal, account=account)
+            seed_account_with_access(tenant, principal, account_id="acc_susp", status="suspended")
 
             resp = await env.call_impl_async(req=_request({"account_id": "acc_susp"}))
 
@@ -221,7 +220,7 @@ class TestSyncGovernanceCrossTransportWire:
         tid = f"gov_wire_{transport.value}"
         with GovernanceSyncEnv(tenant_id=tid, principal_id=f"{tid}_agent") as env:
             tenant, principal = env.setup_default_data()
-            grant_account_access(tenant, principal, "acc_wire")
+            seed_account_with_access(tenant, principal, account_id="acc_wire")
 
             result = env.call_via(
                 transport,
@@ -252,7 +251,7 @@ class TestSyncGovernanceCrossTransportWire:
         tid = f"gov_ctx_{transport.value}"
         with GovernanceSyncEnv(tenant_id=tid, principal_id=f"{tid}_agent") as env:
             tenant, principal = env.setup_default_data()
-            grant_account_access(tenant, principal, "acc_ctx")
+            seed_account_with_access(tenant, principal, account_id="acc_ctx")
 
             result = env.call_via(
                 transport,
@@ -274,7 +273,7 @@ class TestSyncGovernanceRestWire:
     def test_rest_happy_path_synced(self, integration_db):
         with GovernanceSyncEnv(tenant_id="gov_t5", principal_id="gov_agent5") as env:
             tenant, principal = env.setup_default_data()
-            grant_account_access(tenant, principal, "acc_gov_5")
+            seed_account_with_access(tenant, principal, account_id="acc_gov_5")
 
             resp = env.call_rest(req=_request({"account_id": "acc_gov_5"}))
 

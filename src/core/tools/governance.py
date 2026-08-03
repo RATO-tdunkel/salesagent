@@ -195,8 +195,10 @@ def _sync_one_account(
         )
 
     # Persist through the repository, which OWNS the url-only projection (credentials
-    # never persisted — #1329) and returns the stored url-only list. Echo
-    # from that same list so persisted and echoed can never disagree.
+    # never persisted — #1329) and returns the stored list as typed GovernanceAgentColumn
+    # records ({url: str}). Echo from that same list so persisted and echoed can never
+    # disagree; the typed record means ``agent["url"]`` is statically key-checked — a column
+    # rename fails mypy here rather than becoming a runtime KeyError (#1682 review item 2).
     # set_governance_binding replaces the prior binding (per-account replace semantics).
     agent_urls = repo.set_governance_binding(account_id, entry.governance_agents)
 

@@ -917,6 +917,11 @@ _SUPPLEMENTAL_ALIGNMENTS: list[ResponseAlignment] = [
         selector="accounts",
         item_key="accounts",
         model=SyncGovernanceResponseAccount,
+        # account/status are explicitly declared on the model (schemas/account.py) and
+        # required in the pinned schema; pin them so test_declared_fields_present_in_schema_
+        # and_model actually runs for this row (an empty declared_fields skips it) — the check
+        # that catches a field surviving only via inherited extra='allow' (#1682 review item 4).
+        declared_fields=frozenset({"account", "status"}),
         sample={"account": {"account_id": "acc_1"}, "status": "synced"},
     ),
 ]

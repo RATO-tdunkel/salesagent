@@ -33,8 +33,9 @@ from pytest_bdd import given, parsers, then, when
 
 from tests.bdd.steps._outcome_helpers import _require_response, wire_dict
 from tests.bdd.steps.generic._dispatch import dispatch_request
-from tests.factories import AccountFactory, AgentAccountAccessFactory
-from tests.helpers.governance import governance_agent_dict, grant_account_access, url_eq
+from tests.factories import AccountFactory
+from tests.helpers.accounts import seed_account_with_access
+from tests.helpers.governance import governance_agent_dict, url_eq
 
 # A valid, well-formed idempotency_key (pattern ^[A-Za-z0-9_.:-]{16,255}$) and
 # Bearer credentials (minLength 32) for scenarios that need a well-formed request
@@ -56,7 +57,7 @@ def _tenant_principal(ctx: dict) -> tuple[Any, Any]:
 def _owned_account(ctx: dict, account_id: str) -> Any:
     """Create an account the authenticated agent has authority over (access grant)."""
     tenant, principal = _tenant_principal(ctx)
-    account = grant_account_access(tenant, principal, account_id)
+    account = seed_account_with_access(tenant, principal, account_id=account_id)
     ctx.setdefault("gov_accounts", {})[account_id] = account
     return account
 
@@ -187,14 +188,14 @@ def given_authority_over_implicit(ctx: dict, brand: str, operator: str) -> None:
     """Seed a natural-key account (brand.domain + operator, non-sandbox) the agent owns.
 
     Unlike ``_owned_account`` (account_id only), the implicit-account scenario resolves by
-    natural key, so the row must carry the operator + brand.domain the request references.
+    natural key, so the row must carry the operator + brand.domain the request references —
+    the canonical seeder carries both (#1682 review item 3).
     """
     tenant, principal = _tenant_principal(ctx)
     account_id = "acc-nk-" + f"{brand}-{operator}".replace(".", "-")
-    account = AccountFactory(
-        tenant=tenant, account_id=account_id, operator=operator, brand={"domain": brand}, sandbox=False
+    account = seed_account_with_access(
+        tenant, principal, account_id=account_id, operator=operator, brand_domain=brand, sandbox=False
     )
-    AgentAccountAccessFactory(tenant=tenant, principal=principal, account=account)
     ctx.setdefault("gov_accounts", {})[account_id] = account
 
 
@@ -404,11 +405,9 @@ def then_no_operation_errors(ctx: dict) -> None:
 @then(parsers.parse('the account "{account_id}" has status "{status}"'))
 @then(parsers.parse('account "{account_id}" has status "{status}" and echoes the governance_agents URL'))
 def then_account_status(ctx: dict, account_id: str, status: str) -> None:
-    # The wire MUST echo the requested account ref — graded explicitly here against the full
-    # wire (a dropped/wrong ref fails this), THEN _wire_account fetches the matching entry.
-    assert account_id in {a.get("account", {}).get("account_id") for a in _wire_accounts(ctx)}, (
-        f"wire must echo the requested account ref {account_id}"
-    )
+    # _wire_account fetches the entry by its echoed ref — the by-id lookup IS the ref-echo
+    # grade (it raises "No wire account {id}. Available: ..." if the ref was dropped/wrong),
+    # so no separate membership pre-assert (that is redundant against the lookup, #1682 review item 5).
     acct = _wire_account(ctx, account_id)
     assert acct["status"] == status, f"account {account_id}: expected status {status}, got {acct['status']}"
     if status == "synced":
@@ -420,9 +419,8 @@ def then_account_status(ctx: dict, account_id: str, status: str) -> None:
 
 @then(parsers.parse('account "{account_id}" has status "{status}" and carries a per-account errors array'))
 def then_account_status_with_errors(ctx: dict, account_id: str, status: str) -> None:
-    assert account_id in {a.get("account", {}).get("account_id") for a in _wire_accounts(ctx)}, (
-        f"wire must echo the requested account ref {account_id}"
-    )
+    # _wire_account's by-id lookup IS the ref-echo grade (raises on a dropped/wrong ref);
+    # no redundant membership pre-assert (#1682 review item 5).
     acct = _wire_account(ctx, account_id)
     assert acct["status"] == status, f"account {account_id}: expected status {status}, got {acct['status']}"
     assert acct.get("errors"), f"failed account {account_id} must carry a per-account errors array: {acct}"
@@ -430,9 +428,8 @@ def then_account_status_with_errors(ctx: dict, account_id: str, status: str) -> 
 
 @then(parsers.parse('the response account "{account_id}" echoes governance_agents[{idx:d}].url "{url}"'))
 def then_echo_url(ctx: dict, account_id: str, idx: int, url: str) -> None:
-    assert account_id in {a.get("account", {}).get("account_id") for a in _wire_accounts(ctx)}, (
-        f"wire must echo the requested account ref {account_id}"
-    )
+    # _wire_account's by-id lookup IS the ref-echo grade (raises on a dropped/wrong ref);
+    # no redundant membership pre-assert (#1682 review item 5).
     acct = _wire_account(ctx, account_id)
     agents = acct.get("governance_agents") or []
     actual = agents[idx]["url"]
@@ -441,9 +438,8 @@ def then_echo_url(ctx: dict, account_id: str, idx: int, url: str) -> None:
 
 @then(parsers.parse('the response account "{account_id}" does NOT echo governance_agents[{idx:d}].authentication'))
 def then_no_echo_auth(ctx: dict, account_id: str, idx: int) -> None:
-    assert account_id in {a.get("account", {}).get("account_id") for a in _wire_accounts(ctx)}, (
-        f"wire must echo the requested account ref {account_id}"
-    )
+    # _wire_account's by-id lookup IS the ref-echo grade (raises on a dropped/wrong ref);
+    # no redundant membership pre-assert (#1682 review item 5).
     acct = _wire_account(ctx, account_id)
     agents = acct.get("governance_agents") or []
     assert "authentication" not in agents[idx], f"credentials must not be echoed: {agents[idx]}"

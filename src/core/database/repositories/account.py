@@ -8,7 +8,7 @@ beads: salesagent-m44
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, TypedDict
 
 from adcp.types.generated_poc.core.account import GovernanceAgent  # url-only DB column model
 from sqlalchemy import cast, select
@@ -25,7 +25,22 @@ if TYPE_CHECKING:
     )
 
 
-def _serialize_governance_agents(agents: Any) -> list[dict[str, Any]] | None:
+class GovernanceAgentColumn(TypedDict):
+    """The persisted shape of one ``accounts.governance_agents`` element: url-only.
+
+    The element is fully determined — ``GovernanceAgent(url=...).model_dump(mode="json")``
+    yields a single ``url`` key. Typing the persisted record (rather than a bare ``dict``,
+    which is ``dict[Any, Any]`` — no key/value checking at all) makes a ``url`` rename or an
+    extra key a type error at the repository→tool boundary instead of a runtime ``KeyError``
+    on ``agent["url"]`` in the consumer (#1682 review item 2).
+    """
+
+    url: str
+
+
+def _serialize_governance_agents(
+    agents: list[SyncGovernanceRequestAgent] | list[dict[str, Any]] | None,
+) -> list[GovernanceAgentColumn] | None:
     """Project governance agents to the url-only ``accounts.governance_agents`` JSON shape.
 
     Lives beside its sole consumer, ``AccountRepository.set_governance_binding`` — the
@@ -35,7 +50,8 @@ def _serialize_governance_agents(agents: Any) -> list[dict[str, Any]] | None:
     and MUST NEVER be persisted or echoed (sync_governance.mdx;
     sync-governance-response.json ``governance_agents.items`` = url only). The request-side
     ``GovernanceAgent`` carries ``authentication`` (schemes + credentials); this projects to
-    url-only for *both* dict and model inputs.
+    url-only for *both* dict and model inputs (the caller's precise union, not ``Any`` —
+    #1682 review item 2).
 
     Only the ``url`` is read (never re-validating the full request model through the
     url-only DB model, which would ``extra="forbid"``-reject ``authentication`` in
@@ -44,10 +60,13 @@ def _serialize_governance_agents(agents: Any) -> list[dict[str, Any]] | None:
     """
     if agents is None:
         return None
-    result: list[dict[str, Any]] = []
+    result: list[GovernanceAgentColumn] = []
     for agent in agents:
         url = agent["url"] if isinstance(agent, dict) else agent.url
-        result.append(GovernanceAgent(url=url).model_dump(mode="json"))
+        # GovernanceAgent normalizes AnyUrl -> str (trailing slash) and drops the
+        # write-only authentication; the typed record carries only that url.
+        normalized = GovernanceAgent(url=url).model_dump(mode="json")["url"]
+        result.append(GovernanceAgentColumn(url=normalized))
     return result
 
 
@@ -311,7 +330,7 @@ class AccountRepository:
 
     def set_governance_binding(
         self, account_id: str, agents: list[SyncGovernanceRequestAgent] | list[dict[str, Any]] | None
-    ) -> list[dict]:
+    ) -> list[GovernanceAgentColumn]:
         """Replace an account's governance-agent binding; return the persisted url-only list.
 
         The SINGLE write path for ``accounts.governance_agents``, and it OWNS the
@@ -330,7 +349,7 @@ class AccountRepository:
         self._apply_fields(account_id, {"governance_agents": urls})
         return urls
 
-    def get_stored_governance_agents(self, account_id: str) -> list[dict] | None:
+    def get_stored_governance_agents(self, account_id: str) -> list[GovernanceAgentColumn] | None:
         """Return the RAW stored ``governance_agents`` JSON, bypassing JSONType coercion.
 
         Casting the column to plain ``JSONB`` skips ``process_result_value``'s per-item

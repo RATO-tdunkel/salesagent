@@ -35,13 +35,18 @@ from tests.bdd.steps._outcome_helpers import _require_response, wire_dict
 from tests.bdd.steps.generic._dispatch import dispatch_request
 from tests.factories import AccountFactory
 from tests.helpers.accounts import seed_account_with_access
-from tests.helpers.governance import governance_agent_dict, url_eq
+from tests.helpers.governance import (
+    DEFAULT_URL,
+    account_entry,
+    governance_agent_dict,
+    persisted_governance_urls,
+    url_eq,
+)
 
 # A valid, well-formed idempotency_key (pattern ^[A-Za-z0-9_.:-]{16,255}$) and
 # Bearer credentials (minLength 32) for scenarios that need a well-formed request
 # so the assertion-under-test (auth, account resolution) is what actually fires.
 _VALID_KEY = "uuid-v4-bdd-00000000000001"
-_DEFAULT_URL = "https://governance.example.com"
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -76,7 +81,8 @@ def _agent(url: str, *, cred_len: int = 64, credentials: str | None = None, sche
 
 
 def _account_entry(account_id: str, agents: list[dict[str, Any]]) -> dict[str, Any]:
-    return {"account": {"account_id": account_id}, "governance_agents": agents}
+    # Thin id-form wrapper over the shared request-element builder (#1682 review item 2).
+    return account_entry({"account_id": account_id}, agents=agents)
 
 
 def _dispatch(ctx: dict, transport: str, *, identity: Any = "__keep__", **kwargs: Any) -> None:
@@ -113,23 +119,6 @@ def _wire_account(ctx: dict, account_id: str) -> dict[str, Any]:
             return acct
     available = [(a.get("account") or {}).get("account_id") for a in _wire_accounts(ctx)]
     raise AssertionError(f"No wire account {account_id!r}. Available: {available}")
-
-
-def _persisted_binding(ctx: dict, account_id: str) -> dict[str, Any]:
-    """Read the persisted account row back through a fresh AccountUoW on the same DB the
-    dispatch committed to, returning ``{"account_id", "urls"}`` extracted BEFORE the session
-    closes (accessing ORM attributes after close raises DetachedInstanceError — attributes
-    expire on commit). Lets the replace/absent Then steps grade what was actually persisted
-    (below the wire), not just the response echo. ``account_id`` is None when no row exists.
-    """
-    from src.core.database.repositories.uow import AccountUoW
-
-    tenant_id = ctx["tenant"].tenant_id
-    with AccountUoW(tenant_id) as uow:
-        account = uow.accounts.get_by_id(account_id)
-        if account is None:
-            return {"account_id": None, "urls": []}
-        return {"account_id": account.account_id, "urls": [str(a.url) for a in (account.governance_agents or [])]}
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -245,7 +234,7 @@ def when_sync_natural_key_account(
         ctx,
         transport,
         idempotency_key=key,
-        accounts=[{"account": ref, "governance_agents": [_agent(url, cred_len=n)]}],
+        accounts=[account_entry(ref, agents=[_agent(url, cred_len=n)])],
     )
 
 
@@ -320,7 +309,7 @@ def when_sync_n_accounts(ctx: dict, transport: str, key: str, n: int, url: str) 
 )
 def when_sync_no_key(ctx: dict, transport: str, account_id: str) -> None:
     # Well-formed agent so the ONLY defect is the missing key.
-    _dispatch(ctx, transport, accounts=[_account_entry(account_id, [_agent(_DEFAULT_URL)])])
+    _dispatch(ctx, transport, accounts=[_account_entry(account_id, [_agent(DEFAULT_URL)])])
 
 
 @when(
@@ -336,7 +325,7 @@ def when_sync_no_auth(ctx: dict, transport: str, account_id: str) -> None:
         transport,
         identity=None,
         idempotency_key=_VALID_KEY,
-        accounts=[_account_entry(account_id, [_agent(_DEFAULT_URL)])],
+        accounts=[_account_entry(account_id, [_agent(DEFAULT_URL)])],
     )
 
 
@@ -348,7 +337,7 @@ def when_sync_no_auth(ctx: dict, transport: str, account_id: str) -> None:
 )
 def when_sync_key_boundary(ctx: dict, transport: str, key: str, account_id: str) -> None:
     # idempotency_key boundary scenarios: vary only the key; keep the rest well-formed.
-    _dispatch(ctx, transport, idempotency_key=key, accounts=[_account_entry(account_id, [_agent(_DEFAULT_URL)])])
+    _dispatch(ctx, transport, idempotency_key=key, accounts=[_account_entry(account_id, [_agent(DEFAULT_URL)])])
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -511,8 +500,8 @@ def then_per_account_suggestion(ctx: dict, field: str) -> None:
 #
 # The wire echo shows the current sync's result, so proving REPLACE (prior binding gone)
 # and per-account SCOPE (an unnamed account untouched) requires reading the persisted row.
-# These read it back via _persisted_binding, matching the below-wire integration test
-# test_replace_semantics_overwrites_prior_binding (#1682 review item 3).
+# These read it back via the shared session-safe persisted_governance_urls, matching the
+# below-wire integration test test_replace_semantics_overwrites_prior_binding (#1682 review item 2).
 
 
 @then(parsers.parse('the persisted governance agent on "{account_id}" is "{url}"'))
@@ -521,9 +510,8 @@ def then_persisted_binding_is(ctx: dict, account_id: str, url: str) -> None:
     # One body, two phrasings (replace-overwrites vs per-account-scope-unchanged): both
     # assert the persisted binding on the account is EXACTLY [url]. Stacked parsers rather
     # than two identical bodies (#1682 review H; mirrors the stacked @when parsers).
-    persisted = _persisted_binding(ctx, account_id)
-    assert persisted["account_id"] == account_id, f"account {account_id!r} not persisted"
-    urls = persisted["urls"]
+    # An absent/unbound account reads back as [], so the len==1 check also covers persistence.
+    urls = persisted_governance_urls(ctx["tenant"].tenant_id, account_id)
     assert len(urls) == 1 and url_eq(urls[0], url), f"expected {account_id} persisted binding == [{url!r}], got {urls}"
 
 
@@ -534,7 +522,7 @@ def then_previous_binding_absent(ctx: dict, url: str) -> None:
     prior = ctx.get("prior_bindings") or {}
     assert prior, "no prior binding recorded by the pre-binding Given"
     account_id = next(iter(prior))
-    urls = _persisted_binding(ctx, account_id)["urls"]
+    urls = persisted_governance_urls(ctx["tenant"].tenant_id, account_id)
     assert not any(url_eq(p, url) for p in urls), f"stale binding {url!r} still present on {account_id}: {urls}"
 
 

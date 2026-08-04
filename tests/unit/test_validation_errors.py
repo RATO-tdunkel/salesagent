@@ -242,3 +242,50 @@ def test_validation_error_redacts_nested_secret_under_unknown_field():
 
         assert secret not in error_msg, f"nested credential leaked: {error_msg!r}"
         assert "[redacted]" in error_msg
+
+
+@pytest.mark.parametrize(
+    "field_name",
+    [
+        "api_key",
+        "access_token",
+        "client_secret",
+        "auth_token",
+        "private_key",
+        "bearer_token",
+        "secret_key",
+        "refresh_token",
+        "session_token",
+        "password",
+    ],
+)
+def test_validation_error_redacts_credential_shaped_sibling_of_url(field_name):
+    """A credential-shaped field passed as a SCALAR SIBLING of ``url`` is redacted.
+
+    The round-4 redaction keyed on an exact token set, so realistic credential
+    field names (api_key, access_token, client_secret, private_key, ...) placed
+    NOT under ``authentication`` but as a plain sibling of ``url`` echoed their
+    value verbatim onto the buyer wire + the message-persisting sinks. The matcher
+    is fragment-based (substring) so these variants are withheld too — pins the
+    gap the nested `authentication.credentials` probe never stressed (#1682 review).
+    """
+    secret = "sk-live-" + "z" * 40
+    try:
+        raise ValidationError.from_exception_data(
+            "SyncGovernanceRequest",
+            [
+                {
+                    "type": "extra_forbidden",
+                    "loc": ("accounts", 0, "governance_agents", 0, field_name),
+                    "msg": "Extra inputs are not permitted",
+                    "input": secret,
+                }
+            ],
+        )
+    except ValidationError as e:
+        error_msg = format_validation_error(e)
+
+        assert secret not in error_msg, f"{field_name} value must be withheld from the echo"
+        assert "[redacted]" in error_msg
+        # The field path stays actionable.
+        assert f"{field_name}: Extra field not allowed by AdCP spec" in error_msg

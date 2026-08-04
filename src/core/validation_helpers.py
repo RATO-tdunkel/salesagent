@@ -23,28 +23,37 @@ from src.core.exceptions import (
 
 logger = logging.getLogger(__name__)
 
-# Field-name tokens that mark a credential-bearing context. When an
-# ``extra_forbidden`` rejection sits under (or carries a value nested under) any
+# Substring fragments that mark a credential-bearing field name. When an
+# ``extra_forbidden`` rejection's loc segment (or a nested value key) CONTAINS any
 # of these, the offending value is a candidate write-only secret — e.g. a buyer
-# typo of ``credentials`` -> ``credential`` still carries the bearer token — so
-# ``format_validation_error`` redacts the ``Received value:`` echo rather than
-# reflecting it onto the buyer wire / into the error-log + audit sinks that
-# persist ``errors[0].message`` (#1329). The field *path* stays; only
-# the value is withheld. ``governance_agents`` is deliberately absent: it is
-# url-only (echoed on the wire anyway), and its sole secret leaf,
-# ``authentication.credentials``, is already covered by the tokens below.
-_SENSITIVE_VALUE_TOKENS: frozenset[str] = frozenset(
-    {
-        "authentication",
-        "credentials",
-        "credential",
-        "authorization",
-        "secret",
-        "token",
-        "password",
-        "push_notification_config",
-    }
+# typo of ``credentials`` -> ``credential`` still carries the bearer token, and a
+# credential passed as a plain scalar *sibling* of ``url`` (``api_key``,
+# ``access_token``, ``client_secret``, ``private_key``, ``refresh_token``) is not
+# nested under ``authentication`` at all — so ``format_validation_error`` redacts
+# the ``Received value:`` echo rather than reflecting it onto the buyer wire / into
+# the error-log + audit sinks that persist ``errors[0].message`` (#1329). Matching
+# is by SUBSTRING (not exact token) precisely so those un-nested variants are caught
+# too; because this governs only the debug echo of an ALREADY-REJECTED extra field,
+# over-matching an innocuous unknown field costs nothing (its value is simply not
+# echoed) while under-matching leaks a secret. The field *path* always stays; only
+# the value is withheld. ``governance_agents`` needs no fragment: it is url-only
+# (echoed anyway), and its secret leaf ``authentication.credentials`` matches ``auth``
+# / ``credential`` below.
+_SENSITIVE_NAME_FRAGMENTS: frozenset[str] = frozenset(
+    {"auth", "credential", "secret", "token", "password", "passwd", "key", "bearer"}
 )
+# Credential-bearing field names that contain none of the fragments above.
+_SENSITIVE_EXACT_TOKENS: frozenset[str] = frozenset({"push_notification_config"})
+
+
+def _names_credential(name: object) -> bool:
+    """True if a field/key name marks a credential-bearing context.
+
+    Matches an exact carve-out token (``push_notification_config``) or any
+    substring fragment (``auth``/``credential``/``secret``/``token``/``key``/...).
+    """
+    lowered = str(name).lower()
+    return lowered in _SENSITIVE_EXACT_TOKENS or any(frag in lowered for frag in _SENSITIVE_NAME_FRAGMENTS)
 
 
 def _value_has_sensitive_key(value: object) -> bool:
@@ -55,7 +64,7 @@ def _value_has_sensitive_key(value: object) -> bool:
     still holds the credential).
     """
     if isinstance(value, dict):
-        if any(str(k).lower() in _SENSITIVE_VALUE_TOKENS for k in value):
+        if any(_names_credential(k) for k in value):
             return True
         return any(_value_has_sensitive_key(v) for v in value.values())
     if isinstance(value, list):
@@ -63,13 +72,13 @@ def _value_has_sensitive_key(value: object) -> bool:
     return False
 
 
-def _is_sensitive_extra_field(loc: tuple, input_val: object) -> bool:
+def _is_sensitive_extra_field(loc: tuple[str | int, ...], input_val: object) -> bool:
     """Whether an ``extra_forbidden`` value must be withheld from the echo.
 
     Sensitive if any loc segment names a credential-bearing context OR the value
     itself nests a sensitive key.
     """
-    if any(str(seg).lower() in _SENSITIVE_VALUE_TOKENS for seg in loc):
+    if any(_names_credential(seg) for seg in loc):
         return True
     return _value_has_sensitive_key(input_val)
 

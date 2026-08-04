@@ -8,6 +8,7 @@ This module follows the MCP/A2A shared implementation pattern from CLAUDE.md.
 
 import logging
 from datetime import UTC, datetime
+from typing import Any
 
 from adcp.types import GetAdcpCapabilitiesRequest, GetAdcpCapabilitiesResponse
 from adcp.types.generated_poc.core.media_buy_features import MediaBuyFeatures
@@ -81,7 +82,7 @@ CHANNEL_MAPPING: dict[str, MediaChannel] = {
 _DEFAULT_SUPPORTED_BILLING: list[BillingParty] = [BillingParty.operator, BillingParty.agent]
 
 
-def _build_account_capability(tenant: dict | None) -> AccountCapability:
+def _build_account_capability(tenant: dict[str, Any] | None) -> AccountCapability:
     """Build the `account` capability object with an HONEST sandbox declaration.
 
     sandbox=False (#1329 gap 13): this seller stores a per-account `sandbox` flag
@@ -190,7 +191,7 @@ def _adcp_metadata() -> Adcp:
 
 
 def _build_capabilities_response(
-    tenant: dict | None,
+    tenant: dict[str, Any] | None,
     *,
     media_buy: MediaBuy | None = None,
     last_updated: datetime | None = None,

@@ -21,7 +21,14 @@ from tests.factories import AccountFactory, TenantFactory
 from tests.harness.governance_sync import GovernanceSyncEnv
 from tests.harness.transport import Transport, _pinned_error_metadata
 from tests.helpers.accounts import seed_account_with_access
-from tests.helpers.governance import BEARER_CREDS, GOV_URL, governance_agent_dict, url_eq
+from tests.helpers.governance import (
+    BEARER_CREDS,
+    GOV_URL,
+    account_entry,
+    governance_agent_dict,
+    persisted_governance_urls,
+    url_eq,
+)
 
 pytestmark = [pytest.mark.integration, pytest.mark.requires_db]
 
@@ -37,16 +44,8 @@ def _request(
 ) -> SyncGovernanceRequest:
     return SyncGovernanceRequest(
         idempotency_key=key,
-        accounts=[{"account": account_ref, "governance_agents": [governance_agent_dict(url)]}],
+        accounts=[account_entry(account_ref, agents=[governance_agent_dict(url)])],
     )
-
-
-def _persisted_agents(tenant_id: str, account_id: str) -> list:
-    """Read the persisted governance_agents off the account row via the repository."""
-    with AccountUoW(tenant_id) as uow:
-        repo: AccountRepository = uow.accounts
-        account = repo.get_by_id(account_id)
-        return account.governance_agents if account else None
 
 
 def _persisted_agents_raw(tenant_id: str, account_id: str) -> list | None:
@@ -77,9 +76,9 @@ class TestSyncGovernancePersistence:
         assert resp.accounts[0].status == "synced"
         assert resp.accounts[0].governance_agents[0].url == GOV_URL + "/"
         # Persisted url-only (credentials are never stored — column model is url-only).
-        persisted = _persisted_agents("gov_t1", "acc_gov_1")
+        persisted = persisted_governance_urls("gov_t1", "acc_gov_1")
         assert len(persisted) == 1
-        assert str(persisted[0].url) == GOV_URL + "/"
+        assert persisted[0] == GOV_URL + "/"
         # Assert the RAW STORED JSON has exactly one key, `url`. Reading through the ORM
         # (above) re-coerces to the url-only column model, so a leaked credential would
         # RAISE on read rather than fail this assertion — the raw JSONB read makes the
@@ -100,9 +99,9 @@ class TestSyncGovernancePersistence:
             )
 
         assert resp.accounts[0].status == "synced"
-        persisted = _persisted_agents("gov_t2", "acc_gov_2")
+        persisted = persisted_governance_urls("gov_t2", "acc_gov_2")
         assert len(persisted) == 1
-        assert str(persisted[0].url) == GOV_URL_2 + "/"
+        assert persisted[0] == GOV_URL_2 + "/"
 
 
 class TestSyncGovernanceAuthority:
@@ -139,7 +138,7 @@ class TestSyncGovernanceAuthority:
         # authorization-specific "does not have access to account 'X'" phrasing.
         assert "does not have access" not in err.message
         # No binding persisted on a failed account.
-        assert _persisted_agents("gov_t4", "acc_unowned") in (None, [])
+        assert persisted_governance_urls("gov_t4", "acc_unowned") == []
 
     @pytest.mark.asyncio
     async def test_cross_tenant_account_fails_account_not_found(self, integration_db):
@@ -157,7 +156,7 @@ class TestSyncGovernanceAuthority:
         assert resp.accounts[0].status == "failed"
         assert resp.accounts[0].errors[0].code == "ACCOUNT_NOT_FOUND"
         # The account was NOT touched in tenant B.
-        assert _persisted_agents("gov_tb", "acc_in_b") in (None, [])
+        assert persisted_governance_urls("gov_tb", "acc_in_b") == []
 
     @pytest.mark.asyncio
     async def test_natural_key_ambiguous_fails_account_ambiguous(self, integration_db):
@@ -176,7 +175,7 @@ class TestSyncGovernanceAuthority:
             resp = await env.call_impl_async(
                 req=SyncGovernanceRequest(
                     idempotency_key="uuid-v4-int-000000000000000amb",
-                    accounts=[{"account": ref, "governance_agents": [governance_agent_dict(GOV_URL)]}],
+                    accounts=[account_entry(ref, agents=[governance_agent_dict(GOV_URL)])],
                 )
             )
 
@@ -185,7 +184,7 @@ class TestSyncGovernanceAuthority:
         assert err.code == "ACCOUNT_AMBIGUOUS"
         assert err.recovery == _pinned_error_metadata()["ACCOUNT_AMBIGUOUS"]["recovery"]
         # No binding persisted on a failed account.
-        assert _persisted_agents("gov_amb", "acc_amb_1") in (None, [])
+        assert persisted_governance_urls("gov_amb", "acc_amb_1") == []
 
     @pytest.mark.asyncio
     async def test_status_blocked_account_fails_with_status_code(self, integration_db):
@@ -204,7 +203,7 @@ class TestSyncGovernanceAuthority:
         # ACCOUNT_SUSPENDED is a canonical pinned code; recovery agrees by construction.
         assert err.code == "ACCOUNT_SUSPENDED"
         assert err.recovery == _pinned_error_metadata()["ACCOUNT_SUSPENDED"]["recovery"]
-        assert _persisted_agents("gov_susp", "acc_susp") in (None, [])
+        assert persisted_governance_urls("gov_susp", "acc_susp") == []
 
 
 class TestSyncGovernanceCrossTransportWire:
@@ -225,9 +224,7 @@ class TestSyncGovernanceCrossTransportWire:
             result = env.call_via(
                 transport,
                 idempotency_key="uuid-v4-wire-0000000000000001",
-                accounts=[
-                    {"account": {"account_id": "acc_wire"}, "governance_agents": [governance_agent_dict(GOV_URL)]}
-                ],
+                accounts=[account_entry({"account_id": "acc_wire"}, agents=[governance_agent_dict(GOV_URL)])],
             )
 
         assert result.is_success, f"{transport}: expected success, got {result.error!r}"
@@ -257,14 +254,66 @@ class TestSyncGovernanceCrossTransportWire:
                 transport,
                 idempotency_key="uuid-v4-ctx-00000000000000001",
                 context={"conversation_id": "conv-gov-xyz"},
-                accounts=[
-                    {"account": {"account_id": "acc_ctx"}, "governance_agents": [governance_agent_dict(GOV_URL)]}
-                ],
+                accounts=[account_entry({"account_id": "acc_ctx"}, agents=[governance_agent_dict(GOV_URL)])],
             )
 
         assert result.is_success, f"{transport}: expected success, got {result.error!r}"
         echoed = (result.wire_response or {}).get("context") or {}
         assert echoed.get("conversation_id") == "conv-gov-xyz", f"{transport}: context not echoed: {echoed}"
+
+
+# A 32+ char secret carried on a mistyped, credential-bearing extra field. It must NEVER
+# reach the wire — format_validation_error redacts the extra_forbidden echo under a
+# credential-bearing loc (#1329). Distinct from BEARER_CREDS so the grade pins the extra
+# field's value specifically.
+_REDACTION_SECRET = "leaked-bearer-" + "z" * 40
+
+
+class TestSyncGovernanceCredentialRedactionWire:
+    """A credential-bearing ``extra_forbidden`` rejection redacts the secret on the REAL wire.
+
+    The #1329 redaction (``format_validation_error`` withholds the ``Received value:`` echo under
+    a credential-bearing extra field) feeds ``errors[0].message``, which reaches the REST and A2A
+    buyer wire — but was otherwise graded only by in-process unit tests. This dispatches a
+    governance agent with a mistyped ``authentication.credential`` extra field carrying a 32+ char
+    secret and asserts the VALIDATION_ERROR envelope does NOT echo the secret — the error-path
+    mirror of the success-echo credential grade at ``test_happy_path_synced_on_mcp_and_a2a_wire``
+    (#1682 review item 1).
+
+    Parametrized over A2A + REST only: those carry ``format_validation_error``'s full message on
+    the wire, so disabling the redaction reddens them (verified by mutation). MCP emits only the
+    leaf Pydantic message ("Extra inputs are not permitted"), which never echoes the input value,
+    so a redaction grade there would pass vacuously (the reviewer named REST + A2A specifically).
+    """
+
+    @pytest.mark.parametrize("transport", [Transport.A2A, Transport.REST])
+    def test_credential_bearing_extra_field_redacted_on_wire(self, transport, integration_db):
+        tid = f"gov_redact_{transport.value}"
+        with GovernanceSyncEnv(tenant_id=tid, principal_id=f"{tid}_agent") as env:
+            tenant, principal = env.setup_default_data()
+            seed_account_with_access(tenant, principal, account_id="acc_redact")
+
+            # `credential` (singular) is not in the Authentication schema -> extra_forbidden; it
+            # carries a 32+ char secret, and the credential-bearing loc makes the boundary redact
+            # the echoed value so it never reaches the wire (#1329).
+            leaky_agent = {
+                "url": GOV_URL,
+                "authentication": {
+                    "schemes": ["Bearer"],
+                    "credentials": BEARER_CREDS,
+                    "credential": _REDACTION_SECRET,
+                },
+            }
+            result = env.call_via(
+                transport,
+                idempotency_key="uuid-v4-redact-0000000000001",
+                accounts=[account_entry({"account_id": "acc_redact"}, agents=[leaky_agent])],
+            )
+
+        assert result.is_error, f"{transport}: expected a validation rejection, got {result.payload!r}"
+        result.assert_wire_error("VALIDATION_ERROR")
+        envelope = result.wire_error_envelope
+        assert _REDACTION_SECRET not in str(envelope), f"{transport}: redacted secret leaked on the wire: {envelope}"
 
 
 class TestSyncGovernanceRestWire:

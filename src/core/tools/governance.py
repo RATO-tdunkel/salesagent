@@ -65,6 +65,7 @@ from src.core.exceptions import (
     AdCPAuthorizationError,
     AdCPError,
     AdCPValidationError,
+    RecoveryHint,
 )
 from src.core.helpers.account_helpers import resolve_account
 from src.core.resolved_identity import ResolvedIdentity
@@ -107,7 +108,7 @@ def _failed_account_result(
     account_ref: LibraryAccountReference,
     code: str,
     *,
-    recovery: str,
+    recovery: RecoveryHint,
     message: str,
     suggestion: str | None = None,
 ) -> SyncGovernanceResponseAccount:

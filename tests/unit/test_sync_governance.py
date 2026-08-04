@@ -29,7 +29,6 @@ from unittest.mock import MagicMock, patch
 import pytest
 from pydantic import ValidationError
 
-from src.core.database.repositories.account import _serialize_governance_agents as serialize_governance_agents
 from src.core.exceptions import (
     AdCPAccountNotFoundError,
     AdCPAuthenticationError,
@@ -37,7 +36,13 @@ from src.core.exceptions import (
 )
 from src.core.schemas.account import SyncGovernanceRequest, SyncGovernanceResponse
 from tests.harness.transport import _pinned_error_metadata
-from tests.helpers.governance import BEARER_CREDS, GOV_URL, governance_agent_dict
+from tests.helpers.governance import (
+    BEARER_CREDS,
+    GOV_URL,
+    account_entry,
+    governance_agent_dict,
+    governance_binding_stub,
+)
 
 # Recovery expected on the uniform ACCOUNT_NOT_FOUND per-account error, DERIVED from
 # the pinned spec enum (the authority) — not the literal "terminal" and not the
@@ -78,12 +83,7 @@ def _make_request(
     accounts: list[dict] | None = None,
 ) -> SyncGovernanceRequest:
     if accounts is None:
-        accounts = [
-            {
-                "account": account_ref or {"account_id": "acc_1"},
-                "governance_agents": [governance_agent_dict(url)],
-            }
-        ]
+        accounts = [account_entry(account_ref or {"account_id": "acc_1"}, agents=[governance_agent_dict(url)])]
     return SyncGovernanceRequest(idempotency_key=idempotency_key, accounts=accounts)
 
 
@@ -97,7 +97,7 @@ def _patch_deps(*, resolve_side_effect=None, repo: MagicMock | None = None) -> t
     """
     stack = ExitStack()
     repo = repo or MagicMock()
-    repo.set_governance_binding.side_effect = lambda account_id, agents: serialize_governance_agents(agents) or []
+    repo.set_governance_binding.side_effect = governance_binding_stub()
 
     mock_uow = MagicMock()
     mock_uow.__enter__ = MagicMock(return_value=mock_uow)
@@ -216,8 +216,8 @@ class TestSyncGovernanceAuthorityContract:
             raise AdCPAccountNotFoundError("nope", suggestion="s")
 
         accounts = [
-            {"account": {"account_id": "acc_ok"}, "governance_agents": [governance_agent_dict(GOV_URL)]},
-            {"account": {"account_id": "acc_bad"}, "governance_agents": [governance_agent_dict(GOV_URL)]},
+            account_entry({"account_id": "acc_ok"}, agents=[governance_agent_dict(GOV_URL)]),
+            account_entry({"account_id": "acc_bad"}, agents=[governance_agent_dict(GOV_URL)]),
         ]
         req = _make_request(accounts=accounts)
         stack, repo = _patch_deps(resolve_side_effect=_resolve)
@@ -258,7 +258,7 @@ class TestSyncGovernanceRequestSchema:
     def test_idempotency_key_required(self):
         err = _first_schema_error(
             lambda: SyncGovernanceRequest(
-                accounts=[{"account": {"account_id": "acc_1"}, "governance_agents": [governance_agent_dict(GOV_URL)]}]
+                accounts=[account_entry({"account_id": "acc_1"}, agents=[governance_agent_dict(GOV_URL)])]
             )
         )
         assert err["type"] == "missing", err
@@ -302,10 +302,7 @@ class TestSyncGovernanceRequestSchema:
             lambda: SyncGovernanceRequest(
                 idempotency_key="uuid-v4-unit-00000000000000001",
                 accounts=[
-                    {
-                        "account": {"account_id": "acc_1"},
-                        "governance_agents": [governance_agent_dict(GOV_URL, credentials="short")],
-                    }
+                    account_entry({"account_id": "acc_1"}, agents=[governance_agent_dict(GOV_URL, credentials="short")])
                 ],
             )
         )
@@ -317,13 +314,13 @@ class TestSyncGovernanceRequestSchema:
             lambda: SyncGovernanceRequest(
                 idempotency_key="uuid-v4-unit-00000000000000001",
                 accounts=[
-                    {
-                        "account": {"account_id": "acc_1"},
-                        "governance_agents": [
+                    account_entry(
+                        {"account_id": "acc_1"},
+                        agents=[
                             governance_agent_dict(GOV_URL),
                             governance_agent_dict("https://other.example.com"),
                         ],
-                    }
+                    )
                 ],
             )
         )
@@ -347,7 +344,7 @@ class TestSyncGovernanceBoundaryValues:
         return _first_schema_error(
             lambda: SyncGovernanceRequest(
                 idempotency_key=self._KEY,
-                accounts=[{"account": {"account_id": "a"}, "governance_agents": [agent]}],
+                accounts=[account_entry({"account_id": "a"}, agents=[agent])],
             )
         )
 
@@ -385,8 +382,7 @@ class TestSyncGovernanceBoundaryValues:
         req = SyncGovernanceRequest(
             idempotency_key=self._KEY,
             accounts=[
-                {"account": {"account_id": f"a{i}"}, "governance_agents": [governance_agent_dict(GOV_URL)]}
-                for i in range(100)
+                account_entry({"account_id": f"a{i}"}, agents=[governance_agent_dict(GOV_URL)]) for i in range(100)
             ],
         )
         assert len(req.accounts) == 100

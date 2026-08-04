@@ -14,6 +14,7 @@ from src.core.schemas.account import SyncAccountsRequest
 from tests.harness import Transport
 from tests.harness.account_sync import AccountSyncEnv
 from tests.helpers import assert_envelope_shape
+from tests.helpers.governance import persisted_governance_urls
 
 pytestmark = [pytest.mark.integration, pytest.mark.requires_db]
 
@@ -185,15 +186,13 @@ class TestSyncAccountsPreservesGovernanceBinding:
             )
             assert _action_value(resync.accounts[0].action) == "updated"
 
-            # 4. The governance binding MUST survive the metadata update.
-            with AccountUoW("sync_gov") as uow:
-                repo = uow.accounts
-                account = repo.get_by_id(account_id)
-                persisted = account.governance_agents if account else None
+        # 4. The governance binding MUST survive the metadata update (read back via the shared
+        #    session-safe reader — extracts urls before the session closes, #1682 review item 2).
+        persisted = persisted_governance_urls("sync_gov", account_id)
 
         assert persisted, "sync_accounts wiped the governance binding on a metadata re-sync (#1682 Cluster B)"
         assert len(persisted) == 1
-        assert str(persisted[0].url) == gov_url
+        assert persisted[0] == gov_url
 
 
 class TestSyncAccountsAuth:

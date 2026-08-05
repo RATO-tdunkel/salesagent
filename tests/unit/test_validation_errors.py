@@ -137,8 +137,14 @@ def test_validation_error_formatting_missing_field():
         assert "Invalid request:" in error_msg
 
 
-def test_validation_error_formatting_extra_field():
-    """Test formatting for extra forbidden fields shows the actual value."""
+def test_validation_error_formatting_extra_field_redacts_innocuous_scalar():
+    """Even an innocuous scalar extra field is redacted — the echo is redact-ALL.
+
+    The value is withheld for EVERY extra_forbidden rejection, not only
+    credential-shaped ones: a deny-list cannot enumerate buyer-invented names, so the
+    only safe policy is to never echo (#1682 review C). The actionable field PATH
+    always survives.
+    """
     try:
         raise ValidationError.from_exception_data(
             "CreateMediaBuyRequest",
@@ -155,15 +161,17 @@ def test_validation_error_formatting_extra_field():
         error_msg = format_validation_error(e)
 
         assert "unknown_field: Extra field not allowed by AdCP spec" in error_msg
-        # Now we show the actual value for debugging
-        assert "some_value" in error_msg
-        assert "Received value:" in error_msg
+        # The value is NEVER echoed — even an innocuous one.
+        assert "some_value" not in error_msg
+        assert "Received value: [redacted]" in error_msg
 
 
-def test_validation_error_formatting_extra_field_with_dict():
-    """Test formatting for extra forbidden fields with dict values shows full structure."""
-    # This tests the scenario from the bug where format_ids had an agent_url key
-    # that was incorrectly placed, and Pydantic truncated it
+def test_validation_error_formatting_extra_field_with_dict_redacted():
+    """An extra field with a dict value is redacted too — the structure could nest a secret.
+
+    A value scan cannot prove a dict is credential-free (a list-of-pairs or a
+    buyer-invented key escapes it), so the whole value is withheld (#1682 review C).
+    """
     try:
         raise ValidationError.from_exception_data(
             "Package",
@@ -179,22 +187,48 @@ def test_validation_error_formatting_extra_field_with_dict():
     except ValidationError as e:
         error_msg = format_validation_error(e)
 
-        # Error message should show the full value, not truncated
         assert "format_ids.agent_url: Extra field not allowed by AdCP spec" in error_msg
-        assert "Received value:" in error_msg
-        # The full URL should be visible, not truncated like "ht...id"
-        assert "https://creative.adcontextprotocol.org/" in error_msg
-        assert "display_300x250" in error_msg
+        assert "Received value: [redacted]" in error_msg
+        # The value (even innocuous) is withheld — not echoed.
+        assert "https://creative.adcontextprotocol.org/" not in error_msg
+        assert "display_300x250" not in error_msg
+
+
+def test_validation_error_redacts_declared_field_name_misplaced():
+    """A DECLARED field name misplaced as an extra (e.g. keywords) is redacted uniformly.
+
+    Redact-all makes the former deny-list's over-match moot: declared field names that
+    happened to contain a fragment (``keywords`` -> ``key``, ``idempotency_key``) no
+    longer get special treatment — every extra_forbidden value is withheld the same way
+    (#1682 review C).
+    """
+    try:
+        raise ValidationError.from_exception_data(
+            "SyncAccountsRequest",
+            [
+                {
+                    "type": "extra_forbidden",
+                    "loc": ("keywords",),
+                    "msg": "Extra inputs are not permitted",
+                    "input": ["news", "sports"],
+                }
+            ],
+        )
+    except ValidationError as e:
+        error_msg = format_validation_error(e)
+
+        assert "keywords: Extra field not allowed by AdCP spec" in error_msg
+        assert "Received value: [redacted]" in error_msg
+        assert "news" not in error_msg and "sports" not in error_msg
 
 
 def test_validation_error_redacts_credential_under_authentication():
     """A typo'd extra field under authentication must NOT echo the secret value.
 
-    Regression for #1682 review BLOCKER A: format_validation_error feeds
-    errors[0].message, which reaches the buyer wire (REST/A2A) and the
-    error-log + audit sinks. A buyer typo (`credential` for `credentials`)
-    still carries the bearer token, so the value MUST be redacted while the
-    actionable field PATH is preserved.
+    format_validation_error feeds errors[0].message, which reaches the buyer wire
+    (REST/A2A) and the error-log + audit sinks. A buyer typo (`credential` for
+    `credentials`) still carries the bearer token; redact-all withholds the value while
+    the actionable field PATH is preserved (#1682 review C, was BLOCKER A).
     """
     secret = "SUPERSECRETcredential00000000000000"
     try:
@@ -221,8 +255,9 @@ def test_validation_error_redacts_credential_under_authentication():
 def test_validation_error_redacts_nested_secret_under_unknown_field():
     """An unknown top-level field carrying a nested credential must be redacted.
 
-    Closes the nesting escape where the offending loc segment is innocuous but
-    the echoed value nests a sensitive key (#1682 review BLOCKER A).
+    The offending loc segment is innocuous and the value nests a sensitive key several
+    levels deep — redact-all withholds it without needing to detect the nesting
+    (#1682 review C).
     """
     secret = "NESTEDbearerSECRET00000000000000000"
     try:
@@ -260,14 +295,12 @@ def test_validation_error_redacts_nested_secret_under_unknown_field():
     ],
 )
 def test_validation_error_redacts_credential_shaped_sibling_of_url(field_name):
-    """A credential-shaped field passed as a SCALAR SIBLING of ``url`` is redacted.
+    """Realistic credential field names as a SCALAR SIBLING of ``url`` are redacted.
 
-    The round-4 redaction keyed on an exact token set, so realistic credential
-    field names (api_key, access_token, client_secret, private_key, ...) placed
-    NOT under ``authentication`` but as a plain sibling of ``url`` echoed their
-    value verbatim onto the buyer wire + the message-persisting sinks. The matcher
-    is fragment-based (substring) so these variants are withheld too — pins the
-    gap the nested `authentication.credentials` probe never stressed (#1682 review).
+    Names like api_key/access_token/client_secret/private_key placed NOT under
+    ``authentication`` but as a plain scalar sibling would defeat any nested-key scan;
+    redact-all withholds them regardless. A deny-list could never enumerate this open
+    set, which is why the policy redacts every value (#1682 review C).
     """
     secret = "sk-live-" + "z" * 40
     try:

@@ -15,7 +15,6 @@ from adcp.types.generated_poc.core.media_buy_features import MediaBuyFeatures
 from adcp.types.generated_poc.core.postal_area_support import (
     PostalAreaSupport,  # adcp 6.6: standalone GeoPostalAreas removed; capabilities use PostalAreaSupport
 )
-from adcp.types.generated_poc.enums.billing_party import BillingParty
 from adcp.types.generated_poc.enums.channels import MediaChannel
 from adcp.types.generated_poc.enums.specialism import AdcpSpecialism
 from adcp.types.generated_poc.protocol.get_adcp_capabilities_response import (
@@ -41,6 +40,7 @@ from src.core.auth import get_principal_object, require_identity
 from src.core.database.repositories.idempotency_attempt import DEFAULT_REPLAY_TTL
 from src.core.database.repositories.uow import TenantConfigUoW
 from src.core.helpers import enum_value
+from src.core.helpers.account_helpers import resolve_supported_billing
 from src.core.helpers.activity_helpers import log_tool_activity
 from src.core.helpers.adapter_helpers import get_adapter
 from src.core.resolved_identity import ResolvedIdentity
@@ -76,12 +76,6 @@ CHANNEL_MAPPING: dict[str, MediaChannel] = {
 }
 
 
-# BillingParty values this seller supports. The accounts.billing column permits
-# {operator, agent} (ck_accounts_billing) and sync_accounts enforces the tenant's
-# `supported_billing` policy against those parties, so both are honest defaults.
-_DEFAULT_SUPPORTED_BILLING: list[BillingParty] = [BillingParty.operator, BillingParty.agent]
-
-
 def _build_account_capability(tenant: dict[str, Any] | None) -> AccountCapability:
     """Build the `account` capability object with an HONEST sandbox declaration.
 
@@ -101,17 +95,11 @@ def _build_account_capability(tenant: dict[str, Any] | None) -> AccountCapabilit
     require_operator_auth=False: accounts are buyer-declared via sync_accounts
     (brand + operator natural key, BR-RULE-056) — operators do not authenticate.
 
-    supported_billing (required by the schema): the billing parties this seller
-    accepts — from tenant config `supported_billing` when set, else {operator, agent}
-    (what the accounts.billing constraint permits).
-
-    The configured list is filtered against the PERMITTED set ({operator, agent} =
-    what the ck_accounts_billing constraint and sync_accounts enforcement actually
-    accept), NOT the full BillingParty enum: declaring `advertiser` because the enum
-    contains it — while sync_accounts would reject an advertiser-billed account — is
-    the same wire-honesty defect as `sandbox=True` without isolation (#1329).
-    A tenant can only narrow within {operator, agent}; anything outside falls back to
-    the default.
+    supported_billing (required by the schema): the account-billable parties this
+    seller accepts, resolved by ``resolve_supported_billing`` — the SAME resolver
+    sync_accounts enforces against, so what is advertised here equals what sync_accounts
+    accepts (#1682 review E). A configured value with no account-billable party raises
+    (loud) rather than silently substituting the default.
 
     required_for_products and account_financials default to False on the library type,
     and False is the honest value here: get_products is auth-optional and needs no
@@ -119,13 +107,8 @@ def _build_account_capability(tenant: dict[str, Any] | None) -> AccountCapabilit
     detail (account_financials=False). authorization_endpoint is left absent (no
     operator-auth endpoint, consistent with require_operator_auth=False).
     """
-    permitted = {b.value for b in _DEFAULT_SUPPORTED_BILLING}
-    configured = tenant.get("supported_billing") if tenant else None
-    billing = [BillingParty(v) for v in (configured or []) if v in permitted]
-    if not billing:
-        billing = list(_DEFAULT_SUPPORTED_BILLING)
     return AccountCapability(
-        supported_billing=billing,
+        supported_billing=resolve_supported_billing(tenant),
         sandbox=False,
         require_operator_auth=False,
     )
@@ -177,12 +160,24 @@ _DECLARED_SPECIALISMS: list[AdcpSpecialism] = [AdcpSpecialism.sales_non_guarante
 def _adcp_metadata() -> Adcp:
     """Agent-level AdCP metadata (major versions + idempotency).
 
-    Idempotency(supported=True) is honored by create_media_buy — the mutating tool
-    with real spend — which dedups via uow.idempotency_attempts. sync_governance and
-    sync_accounts accept idempotency_key but defer replay dedup (#1329 follow-up).
-    There is no per-tool idempotency field in the spec, and the tool that matters for
-    at-most-once financial side effects does honor it, so the agent-wide claim stays
-    declared (#1329).
+    Idempotency(supported=True). The 3.1.1 schema scopes this to ALL mutating requests
+    ("the seller deduplicates replays … without re-executing side effects"), and there
+    is no per-tool field, so the declaration is agent-wide. Honest status of the
+    mutating tools behind it (#1682 review F):
+
+    * create_media_buy — the spend-committing tool — DOES dedup via
+      ``uow.idempotency_attempts`` (a replay returns the cached response, no double
+      spend).
+    * sync_governance and sync_accounts accept ``idempotency_key`` but do NOT yet
+      dedup — a replay re-executes (sync_governance re-emits its audit event). This is
+      a known gap: replay dedup for the sync tools is tracked as a follow-up (it needs
+      the storyboard-graded replay/CONFLICT/EXPIRED contract), NOT silently claimed as
+      done.
+
+    The claim stays ``True`` because the spend-committing operation — the one where a
+    double-execution is financially harmful — is covered; the remaining gap is metadata
+    re-emission on the sync tools, which the follow-up closes. It is declared honestly
+    here rather than rationalized as fully implemented.
     """
     return Adcp(
         major_versions=[MajorVersion(root=3)],

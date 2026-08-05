@@ -12,7 +12,7 @@ SDK 5.7 type:ignore tracking (adcontextprotocol/adcp-client-python#913):
   Architectural; permanent.
 """
 
-from typing import Any, Literal
+from typing import Any, Literal, NoReturn
 
 from adcp.types import Account as LibraryAccountDomain
 from adcp.types import AccountReference as LibraryAccountReference
@@ -27,10 +27,12 @@ from adcp.types import SyncGovernanceResponse as LibrarySyncGovernanceResponse
 from adcp.types.aliases import SyncAccountsSuccessResponse as LibrarySyncAccountsSuccess
 from adcp.types.generated_poc.core.brand_ref import BrandReference as LibraryBrandReference
 from pydantic import ConfigDict, model_validator
+from pydantic_core import InitErrorDetails, PydanticCustomError
+from pydantic_core import ValidationError as CoreValidationError
 
 from src.core.config import get_pydantic_extra_mode
 from src.core.schemas._base import NestedModelSerializerMixin, SalesAgentBaseModel
-from src.core.security.url_validator import check_url_ssrf
+from src.core.security.url_validator import check_url_ssrf, strip_url_userinfo
 
 # ---------------------------------------------------------------------------
 # Core domain Account (used in ListAccountsResponse.accounts)
@@ -179,6 +181,23 @@ class SyncAccountsResponse(NestedModelSerializerMixin, LibrarySyncAccountsSucces
 # ---------------------------------------------------------------------------
 
 
+def _raise_governance_url_error(loc: tuple[str | int, ...], message: str, input_value: str) -> NoReturn:
+    """Raise a field-located ``ValidationError`` for a rejected governance agent url.
+
+    A ``model_validator(mode="after")`` that raises a bare ``ValueError`` produces
+    ``loc=()`` — the buyer wire then carries ``field=""`` on both envelope layers and an
+    empty bullet. Emitting an explicit ``loc`` via ``from_exception_data`` restores the
+    ``accounts[i].governance_agents[j].url`` field pointer so error consumers (and the
+    BR-UC-030 wire steps) can pin ``field=`` instead of a free-text message match
+    (#1682 review H2). The rendered message must be a literal (no ``{}`` placeholders) —
+    ``PydanticCustomError`` treats the second arg as a template.
+    """
+    raise CoreValidationError.from_exception_data(
+        "SyncGovernanceRequest",
+        [InitErrorDetails(type=PydanticCustomError("value_error", message), loc=loc, input=input_value)],
+    )
+
+
 class SyncGovernanceRequest(LibrarySyncGovernanceRequest):
     """Extends library SyncGovernanceRequest.
 
@@ -195,19 +214,23 @@ class SyncGovernanceRequest(LibrarySyncGovernanceRequest):
 
     @model_validator(mode="after")
     def _validate_governance_agent_urls(self) -> "SyncGovernanceRequest":
-        """Enforce https, reject embedded credentials, and SSRF-validate agent urls.
+        """Reject embedded credentials, enforce https, and SSRF-validate agent urls.
 
         Three construction-time gates, uniform across every transport (MCP/A2A/REST
-        all build this type):
+        all build this type), each raising a field-located error at
+        ``accounts[i].governance_agents[j].url`` (#1682 review H2):
 
-        1. **https** — the pinned 3.1.1 request schema marks the agent ``url``
+        1. **no userinfo** (checked FIRST) — ``https://user:pass@host/`` embeds a
+           credential in the url, which SSRF hostname checks skip (they read only the
+           host) and which would otherwise be persisted verbatim and echoed on the
+           wire. Ordering this gate before the https/SSRF gates guarantees a
+           credential-bearing url never reaches a gate whose message renders the url;
+           the https message additionally strips userinfo as defense in depth (#1682
+           review B).
+        2. **https** — the pinned 3.1.1 request schema marks the agent ``url``
            ``pattern: ^https://``, but the generated ``AnyUrl`` field does not carry
            that constraint (SDK codegen gap), so an ``http://`` url would slip
            through. The spec is authoritative; enforce it here.
-        2. **no userinfo** — ``https://user:pass@host/`` embeds a credential in the
-           url, which SSRF hostname checks skip (they read only the host) and which
-           would otherwise be persisted verbatim and echoed on the wire. Reject it
-           so no credential rides in the url (#1329).
         3. **SSRF** — the persisted url is a future ``check_governance`` target;
            reject private/internal/loopback/metadata hosts at bind time so a
            poisoned binding is never stored (#1329). ``resolve_dns=False``
@@ -215,22 +238,29 @@ class SyncGovernanceRequest(LibrarySyncGovernanceRequest):
            -hostname checks apply, but fixture hostnames are not NXDOMAIN-rejected;
            a use-time DNS pin belongs with ``check_governance``.
         """
-        for account in self.accounts:
-            for agent in account.governance_agents:
+        for a_idx, account in enumerate(self.accounts):
+            for g_idx, agent in enumerate(account.governance_agents):
                 url = agent.url
                 url_str = str(url)
-                if not url_str.startswith("https://"):
-                    raise ValueError(
-                        f"governance agent url must use https:// (field: governance_agents[].url, got '{url}')"
-                    )
+                loc = ("accounts", a_idx, "governance_agents", g_idx, "url")
+                # 1. userinfo FIRST — a credential-bearing url must be rejected before any
+                #    gate below renders it (operands checked separately so username-only and
+                #    password-only credentials are both rejected — #1682 review B/D2).
                 if getattr(url, "username", None) or getattr(url, "password", None):
-                    raise ValueError(
-                        "governance agent url must not embed userinfo credentials (field: governance_agents[].url)"
+                    _raise_governance_url_error(
+                        loc, "governance agent url must not embed userinfo credentials", url_str
                     )
+                # 2. https — render a userinfo-stripped url (belt-and-suspenders; gate 1
+                #    already rejected any userinfo-bearing url).
+                if not url_str.startswith("https://"):
+                    _raise_governance_url_error(
+                        loc, f"governance agent url must use https:// (got '{strip_url_userinfo(url_str)}')", url_str
+                    )
+                # 3. SSRF — reason names the host class, never the url userinfo.
                 ok, reason = check_url_ssrf(url_str, require_https=True, resolve_dns=False)
                 if not ok:
-                    raise ValueError(
-                        f"governance agent url targets a disallowed host: {reason} (field: governance_agents[].url)"
+                    _raise_governance_url_error(
+                        loc, f"governance agent url targets a disallowed host: {reason}", url_str
                     )
         return self
 

@@ -331,6 +331,29 @@ class _TestClock:
         return self._iso(datetime.now(UTC) - timedelta(days=days))
 
 
+_BODYLESS_REST_VERBS: frozenset[str] = frozenset({"get", "delete"})
+
+
+def issue_rest_verb(
+    client: Any, method: str, endpoint: str, body: dict[str, Any], *, headers: dict[str, str] | None = None
+) -> Any:
+    """Issue ``method`` on ``client`` for ``endpoint``, omitting a JSON body for body-less verbs.
+
+    ``httpx.Client``/Starlette ``TestClient`` ``.get()``/``.delete()`` reject a ``json=``
+    kwarg, so the *verb* — not just the endpoint — decides whether a body is sent. This is
+    the SINGLE place the harness dispatches a REST verb, shared by the in-process
+    ``_run_rest_request`` and the in-network ``RestE2EDispatcher`` so the two legs cannot
+    diverge on how a GET/DELETE discovery endpoint is called: a GET env that overrode only
+    one leg (e.g. ``CapabilitiesEnv``) POSTed on the other and 404'd on the live route
+    (#1682 review A).
+    """
+    call = getattr(client, method)
+    call_kwargs: dict[str, Any] = {} if headers is None else {"headers": headers}
+    if method in _BODYLESS_REST_VERBS:
+        return call(endpoint, **call_kwargs)
+    return call(endpoint, json=body, **call_kwargs)
+
+
 class BaseTestEnv:
     """Base test environment for _impl function testing.
 
@@ -373,6 +396,7 @@ class BaseTestEnv:
     ASYNC_PATCHES: set[str] = set()  # Names that need AsyncMock (for async functions)
     MODULE: str = ""  # Convenience for unit envs building patch paths
     REST_ENDPOINT: str = ""  # Override in subclass for REST dispatch
+    REST_METHOD: str = "post"  # HTTP verb for REST_ENDPOINT; override for GET/DELETE discovery
     use_real_db: bool = False
 
     def __init__(
@@ -889,23 +913,29 @@ class BaseTestEnv:
         return response_cls(**tool_result.structured_content)
 
     def _run_rest_request(self, endpoint: str, **kwargs: Any) -> Any:
-        """Shared REST dispatch: configure auth → build body → POST → return Response.
+        """Shared REST dispatch: configure auth → build body → issue ``REST_METHOD`` → Response.
 
         Symmetric with ``_run_mcp_wrapper``. Handles the full REST lifecycle:
         1. Pop ``identity`` from kwargs and configure dep override for this request
         2. Commit factory data
         3. Build request body from remaining kwargs
-        4. POST via TestClient
+        4. Issue ``self.REST_METHOD`` (default POST) via TestClient — a GET/DELETE
+           discovery endpoint sends no body (``issue_rest_verb``)
         5. Return raw httpx.Response
 
         Identity handling (mirrors production auth middleware):
         - identity is None → dep raises AUTH_REQUIRED (no token) with suggestion
         - identity is ResolvedIdentity → dep returns it (valid token)
         - identity absent → uses default self.identity_for(Transport.REST)
+
+        ``REST_METHOD`` is the single source of truth for the verb: both this in-process
+        leg and the in-network ``RestE2EDispatcher`` read it, so an env need only declare
+        ``REST_METHOD = "get"`` (not override this method) to be dispatched correctly on
+        every REST transport (#1682 review A).
         """
         client, identity = self._prepare_rest_request(kwargs)
         body = self.build_rest_body(**kwargs)
-        return client.post(endpoint, json=body)
+        return issue_rest_verb(client, self.REST_METHOD, endpoint, body)
 
     def _prepare_rest_request(self, kwargs: dict[str, Any]) -> tuple[Any, Any]:
         """Resolve identity, commit factory data, get the client, and install auth.

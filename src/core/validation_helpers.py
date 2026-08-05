@@ -23,65 +23,6 @@ from src.core.exceptions import (
 
 logger = logging.getLogger(__name__)
 
-# Substring fragments that mark a credential-bearing field name. When an
-# ``extra_forbidden`` rejection's loc segment (or a nested value key) CONTAINS any
-# of these, the offending value is a candidate write-only secret — e.g. a buyer
-# typo of ``credentials`` -> ``credential`` still carries the bearer token, and a
-# credential passed as a plain scalar *sibling* of ``url`` (``api_key``,
-# ``access_token``, ``client_secret``, ``private_key``, ``refresh_token``) is not
-# nested under ``authentication`` at all — so ``format_validation_error`` redacts
-# the ``Received value:`` echo rather than reflecting it onto the buyer wire / into
-# the error-log + audit sinks that persist ``errors[0].message`` (#1329). Matching
-# is by SUBSTRING (not exact token) precisely so those un-nested variants are caught
-# too; because this governs only the debug echo of an ALREADY-REJECTED extra field,
-# over-matching an innocuous unknown field costs nothing (its value is simply not
-# echoed) while under-matching leaks a secret. The field *path* always stays; only
-# the value is withheld. ``governance_agents`` needs no fragment: it is url-only
-# (echoed anyway), and its secret leaf ``authentication.credentials`` matches ``auth``
-# / ``credential`` below.
-_SENSITIVE_NAME_FRAGMENTS: frozenset[str] = frozenset(
-    {"auth", "credential", "secret", "token", "password", "passwd", "key", "bearer"}
-)
-# Credential-bearing field names that contain none of the fragments above.
-_SENSITIVE_EXACT_TOKENS: frozenset[str] = frozenset({"push_notification_config"})
-
-
-def _names_credential(name: object) -> bool:
-    """True if a field/key name marks a credential-bearing context.
-
-    Matches an exact carve-out token (``push_notification_config``) or any
-    substring fragment (``auth``/``credential``/``secret``/``token``/``key``/...).
-    """
-    lowered = str(name).lower()
-    return lowered in _SENSITIVE_EXACT_TOKENS or any(frag in lowered for frag in _SENSITIVE_NAME_FRAGMENTS)
-
-
-def _value_has_sensitive_key(value: object) -> bool:
-    """True if ``value`` (a decoded JSON scalar/dict/list) nests a sensitive key.
-
-    Closes the nesting escape where an *unknown top-level* field carries a secret
-    inside it (its own loc segment is innocuous, but ``{"authentication": {...}}``
-    still holds the credential).
-    """
-    if isinstance(value, dict):
-        if any(_names_credential(k) for k in value):
-            return True
-        return any(_value_has_sensitive_key(v) for v in value.values())
-    if isinstance(value, list):
-        return any(_value_has_sensitive_key(item) for item in value)
-    return False
-
-
-def _is_sensitive_extra_field(loc: tuple[str | int, ...], input_val: object) -> bool:
-    """Whether an ``extra_forbidden`` value must be withheld from the echo.
-
-    Sensitive if any loc segment names a credential-bearing context OR the value
-    itself nests a sensitive key.
-    """
-    if any(_names_credential(seg) for seg in loc):
-        return True
-    return _value_has_sensitive_key(input_val)
-
 
 @contextmanager
 def adcp_validation_boundary(context: str = "parameters", field: str | None = None) -> Iterator[None]:
@@ -257,26 +198,19 @@ def format_validation_error(validation_error: ValidationError, context: str = "r
         elif "missing" in error_type:
             error_details.append(f"  • {field_path}: Required field is missing")
         elif "extra_forbidden" in error_type:
-            # For extra_forbidden, echo the actual value to help debug what was
-            # passed — EXCEPT under a credential-bearing context, where the value
-            # may be a write-only secret (a typo'd `credential` still carries the
-            # bearer token). There the field PATH is the actionable part and is
-            # always safe; the value is redacted so it never reaches the buyer
-            # wire or the message-persisting log/audit sinks (#1329).
+            # ALWAYS redact the value of a rejected extra field — never echo it. A
+            # deny-list cannot enumerate buyer-invented credential names (creds/pwd/jwt/
+            # pat/signature/cookie/session/…), and a scalar or list-of-pairs credential
+            # escapes any nested-key scan, so echoing is unsafe in the general case. The
+            # field PATH is the actionable part and always survives; withholding the
+            # value keeps a secret off the buyer wire and out of the message-persisting
+            # log/audit sinks (#1682 review C). ``errors[0].message`` feeds those sinks,
+            # so this holds on REST and A2A; MCP surfaces only the leaf Pydantic message.
             if input_val is None:
                 error_details.append(f"  • {field_path}: Extra field not allowed by AdCP spec")
-            elif _is_sensitive_extra_field(error["loc"], input_val):
+            else:
                 error_details.append(
                     f"  • {field_path}: Extra field not allowed by AdCP spec.\n    Received value: [redacted]"
-                )
-            else:
-                # Format the input value more verbosely for debugging
-                try:
-                    input_repr = json.dumps(input_val, indent=2, default=str)
-                except (TypeError, ValueError):
-                    input_repr = repr(input_val)
-                error_details.append(
-                    f"  • {field_path}: Extra field not allowed by AdCP spec.\n    Received value: {input_repr}"
                 )
         else:
             error_details.append(f"  • {field_path}: {msg}")

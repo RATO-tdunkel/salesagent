@@ -8,7 +8,10 @@ beads: salesagent-8n4
 
 from __future__ import annotations
 
+from typing import Any
+
 from adcp.types import AccountReference, AccountReferenceById, AccountReferenceByNaturalKey
+from adcp.types.generated_poc.enums.billing_party import BillingParty
 
 from src.core.database.repositories.account import AccountRepository
 from src.core.exceptions import (
@@ -20,6 +23,52 @@ from src.core.exceptions import (
     AdCPAuthorizationError,
 )
 from src.core.resolved_identity import ResolvedIdentity
+
+# The billing parties this seller can bill at the ACCOUNT level. The accounts.billing
+# CHECK constraint (ck_accounts_billing) permits only these, so this is the honest,
+# hand-maintained mirror of that constraint. A tenant's ``supported_billing`` may ALSO
+# carry media-buy-level parties (e.g. ``advertiser``, used by create_media_buy) that are
+# not account-billable — those are intersected out for the account context.
+SELLER_ACCOUNT_BILLING: list[BillingParty] = [BillingParty.operator, BillingParty.agent]
+_PERMITTED_ACCOUNT_BILLING: frozenset[str] = frozenset(b.value for b in SELLER_ACCOUNT_BILLING)
+
+
+def resolve_supported_billing(tenant: Any | None) -> list[BillingParty]:
+    """The account-billable parties this seller accepts — the SINGLE source of truth.
+
+    Consumed by BOTH the get_adcp_capabilities ``account.supported_billing`` honesty
+    declaration (what the seller advertises) and the sync_accounts ``billing``
+    enforcement (what it accepts), so declared == accepted (#1682 review E). The 3.1.1
+    ``account.supported_billing`` contract is "the buyer must pass one of these values in
+    sync_accounts", so the two MUST agree.
+
+    Resolution:
+
+    * unset (``None`` / absent) → the default ``SELLER_ACCOUNT_BILLING`` ({operator,
+      agent}). The accounts.billing ck constraint allows only these, so this is the honest
+      accepted set — not "accept everything" (which would let a ``advertiser`` account pass
+      validation and then fail the persist constraint).
+    * a configured list with ≥1 account-billable party → that intersection (a tenant may
+      narrow, and any non-account party such as ``advertiser`` is dropped for this
+      context, never advertised as account-billable).
+    * an explicit empty list ``[]`` → ``[]`` (the seller intentionally supports no account
+      billing; sync_accounts then rejects every billing value — the pre-existing contract).
+    * a NON-empty configured list that declares NO account-billable party (e.g.
+      ``["advertiser"]`` or a typo ``["bogus"]``) → raise. Silently substituting the default
+      would advertise/accept a set the operator did not configure; fail loud so the
+      misconfiguration is fixed, not masked.
+    """
+    configured = tenant.get("supported_billing") if tenant else None
+    if configured is None:
+        return list(SELLER_ACCOUNT_BILLING)
+    resolved = [BillingParty(v) for v in configured if v in _PERMITTED_ACCOUNT_BILLING]
+    if configured and not resolved:
+        raise ValueError(
+            f"tenant supported_billing {list(configured)} declares no account-billable party; "
+            f"accounts.billing accepts only {sorted(_PERMITTED_ACCOUNT_BILLING)} "
+            f"(ck_accounts_billing) — fix the tenant's supported_billing configuration"
+        )
+    return resolved
 
 
 def resolve_account(

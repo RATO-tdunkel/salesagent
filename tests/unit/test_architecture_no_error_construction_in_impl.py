@@ -37,18 +37,31 @@ import pytest
 # malformed directive.
 PATTERN_A_PER_FILE_CAP: dict[str, int] = {}
 
+# The ``# structural-guard:`` marker suppresses a legitimate per-item advisory
+# ``Error(code=...)`` site (a success-envelope ``errors[]`` entry) from the cap above —
+# but a free-form marker has no counter, so the number of SUPPRESSED sites could grow
+# invisibly. Ratchet the marked-site count per file so a NEW advisory ``Error()`` site is
+# a deliberate, reviewed change, not a silent suppression (#1682 review I3). Only shrinks.
+MARKED_PATTERN_A_SITES: dict[str, int] = {
+    "src/core/tools/accounts.py": 2,
+    "src/core/tools/governance.py": 1,
+    "src/core/tools/media_buy_delivery.py": 4,
+    "src/core/tools/media_buy_list.py": 3,
+}
+
 _SKIP_MARKER = "# structural-guard:"
 
 from tests.unit._architecture_helpers import REPO_ROOT, SCAN_DIRS, iter_call_expressions, safe_parse
 from tests.unit._architecture_helpers import rel as _rel
 
 
-def _count_pattern_a_sites(filepath: Path) -> list[int]:
-    """Return line numbers of ``Error(code=...)`` literals not marked for skip.
+def _pattern_a_site_lines(filepath: Path, *, keep_marked: bool) -> list[int]:
+    """Line numbers of ``Error(code=...)`` literal construction sites.
 
-    Sites carrying a ``# structural-guard:`` comment anywhere within the
-    call's line span are legitimate per-item advisory results in a success
-    envelope and are excluded.
+    ``keep_marked=False`` returns the UNMARKED sites (the capped Pattern-A sites);
+    ``keep_marked=True`` returns only the ``# structural-guard:``-marked sites (the
+    legitimate per-item advisory results in a success envelope). A single scan with the
+    marker check inverted keeps the two counters in lockstep (#1682 review I3).
     """
     from tests.unit._architecture_helpers import collect_error_aliases
 
@@ -72,10 +85,20 @@ def _count_pattern_a_sites(filepath: Path) -> list[int]:
             continue
         start = node.lineno - 1
         end = (getattr(node, "end_lineno", None) or node.lineno) - 1
-        if any(_SKIP_MARKER in source_lines[i] for i in range(start, min(end + 1, len(source_lines)))):
-            continue
-        lines.append(node.lineno)
+        is_marked = any(_SKIP_MARKER in source_lines[i] for i in range(start, min(end + 1, len(source_lines))))
+        if is_marked == keep_marked:
+            lines.append(node.lineno)
     return lines
+
+
+def _count_pattern_a_sites(filepath: Path) -> list[int]:
+    """Return line numbers of ``Error(code=...)`` literals NOT marked for skip."""
+    return _pattern_a_site_lines(filepath, keep_marked=False)
+
+
+def _count_marked_pattern_a_sites(filepath: Path) -> list[int]:
+    """Return line numbers of ``Error(code=...)`` literals that ARE marked `# structural-guard:`."""
+    return _pattern_a_site_lines(filepath, keep_marked=True)
 
 
 class TestNoErrorConstructionInImpl:
@@ -112,3 +135,34 @@ class TestNoErrorConstructionInImpl:
         from tests.unit._per_file_cap_guard import assert_caps_only_shrink
 
         assert_caps_only_shrink(PATTERN_A_PER_FILE_CAP, _count_pattern_a_sites, repo_root=REPO_ROOT)
+
+    @pytest.mark.arch_guard
+    def test_marked_advisory_error_sites_ratcheted(self):
+        """The count of ``# structural-guard:``-suppressed ``Error()`` sites only shrinks.
+
+        A free-form suppression marker has no counter (#1682 review I3): without this
+        ratchet a new advisory ``Error(code=...)`` site could be added invisibly, since
+        the marker excludes it from the Pattern-A cap. Assert no file exceeds its recorded
+        marked-site count and no new file appears; when a marked site is converted to a
+        typed raise, LOWER the recorded number.
+        """
+        actual: dict[str, int] = {}
+        for scan_dir in SCAN_DIRS:
+            for filepath in sorted(Path(scan_dir).rglob("*.py")):
+                count = len(_count_marked_pattern_a_sites(filepath))
+                if count:
+                    actual[_rel(filepath)] = count
+
+        increased = {
+            k: (v, MARKED_PATTERN_A_SITES.get(k, 0)) for k, v in actual.items() if v > MARKED_PATTERN_A_SITES.get(k, 0)
+        }
+        assert not increased, (
+            "New or increased `# structural-guard:`-suppressed Error() site(s) "
+            f"(file -> (actual, recorded)): {increased}. A per-item advisory Error() is legitimate, "
+            "but the count is ratcheted — raise the recorded number here only as a deliberate, reviewed change."
+        )
+        stale = {k: (actual.get(k, 0), v) for k, v in MARKED_PATTERN_A_SITES.items() if actual.get(k, 0) < v}
+        assert not stale, (
+            f"Marked-site count shrank (file -> (actual, recorded)): {stale}. Lower the recorded number in "
+            "MARKED_PATTERN_A_SITES so the ratchet tracks reality."
+        )

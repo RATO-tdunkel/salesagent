@@ -356,6 +356,7 @@ def _check_domain_validity(brand_domain: str) -> list[Any] | None:
                     f"and cannot be used for account provisioning.",
                     suggestion="Use a real domain name for production accounts.",
                     field="brand.domain",
+                    recovery="correctable",
                 )
             ]
     return None
@@ -365,19 +366,24 @@ def _check_billing_policy(
     billing_val: str | None,
     identity: ResolvedIdentity,
 ) -> list[Any] | None:
-    """Check if the billing model is supported by the seller.
+    """Check if the account billing model is supported by the seller.
 
     Returns a list of Error objects if rejected, None if accepted.
     Per BR-RULE-059: unsupported billing → BILLING_NOT_SUPPORTED.
+
+    Resolves the accepted set via ``resolve_supported_billing`` — the SAME resolver
+    get_adcp_capabilities advertises through — so what the buyer sees in
+    ``account.supported_billing`` is exactly what this gate accepts (#1682 review E).
     """
     from adcp.types import Error
 
-    # Read billing policy from tenant configuration (not identity).
-    # Both dict and TenantContext expose .get() identically, so no branching needed.
+    from src.core.helpers.account_helpers import resolve_supported_billing
+
+    # Read billing policy from tenant configuration (not identity). Both dict and
+    # TenantContext expose .get() identically. A misconfigured tenant raises loudly here
+    # (same as on the capabilities wire) rather than silently accepting a set it can't bill.
     tenant = identity.tenant if identity else None
-    supported = tenant.get("supported_billing") if tenant else None
-    if supported is None:
-        return None  # No policy configured → accept all
+    supported = [b.value for b in resolve_supported_billing(tenant)]
 
     if billing_val not in supported:
         return [
@@ -386,6 +392,7 @@ def _check_billing_policy(
                 message=f"Billing model '{billing_val}' is not supported by this seller. "
                 f"Supported models: {', '.join(supported)}.",
                 suggestion=f"Use one of the supported billing models: {', '.join(supported)}.",
+                recovery="correctable",
             )
         ]
     return None

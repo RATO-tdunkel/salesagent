@@ -15,10 +15,17 @@ from __future__ import annotations
 
 import pytest
 
-from tests.harness.capabilities import CAPABILITIES_REST_ENDPOINT, CapabilitiesEnv
+from tests.harness.capabilities import CapabilitiesEnv
 from tests.harness.transport import Transport
 
 pytestmark = [pytest.mark.integration, pytest.mark.requires_db]
+
+# The default tenant (setup_default_data) configures no ``supported_billing``, so the
+# honest declaration is the seller's permitted set — the exact billing parties
+# sync_accounts also accepts (see ``resolve_supported_billing``). Pinning the exact set
+# (not just non-empty) makes a dishonest over/under-declaration a wire regression, and
+# matches the BR-UC-010 BDD sibling.
+_DEFAULT_BILLING = {"operator", "agent"}
 
 
 def _assert_account_section(account: dict) -> None:
@@ -26,16 +33,23 @@ def _assert_account_section(account: dict) -> None:
     assert account is not None, "capabilities response must include an account section"
     # Honesty declaration: sandbox is False until behavioral isolation ships (#1329).
     assert account.get("sandbox") is False, f"account.sandbox must be an honest False, got {account.get('sandbox')!r}"
-    # Billing models the seller accepts — a non-empty list of billing parties.
+    # require_operator_auth is honestly False (accounts are buyer-declared via sync_accounts,
+    # operators do not authenticate) — grade it on the wire too, else the honesty declaration
+    # is ungraded and a dishonest True would slip through (#1682 review NIT).
+    assert account.get("require_operator_auth") is False, (
+        f"account.require_operator_auth must be an honest False, got {account.get('require_operator_auth')!r}"
+    )
+    # Billing models the seller accepts — the exact permitted set for the default tenant.
     billing = account.get("supported_billing")
-    assert isinstance(billing, list) and billing, f"account.supported_billing must be a non-empty list, got {billing!r}"
+    assert isinstance(billing, list), f"account.supported_billing must be a list, got {billing!r}"
+    assert set(billing) == _DEFAULT_BILLING, f"account.supported_billing must be {_DEFAULT_BILLING}, got {billing!r}"
 
 
 class TestGetAdcpCapabilitiesAccountWire:
     """The account/sandbox capability is honestly declared on the real wire."""
 
-    @pytest.mark.parametrize("transport", [Transport.MCP, Transport.A2A])
-    def test_account_section_on_mcp_and_a2a_wire(self, transport, integration_db):
+    @pytest.mark.parametrize("transport", [Transport.MCP, Transport.A2A, Transport.REST])
+    def test_account_section_on_wire(self, transport, integration_db):
         with CapabilitiesEnv() as env:
             env.setup_default_data()
             result = env.call_via(transport)
@@ -43,14 +57,3 @@ class TestGetAdcpCapabilitiesAccountWire:
         assert result.is_success, f"{transport}: expected success, got {result.error!r}"
         assert result.wire_response is not None, f"{transport}: env did not stash success-path wire"
         _assert_account_section(result.wire_response.get("account"))
-
-    def test_account_section_on_rest_wire(self, integration_db):
-        with CapabilitiesEnv() as env:
-            tenant, _principal = env.setup_default_data()
-            client = env.get_rest_client()
-            env._configure_rest_auth_override(env.identity)
-
-            response = client.get(CAPABILITIES_REST_ENDPOINT)
-
-        assert response.status_code == 200, f"REST capabilities returned {response.status_code}: {response.text}"
-        _assert_account_section(response.json().get("account"))

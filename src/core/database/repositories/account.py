@@ -340,10 +340,14 @@ class AccountRepository:
         method projects each agent to ``{url}`` via ``_serialize_governance_agents`` before
         writing through the private ``_apply_fields`` setter. Because generic
         ``update_fields`` REFUSES ``governance_agents`` (``_REPO_OWNED_FIELDS``), this is the
-        only way the field can be persisted — the strip is a repository-layer structural
-        guarantee, not scattered call-site discipline (#1329). Returns the stored
-        list so the caller echoes exactly what was persisted (the two can never disagree).
-        Replaces the prior binding (per-account replace semantics).
+        only *update* path — the strip is a repository-layer guarantee for the mutation
+        surface, not scattered call-site discipline (#1329). (A raw ``create()`` of an
+        Account carrying a pre-populated ``governance_agents`` blob, or a raw ``setattr``,
+        would bypass this strip; no live caller does so, there is no admin surface for
+        governance, and reads are fail-closed — a strip at the persistence boundary is
+        tracked as a separate hardening, #1682 review D.) Returns the stored list so the
+        caller echoes exactly what was persisted (the two can never disagree). Replaces
+        the prior binding (per-account replace semantics).
         """
         urls = _serialize_governance_agents(agents) or []
         self._apply_fields(account_id, {"governance_agents": urls})

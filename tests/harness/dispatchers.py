@@ -267,12 +267,17 @@ class RestE2EDispatcher:
             if tc is not None and getattr(tc, "dry_run", False):
                 headers["x-dry-run"] = "true"
 
+        from tests.harness._base import issue_rest_verb
+
         body = env.build_rest_body(**kwargs)
         endpoint = env.REST_ENDPOINT  # type: ignore[attr-defined]
 
         with httpx.Client(base_url=base_url, timeout=30) as client:
             method = getattr(env, "REST_METHOD", "post")
-            response = getattr(client, method)(endpoint, json=body, headers=headers)
+            # Shared verb dispatch: a body-less verb (GET/DELETE discovery) must NOT
+            # pass json= (httpx rejects it) — the in-process leg honors REST_METHOD the
+            # same way, so both stay in sync on the verb (#1682 review A).
+            response = issue_rest_verb(client, method, endpoint, body, headers=headers)
 
         envelope = {
             "transport": "e2e_rest",

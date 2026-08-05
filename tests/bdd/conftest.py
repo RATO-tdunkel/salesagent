@@ -3478,11 +3478,14 @@ def _harness_env(request: pytest.FixtureRequest, ctx: dict) -> Generator[None, N
                 "graded at construction time by TestSyncGovernanceBoundaryValues"
             )
         _UC030_XFAIL_TAGS: dict[str, str] = {
-            # POST-S4 "adcp_version echoed on every response" is not populated on sync-tool
-            # responses (systemic: sync_accounts has the same gap, UC-011 doesn't assert it).
-            # Success + url-echo + credential-non-echo are covered on the wire by
-            # T-UC-030-sync-partial (synced entry) + the integration tests.
-            "T-UC-030-sync-happy": "POST-S4 adcp_version not echoed on sync responses — spec-production gap (#1329)",
+            # NOTE: T-UC-030-sync-happy is NOT xfailed at the scenario level. Its only gap is
+            # POST-S4 (adcp_version not echoed on sync responses); moving that xfail INTO the
+            # then_adcp_version step (the in-step pattern uc010_capabilities.py uses) lets the
+            # scenario's other four wire graders — success, status=synced, exact echoed url,
+            # credential-non-echo — actually EXECUTE and be graded, instead of being hidden
+            # behind a blanket scenario xfail (#1682 review G1). The exact url echo is graded
+            # end-to-end by the integration tests (test_sync_governance.py — a wrong url
+            # reddens them); T-UC-030-sync-partial asserts url presence, not the exact value.
             "T-UC-030-sync-idempotent-replay": "idempotency replay dedup not implemented — spec-production gap (#1329)",
             "T-UC-030-sync-idempotency-conflict": "IDEMPOTENCY_CONFLICT (same key / different payload) not implemented — spec-production gap (#1329)",
             "T-UC-030-sync-permission-denied": "per-operation granted-scope model (PERMISSION_DENIED) not implemented — spec-production gap (#1329)",
@@ -3515,9 +3518,13 @@ def _harness_env(request: pytest.FixtureRequest, ctx: dict) -> Generator[None, N
         from tests.harness.capabilities import CapabilitiesEnv
 
         with _db_scope_for(request, e2e_config), CapabilitiesEnv(e2e_config=e2e_config) as env:
-            tenant, _principal = env.setup_default_data()
+            tenant, principal = env.setup_default_data()
             ctx["env"] = env
             ctx["tenant"] = tenant
+            # Set ctx["principal"] too (the five sibling UC branches do): a UC-010 scenario
+            # that reads it KeyError'd otherwise, and the blanket xfail above was silently
+            # masking that failure rather than a legitimately-dormant scenario (#1682 review G3).
+            ctx["principal"] = principal
             yield
 
     elif uc == "ADMIN":

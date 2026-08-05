@@ -203,7 +203,7 @@ class TestSyncGovernanceSuggestionParity:
             "accounts": [{"account": {"account_id": "acc_p"}, "governance_agents": [governance_agent_dict(GOV_URL)]}]
         }
 
-    @pytest.mark.parametrize("transport", ["A2A", "REST"])
+    @pytest.mark.parametrize("transport", ["A2A", "MCP", "REST"])
     def test_missing_idempotency_key_envelope_carries_suggestion(self, transport, integration_db):
         from tests.harness.governance_sync import GovernanceSyncEnv
         from tests.harness.transport import Transport
@@ -214,11 +214,15 @@ class TestSyncGovernanceSuggestionParity:
             result = env.call_via(Transport[transport], **self._invalid_kwargs())
 
             assert result.is_error, f"{transport}: missing idempotency_key must be rejected, got {result.payload!r}"
+            # The buyer OMITTED the key, so the message is the same "Required field is missing"
+            # on all three transports — not "Expected string, got NoneType" (the pre-fix A2A/MCP
+            # rendering that passed an explicit None). message_substr pins that divergence (#1682 H1).
             result.assert_wire_error(
                 "VALIDATION_ERROR",
                 recovery="correctable",
                 require_suggestion=True,
                 field="idempotency_key",
+                message_substr="Required field is missing",
             )
 
 

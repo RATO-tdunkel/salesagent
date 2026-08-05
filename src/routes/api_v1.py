@@ -223,6 +223,10 @@ class SyncGovernanceBody(SalesAgentBaseModel):
     idempotency_key: str | None = None
     accounts: list[dict[str, Any]] = []
     context: dict[str, Any] | None = None
+    # SyncGovernanceRequest declares `ext` (protocol extension carrier); expose it on the
+    # HTTP body so a REST buyer can send it — the route forwards it via **model_dump
+    # (#1682 review I4). The A2A handler forwards it explicitly.
+    ext: dict[str, Any] | None = None
     adcp_version: str = "1.0.0"
 
 

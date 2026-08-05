@@ -194,6 +194,33 @@ class TestSyncAccountsPreservesGovernanceBinding:
         assert len(persisted) == 1
         assert persisted[0] == gov_url
 
+    @pytest.mark.asyncio
+    async def test_update_fields_refuses_repository_owned_governance_agents(self, integration_db):
+        """update_fields REFUSES the repository-owned governance_agents field (#1682 review D).
+
+        The refusal is what makes set_governance_binding's url-only strip a structural
+        guarantee rather than call-site discipline: a caller that tries to write the raw
+        (credential-bearing) blob through the generic setter is rejected before it reaches
+        the column. Emptying _REPO_OWNED_FIELDS silently reopens that bypass, so grade the
+        raise (no test exercised the refusal branch before).
+        """
+        from src.core.database.repositories.account import AccountRepository
+        from src.core.database.repositories.uow import AccountUoW
+
+        with AccountSyncEnv(tenant_id="ruf_gov", principal_id="agent_ruf") as env:
+            env.setup_default_data()
+            created = await env.call_impl_async(
+                req=SyncAccountsRequest(
+                    accounts=[{"brand": {"domain": "acme.com"}, "operator": "example.com", "billing": "operator"}]
+                )
+            )
+            account_id = created.accounts[0].account_id
+
+            with AccountUoW("ruf_gov") as uow:
+                repo: AccountRepository = uow.accounts
+                with pytest.raises(ValueError, match="repository-owned"):
+                    repo.update_fields(account_id, governance_agents=[{"url": "https://x.example.com/"}])
+
 
 class TestSyncAccountsAuth:
     """BR-RULE-055: sync_accounts requires valid authentication."""
@@ -540,8 +567,17 @@ class TestSyncAccountsBillingPolicyTransport:
         assert "agent" in err.suggestion
 
     @pytest.mark.parametrize("transport", ALL_TRANSPORTS, ids=lambda t: t.value)
-    def test_unconfigured_billing_policy_accepts_all(self, integration_db, transport):
-        """When supported_billing is not configured, all billing values are accepted."""
+    def test_unconfigured_billing_defaults_to_permitted_set(self, integration_db, transport):
+        """With no supported_billing config, the seller's permitted set (operator, agent)
+        is enforced — NOT "accept everything".
+
+        The account billing gate resolves the accepted set through the SAME resolver
+        get_adcp_capabilities advertises through, so an unconfigured tenant accepts exactly
+        {operator, agent} and rejects a non-account-billable party (advertiser) — the
+        sync_accounts gate agrees with the account.supported_billing declaration. Reverting
+        the gate to a raw read (the old None → accept-all divergence) would accept advertiser
+        here and reopen the honesty gap (#1682 review E).
+        """
         with AccountSyncEnv(
             tenant_id=f"bp_any_{transport.value}",
             principal_id=f"agent_bpa_{transport.value}",
@@ -552,13 +588,20 @@ class TestSyncAccountsBillingPolicyTransport:
                 accounts=[
                     {"brand": {"domain": "acme.com"}, "operator": "example.com", "billing": "operator"},
                     {"brand": {"domain": "beta.com"}, "operator": "example.com", "billing": "agent"},
+                    {"brand": {"domain": "gamma.com"}, "operator": "example.com", "billing": "advertiser"},
                 ],
             )
             result = env.call_via(transport, req=req)
 
         assert result.is_success
-        actions = {a.brand.domain: _action_value(a.action) for a in result.payload.accounts}
-        assert actions == {"acme.com": "created", "beta.com": "created"}
+        by_domain = {a.brand.domain: a for a in result.payload.accounts}
+        assert _action_value(by_domain["acme.com"].action) == "created"
+        assert _action_value(by_domain["beta.com"].action) == "created"
+        # advertiser is a media-buy party, not account-billable → rejected, matching the
+        # capabilities account.supported_billing declaration.
+        advertiser_acct = by_domain["gamma.com"]
+        assert _action_value(advertiser_acct.action) == "failed"
+        assert advertiser_acct.errors[0].code == "BILLING_NOT_SUPPORTED"
 
 
 class TestSyncAccountsApprovalTransport:

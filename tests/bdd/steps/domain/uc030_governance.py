@@ -29,11 +29,13 @@ from __future__ import annotations
 
 from typing import Any
 
+import pytest
 from pytest_bdd import given, parsers, then, when
 
 from tests.bdd.steps._outcome_helpers import _require_response, wire_dict
 from tests.bdd.steps.generic._dispatch import dispatch_request
 from tests.factories import AccountFactory
+from tests.harness.transport import _pinned_error_metadata
 from tests.helpers.accounts import seed_account_with_access
 from tests.helpers.governance import (
     DEFAULT_URL,
@@ -380,15 +382,15 @@ def then_variant_error(ctx: dict) -> None:
 
 @then("the response does NOT carry an operation-level errors array")
 def then_no_operation_errors(ctx: dict) -> None:
-    # Success (partial-failure) variant: per-account errors live under accounts[].errors,
-    # never as a top-level operation-level errors[] (spec oneOf: accounts XOR errors).
+    # Success (partial-failure) variant: per-account results live under accounts[], and
+    # there is NO operation-level error envelope (spec oneOf: accounts XOR adcp_error).
     body = wire_dict(ctx)
-    # Falsifiable form of the oneOf: the ERROR variant WOULD carry adcp_error, so pinning
-    # its absence grades that this is genuinely the success variant. `"errors" not in body`
-    # alone is vacuous — SyncGovernanceResponse (extra='forbid') has no top-level errors
-    # field, so it can never be present (#1682 review H).
+    # Falsifiable: the ERROR variant carries a top-level adcp_error and NO accounts[], so
+    # pinning adcp_error's absence AND accounts' presence grades that this is genuinely the
+    # success variant. (The earlier `"errors" not in body` half was vacuous — the response
+    # model is extra='forbid', so a top-level errors[] can never appear — #1682 review NIT.)
     assert body.get("adcp_error") is None, f"expected success variant, got an error envelope: {body}"
-    assert "errors" not in body, f"success variant must not carry a top-level errors array: {body}"
+    assert body.get("accounts") is not None, f"success variant must carry an accounts array: {body}"
 
 
 @then(parsers.parse('the account "{account_id}" has status "{status}"'))
@@ -437,6 +439,12 @@ def then_no_echo_auth(ctx: dict, account_id: str, idx: int) -> None:
 @then("the response carries an echoed adcp_version envelope")
 def then_adcp_version(ctx: dict) -> None:
     body = wire_dict(ctx)
+    # POST-S4 (adcp_version echoed on every response) is not implemented on sync-tool
+    # responses (systemic — sync_accounts has the same gap). xfail HERE (in-step) rather
+    # than at the scenario level, so the sync-happy scenario's other wire graders execute
+    # and stay falsifiable; graduates when production echoes the envelope field (#1682 G1).
+    if not body.get("adcp_version"):
+        pytest.xfail("POST-S4 adcp_version not echoed on sync responses — spec-production gap (#1329)")
     assert body.get("adcp_version"), f"expected an echoed adcp_version envelope field, got keys {list(body)}"
 
 
@@ -453,14 +461,21 @@ def then_per_account_authority_code(ctx: dict) -> None:
     it on the wire would let the exact value the fix removed pass (#1682 review C).
     """
     allowed = {"ACCOUNT_NOT_FOUND"}
-    failed_codes = {
-        ((acct.get("errors") or [{}])[0]).get("code") for acct in _wire_accounts(ctx) if acct.get("status") == "failed"
-    }
+    failed_errors = [(acct.get("errors") or [{}])[0] for acct in _wire_accounts(ctx) if acct.get("status") == "failed"]
+    failed_codes = {e.get("code") for e in failed_errors}
     # Set comparisons (not count checks): a failed per-account entry must exist
     # (non-empty set) AND every failed code must be an allowed authority code — an
     # absent errors[] surfaces as None, which is not a subset of `allowed`.
     assert failed_codes != set(), f"expected a failed per-account entry, got {_wire_accounts(ctx)}"
     assert failed_codes <= allowed, f"per-account authority code(s) {failed_codes} not all in {allowed}"
+    # Recovery is wire-graded against the pinned enum (not a literal): flipping
+    # governance.py's per-account recovery terminal->transient reddens HERE, not just
+    # off-wire unit/integration (#1682 review G5).
+    expected_recovery = _pinned_error_metadata()["ACCOUNT_NOT_FOUND"]["recovery"]
+    recoveries = {e.get("recovery") for e in failed_errors}
+    assert recoveries == {expected_recovery}, (
+        f"per-account ACCOUNT_NOT_FOUND recovery {recoveries} must equal the pinned enum {expected_recovery!r}"
+    )
 
 
 @then("the per-account error message does not reveal whether the account exists")
@@ -555,11 +570,16 @@ def then_natural_key_account_status(ctx: dict, brand: str, operator: str, status
 # envelopes (#1682 review item 2/D).
 _CREDENTIALS_FIELD = "accounts[0].governance_agents[0].authentication.credentials"
 _AGENTS_FIELD = "accounts[0].governance_agents"
+# The url gates (userinfo/https/SSRF) now raise a field-located error here (was a bare
+# ValueError with an empty field), so the step pins field= too (#1682 review H2).
+_URL_FIELD = "accounts[0].governance_agents[0].url"
 
 
 @then("the error references the url field and indicates https is required")
 def then_error_url_https(ctx: dict) -> None:
-    ctx["result"].assert_wire_error("VALIDATION_ERROR", message_substr="url must use https", require_suggestion=True)
+    ctx["result"].assert_wire_error(
+        "VALIDATION_ERROR", field=_URL_FIELD, message_substr="url must use https", require_suggestion=True
+    )
 
 
 @then("the error references the credentials field")

@@ -59,6 +59,7 @@ from src.core.exceptions import (
 )
 from src.core.helpers import enum_value
 from src.core.idempotency_canonical import canonical_payload_hash, canonical_request_hash
+from src.core.security.url_validator import strip_url_userinfo
 
 
 class PackageAssignmentDict(TypedDict):
@@ -953,7 +954,10 @@ def execute_approved_media_buy(media_buy_id: str, tenant_id: str) -> tuple[bool,
                             validated = FormatId.model_validate(fmt)
                             url_str = str(validated.agent_url)
                             if not url_str.startswith(("http://", "https://")):
-                                raise ValueError(f"agent_url must be HTTP(S), got: {url_str}")
+                                # Strip any userinfo before rendering — the message is logged
+                                # + returned, and a buyer-supplied url could embed a credential
+                                # (same leak class as the governance url gate — #1682 review B).
+                                raise ValueError(f"agent_url must be HTTP(S), got: {strip_url_userinfo(url_str)}")
                             format_ids_list.append(validated)
                         except (ValueError, ValidationError) as e:
                             error_msg = (

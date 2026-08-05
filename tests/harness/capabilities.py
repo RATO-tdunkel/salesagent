@@ -9,10 +9,13 @@ is built from ``identity.tenant`` (``_build_account_capability``), so the env on
 needs a resolvable tenant/identity (the base ``setup_default_data`` provides one).
 
 REST is a GET discovery endpoint (``/api/v1/capabilities``) rather than the POST
-convention the base harness dispatch assumes, so ``_run_rest_request`` below overrides
-the base to GET instead — this makes ``call_via(Transport.REST)`` (and thus the BDD
-``dispatch_request`` REST leg) work directly, same as MCP/A2A through the standard
-harness hooks (which stash the real success-path wire).
+convention the base harness assumes, so this env declares ``REST_METHOD = "get"``.
+Both REST legs read that single attribute — the in-process ``_run_rest_request`` and
+the in-network ``RestE2EDispatcher`` — so ``call_via(Transport.REST)`` (and thus the
+BDD ``dispatch_request`` REST leg) GETs the discovery endpoint on every transport,
+same as MCP/A2A through the standard harness hooks (which stash the real success-path
+wire). An earlier version overrode only the in-process ``_run_rest_request``, leaving
+the in-network leg POSTing to a GET-only route → live-route 404 (#1682 review A).
 
 #1329 (UC-010 account/sandbox honesty)
 """
@@ -33,6 +36,7 @@ class CapabilitiesEnv(IntegrationEnv):
 
     EXTERNAL_PATCHES: dict[str, str] = {}
     REST_ENDPOINT = CAPABILITIES_REST_ENDPOINT
+    REST_METHOD = "get"  # GET discovery endpoint; both REST legs read this (#1682 review A)
 
     def call_impl(self, **kwargs: Any) -> GetAdcpCapabilitiesResponse:
         from src.core.tools.capabilities import _get_adcp_capabilities_impl
@@ -49,16 +53,3 @@ class CapabilitiesEnv(IntegrationEnv):
 
     def parse_rest_response(self, data: dict[str, Any]) -> GetAdcpCapabilitiesResponse:
         return GetAdcpCapabilitiesResponse(**data)
-
-    def _run_rest_request(self, endpoint: str, **kwargs: Any) -> Any:
-        """GET the capabilities discovery endpoint (the base dispatch assumes POST).
-
-        ``get_adcp_capabilities`` is a GET at ``/api/v1/capabilities`` (api_v1.py), not the
-        POST the base ``_run_rest_request`` issues, so ``call_via(Transport.REST)`` — and thus
-        the BDD ``dispatch_request`` REST leg — must GET here. The shared preamble
-        (``_prepare_rest_request``) still pops identity, commits factory rows, and installs the
-        auth override, so the RestDispatcher captures the real success-path wire from
-        ``response.json()`` exactly as it does for POST endpoints (#1682 review item 1).
-        """
-        client, _identity = self._prepare_rest_request(kwargs)
-        return client.get(endpoint)

@@ -68,22 +68,34 @@ def _field_names_referenced(func: ast.FunctionDef | ast.AsyncFunctionDef) -> set
 
 
 def _account_id_passed_to_call(func: ast.FunctionDef | ast.AsyncFunctionDef) -> bool:
-    """True if the ``account_id`` parameter is passed as an argument to a call.
+    """True if the ``account_id`` parameter is routed into a call whose RESULT is used.
 
-    Recognizes helper-mediated inspection like ``_wire_account(ctx, account_id)`` — the
-    parameter is routed into a lookup that performs the ref-echo grade itself — WITHOUT
-    matching an incidental mention (an f-string failure message / log line), where
-    ``account_id`` is nested inside a ``JoinedStr`` rather than being a direct call argument.
-    Only ``ast.Load`` uses count (reading the parameter, not rebinding it). Deliberately
-    narrower than "the Name appears anywhere in the body": that broader form silently
-    weakened the guard repo-wide for a fix that only needed to cover by-id lookup calls
-    (#1682 review — guard-matcher scope).
+    Recognizes helper-mediated inspection like ``acct = _wire_account(ctx, account_id)`` —
+    the parameter is routed into a lookup that performs the ref-echo grade itself — WITHOUT
+    matching an incidental mention (an f-string failure message), where ``account_id`` is
+    nested inside a ``JoinedStr`` rather than being a direct call argument. Only ``ast.Load``
+    uses count (reading the parameter, not rebinding it).
+
+    Calls that are a bare expression STATEMENT (``logger.info(account_id)``,
+    ``print(account_id)``, ``logger.info("%s", account_id)``, ``logger.info(..., extra=account_id)``)
+    are skipped: their result is discarded, so passing ``account_id`` to a log/print line
+    is not an inspection. Without this, the exemption fired on any call argument — a log
+    line satisfied the guard (#1682 review I1). Deliberately narrower than "the Name appears
+    anywhere in the body": that broader form silently weakened the guard repo-wide for a fix
+    that only needed to cover by-id lookup calls (#1682 review — guard-matcher scope).
     """
 
     def _is_account_id_load(node: ast.expr) -> bool:
         return isinstance(node, ast.Name) and node.id == "account_id" and isinstance(node.ctx, ast.Load)
 
+    # Calls whose value is discarded as a bare expression statement (log/print lines).
+    bare_statement_calls = {
+        id(stmt.value) for stmt in ast.walk(func) if isinstance(stmt, ast.Expr) and isinstance(stmt.value, ast.Call)
+    }
+
     for call in iter_call_expressions(func):
+        if id(call) in bare_statement_calls:
+            continue
         for arg in call.args:
             value = arg.value if isinstance(arg, ast.Starred) else arg
             if _is_account_id_load(value):
@@ -146,3 +158,41 @@ class TestBddStepTextAlignment:
             f"Found {len(violations)} response-field Then step(s) that do not reference the named field:\n"
             + "\n".join(f"  {v}" for v in violations)
         )
+
+
+def _parse_single_func(src: str) -> ast.FunctionDef | ast.AsyncFunctionDef:
+    for node in ast.walk(ast.parse(src)):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            return node
+    raise AssertionError("no function in snippet")
+
+
+class TestAccountIdExemptionSelfTest:
+    """Meta-tests for the ``_account_id_passed_to_call`` exemption (#1682 review I1)."""
+
+    @pytest.mark.parametrize(
+        "body",
+        [
+            "logger.info(account_id)",
+            "print(account_id)",
+            'logger.info("acct %s", account_id)',
+            'logger.info("acct", extra=account_id)',
+        ],
+    )
+    def test_bare_log_or_print_of_account_id_is_not_inspection(self, body):
+        """A bare log/print statement of account_id does NOT satisfy the exemption."""
+        func = _parse_single_func(f"def then_x(ctx, account_id):\n    {body}\n")
+        assert not _account_id_passed_to_call(func), f"bare statement wrongly counted as inspection: {body!r}"
+
+    @pytest.mark.parametrize(
+        "body",
+        [
+            "acct = _wire_account(ctx, account_id)",
+            "assert account_id in _wire_account_ids(ctx, account_id)",
+            "return _wire_account(ctx, account_id)",
+        ],
+    )
+    def test_used_result_call_with_account_id_is_inspection(self, body):
+        """Routing account_id into a call whose result is used IS inspection."""
+        func = _parse_single_func(f"def then_x(ctx, account_id):\n    {body}\n")
+        assert _account_id_passed_to_call(func), f"real inspection wrongly rejected: {body!r}"

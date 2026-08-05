@@ -770,7 +770,7 @@ class TestGeoPostalAreas:
 
 
 class TestSupportedBillingParity:
-    """`_DEFAULT_SUPPORTED_BILLING` must stay in lockstep with the DB constraint.
+    """`SELLER_ACCOUNT_BILLING` must stay in lockstep with the DB constraint.
 
     The advertised default is a hand-maintained subset of BillingParty that mirrors
     the `ck_accounts_billing` CHECK constraint (accounts.billing IN {operator,
@@ -784,34 +784,50 @@ class TestSupportedBillingParity:
         from adcp.types.generated_poc.enums.billing_party import BillingParty
 
         from src.core.database.models import Account
-        from src.core.tools.capabilities import _DEFAULT_SUPPORTED_BILLING
+        from src.core.helpers.account_helpers import SELLER_ACCOUNT_BILLING
 
         # Every advertised value is a real BillingParty enum member.
-        assert all(isinstance(p, BillingParty) for p in _DEFAULT_SUPPORTED_BILLING)
+        assert all(isinstance(p, BillingParty) for p in SELLER_ACCOUNT_BILLING)
 
         constraint = next(c for c in Account.__table_args__ if getattr(c, "name", None) == "ck_accounts_billing")
         permitted = set(re.findall(r"'([a-z_]+)'", str(constraint.sqltext)))
-        advertised = {p.value for p in _DEFAULT_SUPPORTED_BILLING}
+        advertised = {p.value for p in SELLER_ACCOUNT_BILLING}
 
         assert advertised == permitted == {"operator", "agent"}
         # `advertiser` is deliberately excluded — this seller has no direct
         # advertiser-billing relationship (see ck_accounts_billing rationale).
         assert "advertiser" not in advertised
 
-    def test_configured_billing_outside_permitted_set_is_filtered(self):
-        """A tenant-configured billing party outside {operator, agent} is dropped, not
-        advertised: the filter is the PERMITTED set, not the full BillingParty enum, so
-        the seller never claims a party sync_accounts would reject (#1682 review F)."""
-        from src.core.tools.capabilities import _build_account_capability
+    def test_configured_billing_narrows_within_permitted_set(self):
+        """A tenant may narrow within {operator, agent}; a non-account party is dropped.
 
-        # `advertiser` is a valid enum member but NOT permitted → filtered → falls back.
-        cap = _build_account_capability({"supported_billing": ["advertiser"]})
-        assert {p.value for p in cap.supported_billing} == {"operator", "agent"}
+        Same resolver as sync_accounts, so what is advertised equals what is accepted
+        (#1682 review E).
+        """
+        from src.core.tools.capabilities import _build_account_capability
 
         # A permitted subset is honored (narrowing within {operator, agent}).
         narrowed = _build_account_capability({"supported_billing": ["operator"]})
         assert [p.value for p in narrowed.supported_billing] == ["operator"]
 
-        # A bogus value falls back to the default rather than advertising it.
-        bogus = _build_account_capability({"supported_billing": ["bogus"]})
-        assert {p.value for p in bogus.supported_billing} == {"operator", "agent"}
+        # A mixed list keeps only the account-billable parties (advertiser dropped — it
+        # is a media-buy party, not account-billable — never advertised on the account).
+        mixed = _build_account_capability({"supported_billing": ["operator", "advertiser"]})
+        assert [p.value for p in mixed.supported_billing] == ["operator"]
+
+    def test_configured_billing_with_no_account_party_raises(self):
+        """A config declaring no account-billable party fails LOUD, not silent-substitute.
+
+        `["advertiser"]` (media-buy-only) and `["bogus"]` (typo) both resolve to an empty
+        account-billable set. Silently substituting the default would advertise/accept a
+        set the operator never configured, so both raise on the capabilities wire — the
+        SAME resolver sync_accounts uses, so the failure is consistent (#1682 review E).
+        """
+        import pytest
+
+        from src.core.tools.capabilities import _build_account_capability
+
+        with pytest.raises(ValueError, match="no account-billable party"):
+            _build_account_capability({"supported_billing": ["advertiser"]})
+        with pytest.raises(ValueError, match="no account-billable party"):
+            _build_account_capability({"supported_billing": ["bogus"]})

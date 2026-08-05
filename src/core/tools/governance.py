@@ -46,7 +46,7 @@ Idempotency(supported=True) capability is honored by create_media_buy (the mutat
 tool with real spend), which is why it stays declared.
 """
 
-from typing import Annotated
+from typing import Annotated, Any
 
 from adcp.types import AccountReference as LibraryAccountReference
 from adcp.types import ContextObject, Error
@@ -289,12 +289,17 @@ async def sync_governance(
     # VALIDATION_ERROR envelope — the same wire shape REST produces via its own
     # boundary — instead of a raw pydantic error or FastMCP's parameter-schema
     # rejection (UC-030 grades these on the wire).
+    #
+    # OMIT idempotency_key when absent (rather than passing None): REST drops it via
+    # model_dump(exclude_none=True), so a missing key there is a "Required field is missing"
+    # error. Passing None here would instead be "Expected string, got NoneType" — a divergent
+    # message + suggestion for the same buyer mistake. Omit it so all three transports render
+    # the same "the buyer omitted the field" error (#1682 review H1).
+    kwargs: dict[str, Any] = {"accounts": accounts or [], "context": context}
+    if idempotency_key is not None:
+        kwargs["idempotency_key"] = idempotency_key
     with adcp_validation_boundary(context="sync_governance request"):
-        req = SyncGovernanceRequest(
-            idempotency_key=idempotency_key,
-            accounts=accounts or [],
-            context=context,
-        )
+        req = SyncGovernanceRequest(**kwargs)
     identity = (await ctx.get_state("identity")) if isinstance(ctx, Context) else None
     response = await _sync_governance_impl(req, identity)
     return ToolResult(content=str(response), structured_content=response)

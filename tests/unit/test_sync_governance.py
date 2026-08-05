@@ -270,17 +270,43 @@ class TestSyncGovernanceRequestSchema:
         assert err["loc"][-1] == "idempotency_key", err
 
     def test_non_https_agent_url_rejected(self):
-        # url https-requirement is a model validator (empty loc), so pin the message.
+        # url gates raise field-located errors at accounts[i].governance_agents[j].url (#1682 H2).
         err = _first_schema_error(lambda: _make_request(url="http://governance.pinnacle-media.com"))
         assert err["type"] == "value_error", err
         assert "https" in err["msg"], err
+        assert err["loc"] == ("accounts", 0, "governance_agents", 0, "url"), err
+
+    def test_non_https_url_message_strips_userinfo(self):
+        # The https gate is ordered AFTER the userinfo gate, so it only ever renders
+        # userinfo-free urls; even so, the rendered url is userinfo-stripped as defense
+        # in depth — the message must never echo a credential (#1682 review B).
+        err = _first_schema_error(lambda: _make_request(url="http://svc:SuperSecret456@governance.example.com/hook"))
+        # userinfo gate fires first — but assert the secret is absent regardless of which gate.
+        assert "SuperSecret456" not in err["msg"], err
 
     def test_agent_url_with_userinfo_rejected(self):
         # A credential embedded in the url (userinfo) must be rejected — it bypasses
-        # SSRF hostname checks and would be persisted/echoed (#1682 review B).
+        # SSRF hostname checks and would be persisted/echoed (#1682 review B). The
+        # rejection message must NOT echo the secret.
         err = _first_schema_error(lambda: _make_request(url="https://svc:SuperSecret123@governance.example.com/hook"))
         assert err["type"] == "value_error", err
         assert "userinfo" in err["msg"], err
+        assert "SuperSecret123" not in err["msg"], err
+        assert err["loc"] == ("accounts", 0, "governance_agents", 0, "url"), err
+
+    def test_agent_url_password_only_userinfo_rejected(self):
+        # Password-only userinfo (username absent) must still be rejected — grades the
+        # second operand of the userinfo check, which a username-only test never exercises
+        # (#1682 review D2).
+        err = _first_schema_error(lambda: _make_request(url="https://:SuperSecret789@governance.example.com/hook"))
+        assert err["type"] == "value_error" and "userinfo" in err["msg"], err
+        assert "SuperSecret789" not in err["msg"], err
+
+    def test_agent_url_username_only_userinfo_rejected(self):
+        # Username-only userinfo (no password) must also be rejected — grades the first
+        # operand independently (#1682 review D2).
+        err = _first_schema_error(lambda: _make_request(url="https://serviceacct@governance.example.com/hook"))
+        assert err["type"] == "value_error" and "userinfo" in err["msg"], err
 
     @pytest.mark.parametrize(
         "url",

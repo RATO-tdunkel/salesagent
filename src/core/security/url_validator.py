@@ -6,7 +6,21 @@ property list resolution and webhook URL validation.
 
 import ipaddress
 import socket
-from urllib.parse import ParseResult, urlparse
+from urllib.parse import ParseResult, urlparse, urlsplit, urlunsplit
+
+
+def strip_url_userinfo(url_str: str) -> str:
+    """Return ``url_str`` with any ``user:pass@`` userinfo removed, for safe error rendering.
+
+    A url that embeds a credential (``https://user:pass@host/``) must never have that
+    credential echoed into an error message, log line, or persisted audit row. Any code
+    that interpolates a buyer-supplied url into a diagnostic string routes it through this
+    first (#1682 review B). Single source of truth so the strip cannot drift between sites.
+    """
+    parts = urlsplit(url_str)
+    if "@" in parts.netloc:
+        parts = parts._replace(netloc=parts.netloc.rsplit("@", 1)[1])
+    return urlunsplit(parts)
 
 # Blocked IP ranges (RFC 1918 private networks, loopback, link-local,
 # CGNAT shared space, and multicast).

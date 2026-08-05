@@ -1929,7 +1929,7 @@ class AdCPRequestHandler(RequestHandler):
         from src.core.tools.creative_formats import build_list_creative_formats_request
 
         # Same context string as the REST route's boundary so buyer-invalid
-        # input produces a byte-identical envelope on every transport (klkg).
+        # input produces a byte-identical envelope on every transport.
         with adcp_validation_boundary(context="list_creative_formats request"):
             req = build_list_creative_formats_request(
                 format_ids=parameters.get("format_ids"),
@@ -1994,13 +1994,19 @@ class AdCPRequestHandler(RequestHandler):
         """
         from src.core.schemas.account import SyncGovernanceRequest
 
-        # Same context string as the REST route's boundary (transport parity).
+        # Same context string as the REST route's boundary (transport parity). OMIT
+        # idempotency_key when absent (don't pass None): matches REST's model_dump(exclude_none)
+        # so a missing key renders as "Required field is missing" on all three transports,
+        # not "Expected string, got NoneType" here (#1682 review H1).
+        request_kwargs: dict[str, Any] = {
+            "accounts": parameters.get("accounts", []),
+            "context": parameters.get("context"),
+            "ext": parameters.get("ext"),  # protocol extension carrier — transport parity (#1682 review I4)
+        }
+        if parameters.get("idempotency_key") is not None:
+            request_kwargs["idempotency_key"] = parameters.get("idempotency_key")
         with adcp_validation_boundary(context="sync_governance request"):
-            request = SyncGovernanceRequest(
-                idempotency_key=parameters.get("idempotency_key"),
-                accounts=parameters.get("accounts", []),
-                context=parameters.get("context"),
-            )
+            request = SyncGovernanceRequest(**request_kwargs)
         return await core_sync_governance_tool(req=request, identity=identity)
 
     async def _handle_list_authorized_properties_skill(
@@ -2091,7 +2097,7 @@ class AdCPRequestHandler(RequestHandler):
         params = {**parameters}
         include_snapshot = params.pop("include_snapshot", False)
         # No REST route exists for get_media_buys; context string follows the
-        # same "<tool> request" convention as the sibling boundaries (klkg).
+        # same "<tool> request" convention as the sibling boundaries.
         with adcp_validation_boundary(context="get_media_buys request"):
             req = GetMediaBuysRequest.model_validate(params)
         response = _get_media_buys_impl(req, identity=identity, include_snapshot=include_snapshot)

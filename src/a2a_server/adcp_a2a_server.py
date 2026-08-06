@@ -1992,21 +1992,19 @@ class AdCPRequestHandler(RequestHandler):
         Authentication is REQUIRED. ``idempotency_key`` is spec-required; a
         missing/invalid key surfaces as a validation error at this boundary.
         """
-        from src.core.schemas.account import SyncGovernanceRequest
+        from src.core.tools.governance import build_sync_governance_request
 
-        # Same context string as the REST route's boundary (transport parity). OMIT
-        # idempotency_key when absent (don't pass None): matches REST's model_dump(exclude_none)
-        # so a missing key renders as "Required field is missing" on all three transports,
-        # not "Expected string, got NoneType" here (#1682 review H1).
-        request_kwargs: dict[str, Any] = {
-            "accounts": parameters.get("accounts", []),
-            "context": parameters.get("context"),
-            "ext": parameters.get("ext"),  # protocol extension carrier — transport parity (#1682 review I4)
-        }
-        if parameters.get("idempotency_key") is not None:
-            request_kwargs["idempotency_key"] = parameters.get("idempotency_key")
-        with adcp_validation_boundary(context="sync_governance request"):
-            request = SyncGovernanceRequest(**request_kwargs)
+        # The shared builder is the single non-REST field list (also used by the MCP
+        # wrapper): it forwards ``ext``, OMITS an absent idempotency_key (so a missing
+        # key renders as "Required field is missing" on all three transports, not
+        # "Expected string, got NoneType"), and runs the same validation boundary — so
+        # this transport cannot drift from MCP (#1329).
+        request = build_sync_governance_request(
+            accounts=parameters.get("accounts", []),
+            context=parameters.get("context"),
+            ext=parameters.get("ext"),
+            idempotency_key=parameters.get("idempotency_key"),
+        )
         return await core_sync_governance_tool(req=request, identity=identity)
 
     async def _handle_list_authorized_properties_skill(

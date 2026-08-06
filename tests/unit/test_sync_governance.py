@@ -18,7 +18,7 @@ These are _impl-level tests, so they assert on the typed response (per
 tests/CLAUDE.md, wire-envelope assertions are for error-path transport tests;
 the success/persistence contract is verified against the typed payload here). The
 url-only credential strip itself is a repository guarantee, verified end-to-end
-against a real DB in tests/integration/test_sync_governance.py (#1682 review item 6).
+against a real DB in tests/integration/test_sync_governance.py (#1329).
 """
 
 from __future__ import annotations
@@ -47,7 +47,7 @@ from tests.helpers.governance import (
 # Recovery expected on the uniform ACCOUNT_NOT_FOUND per-account error, DERIVED from
 # the pinned spec enum (the authority) — not the literal "terminal" and not the
 # production constant (that would be vacuous). If production drifts from the pinned
-# recovery, these tests catch it (#1682 review C).
+# recovery, these tests catch it (#1329).
 _ACCOUNT_NOT_FOUND_RECOVERY = _pinned_error_metadata()["ACCOUNT_NOT_FOUND"]["recovery"]
 
 
@@ -68,7 +68,7 @@ def _first_schema_error(build) -> dict:
 
     Asserting on ``ValidationError.errors()[0]`` (loc + type) pins the SPECIFIC rule
     each test names — a bare ``pytest.raises(ValueError)`` stays green when an
-    unrelated field is what actually broke (#1682 review H).
+    unrelated field is what actually broke (#1329).
     """
     with pytest.raises(ValidationError) as exc_info:
         build()
@@ -136,7 +136,7 @@ class TestSyncGovernanceSuccess:
             await _sync_governance_impl(req, _make_identity())
 
         # The tool persists through the repository's single governance-write path, which
-        # owns the url-only credential strip + replace semantics (#1682 item 6; strip
+        # owns the url-only credential strip + replace semantics (#1329; strip
         # verified end-to-end in tests/integration/test_sync_governance.py). It must pass
         # the raw request agents (repo projects) and must NOT reach for generic update_fields.
         repo.set_governance_binding.assert_called_once_with("acc_1", req.accounts[0].governance_agents)
@@ -177,7 +177,7 @@ class TestSyncGovernanceAuthorityContract:
         assert resp.accounts[0].errors[0].code == "ACCOUNT_NOT_FOUND"
         # ACCOUNT_NOT_FOUND recovery is pinned by the enumMetadata (terminal) — the
         # per-account error MUST carry it so a receiver does not auto-retry (else it
-        # defaults to transient). Derived from the pinned enum. See #1682 review A3/C.
+        # defaults to transient). Derived from the pinned enum. See #1329.
         assert resp.accounts[0].errors[0].recovery == _ACCOUNT_NOT_FOUND_RECOVERY
         # A failed account never persists a binding.
         repo.set_governance_binding.assert_not_called()
@@ -198,7 +198,7 @@ class TestSyncGovernanceAuthorityContract:
         # SAME ACCOUNT_NOT_FOUND result as a nonexistent account — the *_NOT_FOUND
         # uniform-response MUST (no cross-principal enumeration oracle). It is NOT
         # SCOPE_INSUFFICIENT (a task-scope / allowed_tasks code this seller does not
-        # model) nor the AdCPAuthorizationError wire default (AUTH_REQUIRED). #1682 A1.
+        # model) nor the AdCPAuthorizationError wire default (AUTH_REQUIRED). #1329.
         err = resp.accounts[0].errors[0]
         assert err.code == "ACCOUNT_NOT_FOUND"
         assert err.recovery == _ACCOUNT_NOT_FOUND_RECOVERY
@@ -270,7 +270,7 @@ class TestSyncGovernanceRequestSchema:
         assert err["loc"][-1] == "idempotency_key", err
 
     def test_non_https_agent_url_rejected(self):
-        # url gates raise field-located errors at accounts[i].governance_agents[j].url (#1682 H2).
+        # url gates raise field-located errors at accounts[i].governance_agents[j].url (#1329).
         err = _first_schema_error(lambda: _make_request(url="http://governance.pinnacle-media.com"))
         assert err["type"] == "value_error", err
         assert "https" in err["msg"], err
@@ -279,14 +279,14 @@ class TestSyncGovernanceRequestSchema:
     def test_non_https_url_message_strips_userinfo(self):
         # The https gate is ordered AFTER the userinfo gate, so it only ever renders
         # userinfo-free urls; even so, the rendered url is userinfo-stripped as defense
-        # in depth — the message must never echo a credential (#1682 review B).
+        # in depth — the message must never echo a credential (#1329).
         err = _first_schema_error(lambda: _make_request(url="http://svc:SuperSecret456@governance.example.com/hook"))
         # userinfo gate fires first — but assert the secret is absent regardless of which gate.
         assert "SuperSecret456" not in err["msg"], err
 
     def test_agent_url_with_userinfo_rejected(self):
         # A credential embedded in the url (userinfo) must be rejected — it bypasses
-        # SSRF hostname checks and would be persisted/echoed (#1682 review B). The
+        # SSRF hostname checks and would be persisted/echoed (#1329). The
         # rejection message must NOT echo the secret.
         err = _first_schema_error(lambda: _make_request(url="https://svc:SuperSecret123@governance.example.com/hook"))
         assert err["type"] == "value_error", err
@@ -297,14 +297,14 @@ class TestSyncGovernanceRequestSchema:
     def test_agent_url_password_only_userinfo_rejected(self):
         # Password-only userinfo (username absent) must still be rejected — grades the
         # second operand of the userinfo check, which a username-only test never exercises
-        # (#1682 review D2).
+        # (#1329).
         err = _first_schema_error(lambda: _make_request(url="https://:SuperSecret789@governance.example.com/hook"))
         assert err["type"] == "value_error" and "userinfo" in err["msg"], err
         assert "SuperSecret789" not in err["msg"], err
 
     def test_agent_url_username_only_userinfo_rejected(self):
         # Username-only userinfo (no password) must also be rejected — grades the first
-        # operand independently (#1682 review D2).
+        # operand independently (#1329).
         err = _first_schema_error(lambda: _make_request(url="https://serviceacct@governance.example.com/hook"))
         assert err["type"] == "value_error" and "userinfo" in err["msg"], err
 
@@ -318,7 +318,7 @@ class TestSyncGovernanceRequestSchema:
     )
     def test_agent_url_ssrf_target_rejected(self, url):
         # A persisted governance url is a future check_governance target; internal /
-        # loopback / metadata hosts are rejected at bind time (#1682 review B7).
+        # loopback / metadata hosts are rejected at bind time (#1329).
         err = _first_schema_error(lambda: _make_request(url=url))
         assert err["type"] == "value_error", err
         assert "disallowed host" in err["msg"], err
@@ -354,8 +354,61 @@ class TestSyncGovernanceRequestSchema:
         assert err["loc"][-1] == "governance_agents", err
 
 
+class TestNonRestRequestBuilder:
+    """``build_sync_governance_request`` is the single non-REST field list (MCP + A2A).
+
+    Pins the two properties the shared builder guarantees so the two hand-assembling
+    transports cannot drift again (#1329): ``ext`` is forwarded (the MCP wrapper
+    previously dropped it) and an absent ``idempotency_key`` is OMITTED, not passed as
+    ``None`` (so it renders as the "missing" error REST produces, not a NoneType error).
+    """
+
+    _KEY = "uuid-v4-unit-00000000000000001"
+
+    def _account(self) -> dict:
+        return account_entry({"account_id": "acc_1"}, agents=[governance_agent_dict(GOV_URL)])
+
+    def test_ext_is_forwarded(self):
+        # Reddens if the builder drops ``ext`` — the exact fork the MCP wrapper had
+        # (A2A forwarded ext, MCP did not), a spec-valid field vanishing off one transport.
+        from src.core.tools.governance import build_sync_governance_request
+
+        req = build_sync_governance_request(
+            accounts=[self._account()], context=None, ext={"vendor_flag": True}, idempotency_key=self._KEY
+        )
+        # ext coerces to an ExtensionObject; compare its serialized (wire) form.
+        assert req.model_dump(mode="json").get("ext") == {"vendor_flag": True}
+
+    def test_absent_idempotency_key_omitted_renders_missing(self):
+        # OMIT (not None): a missing key renders as "Required field is missing" (matching
+        # REST's model_dump(exclude_none)), not "Expected string, got NoneType" (#1329 H1).
+        from src.core.exceptions import AdCPValidationError
+        from src.core.tools.governance import build_sync_governance_request
+
+        with pytest.raises(AdCPValidationError) as exc:
+            build_sync_governance_request(accounts=[self._account()], context=None, ext=None, idempotency_key=None)
+        assert "missing" in str(exc.value).lower(), exc.value
+
+    async def test_mcp_wrapper_threads_ext_through_to_impl(self):
+        # Pin the fork at the wrapper boundary: the MCP wrapper must pass ``ext`` into the
+        # request the _impl receives. Reddens if the wrapper drops ext before the builder.
+        from src.core.tools import governance as gov
+
+        captured: dict = {}
+
+        async def _capture(req, identity):
+            captured["ext"] = req.model_dump(mode="json").get("ext")
+            return SyncGovernanceResponse(accounts=[], context=None)
+
+        with patch.object(gov, "_sync_governance_impl", side_effect=_capture):
+            await gov.sync_governance(
+                idempotency_key=self._KEY, accounts=[self._account()], ext={"vendor_flag": True}, ctx=None
+            )
+        assert captured["ext"] == {"vendor_flag": True}
+
+
 class TestSyncGovernanceBoundaryValues:
-    """Construction-time schema asserts for the @bva boundary VALUES (#1682 review I).
+    """Construction-time schema asserts for the @bva boundary VALUES (#1329).
 
     The UC-030 ``@bva`` outlines are xfailed (abstract verdict-step wiring is deferred),
     and the old conftest reason claimed the boundary values are "covered concretely by the

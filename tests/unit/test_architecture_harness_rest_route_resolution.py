@@ -8,7 +8,7 @@ to the catch-all Flask mount at ``/`` and returns a Werkzeug HTML 404 — invisi
 ``make quality`` (unit + offline) and to the in-process leg when only ONE leg was
 overridden.
 
-That is exactly the ``CapabilitiesEnv`` regression (#1682 review A): it overrode only
+That is exactly the ``CapabilitiesEnv`` regression (#1329): it overrode only
 the in-process ``_run_rest_request`` to GET, so the in-network leg POSTed to the
 GET-only ``/api/v1/capabilities`` and 404'd on the live route — a red in-network CI job
 that no unit/in-process check could see. This guard performs that check structurally:
@@ -28,16 +28,12 @@ from tests.harness._base import BaseTestEnv
 
 _HARNESS_DIR = Path(__file__).resolve().parents[1] / "harness"
 
-# Pre-existing dead literals: a declared REST_ENDPOINT whose tool has no REST route.
-# get_media_buys is not exposed over REST — no /api/v1/media-buys/query route exists —
-# so MediaBuyListEnv's REST leg has never resolved. This predates #1329 and is separate
-# from it. Allowlist only shrinks: resolve by adding the route or dropping the env's
-# REST_ENDPOINT, then delete the entry.
-_KNOWN_UNRESOLVED: frozenset[tuple[str, str]] = frozenset(
-    {
-        ("post", "/api/v1/media-buys/query"),  # FIXME(#1682): get_media_buys has no REST route
-    }
-)
+# The allowlist is intentionally EMPTY and shrink-only: no harness env may declare a
+# REST_ENDPOINT that resolves to no live route. (The lone historical offender —
+# MediaBuyListEnv's /api/v1/media-buys/query for the REST-less get_media_buys — had its
+# dead REST_ENDPOINT removed rather than allowlisted; #1329.) A new entry is never added:
+# fix the env's REST_METHOD/REST_ENDPOINT or add the route.
+_KNOWN_UNRESOLVED: frozenset[tuple[str, str]] = frozenset()
 
 
 def _import_all_harness_modules() -> None:
@@ -101,7 +97,7 @@ def test_every_harness_rest_endpoint_resolves_to_live_route():
     assert unresolved == set(), (
         f"Harness env(s) declare a REST dispatch that resolves to no live APIRoute: {sorted(unresolved)}. "
         f"A (verb, path) with no matching route falls through to the Flask mount and 404s on the in-network "
-        f"leg (#1682 review A). Fix the env's REST_METHOD/REST_ENDPOINT or add the route. Do NOT add to the "
+        f"leg (#1329). Fix the env's REST_METHOD/REST_ENDPOINT or add the route. Do NOT add to the "
         f"allowlist."
     )
 

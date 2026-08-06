@@ -33,12 +33,12 @@ SELLER_ACCOUNT_BILLING: list[BillingParty] = [BillingParty.operator, BillingPart
 _PERMITTED_ACCOUNT_BILLING: frozenset[str] = frozenset(b.value for b in SELLER_ACCOUNT_BILLING)
 
 
-def resolve_supported_billing(tenant: Any | None) -> list[BillingParty]:
+def resolve_supported_billing(tenant: dict[str, Any] | None) -> list[BillingParty]:
     """The account-billable parties this seller accepts — the SINGLE source of truth.
 
     Consumed by BOTH the get_adcp_capabilities ``account.supported_billing`` honesty
     declaration (what the seller advertises) and the sync_accounts ``billing``
-    enforcement (what it accepts), so declared == accepted (#1682 review E). The 3.1.1
+    enforcement (what it accepts), so declared == accepted (#1329). The 3.1.1
     ``account.supported_billing`` contract is "the buyer must pass one of these values in
     sync_accounts", so the two MUST agree.
 

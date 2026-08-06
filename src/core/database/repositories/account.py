@@ -32,7 +32,7 @@ class GovernanceAgentColumn(TypedDict):
     yields a single ``url`` key. Typing the persisted record (rather than a bare ``dict``,
     which is ``dict[Any, Any]`` — no key/value checking at all) makes a ``url`` rename or an
     extra key a type error at the repository→tool boundary instead of a runtime ``KeyError``
-    on ``agent["url"]`` in the consumer (#1682 review item 2).
+    on ``agent["url"]`` in the consumer (#1329).
     """
 
     url: str
@@ -51,7 +51,7 @@ def _serialize_governance_agents(
     sync-governance-response.json ``governance_agents.items`` = url only). The request-side
     ``GovernanceAgent`` carries ``authentication`` (schemes + credentials); this projects to
     url-only for *both* dict and model inputs (the caller's precise union, not ``Any`` —
-    #1682 review item 2).
+    #1329).
 
     Only the ``url`` is read (never re-validating the full request model through the
     url-only DB model, which would ``extra="forbid"``-reject ``authentication`` in
@@ -92,8 +92,8 @@ class AccountRepository:
     # credential strip) — writing it raw through ``update_fields`` would persist the
     # write-only ``authentication`` blob. ``set_governance_binding`` is that path;
     # rejecting the field here makes the strip a structural guarantee, not call-site
-    # discipline, and any bypass (including a new caller) goes red immediately (#1682
-    # review B).
+    # discipline, and any bypass (including a new caller) goes red immediately
+    # (#1329).
     _REPO_OWNED_FIELDS: frozenset[str] = frozenset({"governance_agents"})
 
     def __init__(self, session: Session, tenant_id: str) -> None:
@@ -345,7 +345,7 @@ class AccountRepository:
         Account carrying a pre-populated ``governance_agents`` blob, or a raw ``setattr``,
         would bypass this strip; no live caller does so, there is no admin surface for
         governance, and reads are fail-closed — a strip at the persistence boundary is
-        tracked as a separate hardening, #1682 review D.) Returns the stored list so the
+        tracked as a separate hardening, #1329.) Returns the stored list so the
         caller echoes exactly what was persisted (the two can never disagree). Replaces
         the prior binding (per-account replace semantics).
         """

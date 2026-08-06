@@ -124,6 +124,24 @@ Feature: BR-UC-030 Manage Governance Binding
     # PRE-B7, BR-6
     # @source repo=adcp ref=v3.1-04f59d2d5 commit=04f59d2d5 path=static/schemas/source/account/sync-governance-request.json
 
+  @T-UC-030-sync-secret-not-on-wire @sync @validation @security @credential-redaction @partition @post-s2
+  Scenario Outline: sync_governance rejects a governance agent that leaks a secret via <channel> without the secret reaching the wire
+    Given the Buyer Agent has an authenticated connection
+    When the Buyer Agent sends a sync_governance request with idempotency_key "uuid-v4-secret-000000000042" and account "acct-social-001" whose governance agent leaks a secret via <channel>
+    Then the response is a VALIDATION_ERROR on the wire naming the governance agent field
+    And the wire envelope does NOT contain the leaked secret
+
+    Examples:
+      | channel                  |
+      | url-userinfo             |
+      | extra-authentication-key |
+    # PRE-B7, BR-6 — credential channels: a rejected secret (a credential embedded in the
+    # agent URL's userinfo, or a mistyped extra authentication key) must be rejected AND
+    # must never be echoed back on the buyer wire. Graded on the a2a + rest wire; mcp is
+    # xfailed because it surfaces only the leaf pydantic message, never the input value, so a
+    # secret-absence grade there is vacuous.
+    # @source repo=adcp ref=v3.1-04f59d2d5 commit=04f59d2d5 path=static/schemas/source/account/sync-governance-request.json
+
   @T-UC-030-sync-multiple-agents-rejected @sync @validation @partition @boundary @cardinality
   Scenario: sync_governance with more than one governance_agents entry per account is rejected (maxItems 1)
     Given the Buyer Agent has an authenticated connection

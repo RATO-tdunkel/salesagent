@@ -173,20 +173,15 @@ def _sync_one_account(
             message=_UNRESOLVED_ACCOUNT_MESSAGE,
             suggestion=_UNRESOLVED_ACCOUNT_SUGGESTION,
         )
-    except AdCPAccountAmbiguousError as e:
-        # code + recovery derived from the caught exception (they agree by construction),
-        # not copied literals.
-        return _failed_account_result(
-            entry.account,
-            e.error_code,
-            recovery=e.recovery,
-            message=str(e),
-            suggestion=getattr(e, "suggestion", None),
-        )
-    except AdCPError as e:
-        # Account-status blocks (setup/suspended/payment): honest per-account
-        # failure carrying the resolver's own code + recovery rather than a silent
-        # success (the exception's code and recovery agree by construction).
+    except (AdCPAccountAmbiguousError, AdCPError) as e:
+        # Any other resolver failure — an ambiguous natural key (ACCOUNT_AMBIGUOUS,
+        # scoped to the caller's own accounts so not an enumeration oracle) or an
+        # account-status block (setup/suspended/payment) — surfaces as an honest
+        # per-account failure carrying the exception's OWN code + recovery (they agree
+        # by construction), never a silent success. AdCPAccountAmbiguousError is an
+        # AdCPError subclass, so one handler covers both; it is named explicitly for
+        # readers. The earlier NotFound/Authorization except stays separate because it
+        # deliberately does NOT echo the caught code (that would reopen the oracle).
         return _failed_account_result(
             entry.account,
             e.error_code,
@@ -199,7 +194,7 @@ def _sync_one_account(
     # never persisted — #1329) and returns the stored list as typed GovernanceAgentColumn
     # records ({url: str}). Echo from that same list so persisted and echoed can never
     # disagree; the typed record means ``agent["url"]`` is statically key-checked — a column
-    # rename fails mypy here rather than becoming a runtime KeyError (#1682 review item 2).
+    # rename fails mypy here rather than becoming a runtime KeyError (#1329).
     # set_governance_binding replaces the prior binding (per-account replace semantics).
     agent_urls = repo.set_governance_binding(account_id, entry.governance_agents)
 
@@ -251,6 +246,42 @@ async def _sync_governance_impl(
 
 
 # ---------------------------------------------------------------------------
+# Shared request assembly (non-REST transports)
+# ---------------------------------------------------------------------------
+
+
+def build_sync_governance_request(
+    *,
+    accounts: list[SyncGovernanceAccountInput] | list[dict[str, Any]] | None,
+    context: ContextObject | dict[str, Any] | None,
+    ext: dict[str, Any] | None,
+    idempotency_key: str | None,
+) -> SyncGovernanceRequest:
+    """Assemble a ``SyncGovernanceRequest`` from loose params (the MCP + A2A wrappers).
+
+    The SINGLE source for the non-REST field list, so the two hand-assembling
+    transports cannot drift — any future H1 field is added HERE once (REST builds
+    generically via ``model_dump(exclude_none=True)`` and needs no counterpart).
+    Construction runs inside the AdCP validation boundary so a schema violation
+    (missing/short idempotency_key, non-https url, short credentials, agent
+    cardinality) surfaces as the VALIDATION_ERROR envelope — the same wire shape REST
+    produces — on both transports (#1329).
+
+    ``idempotency_key`` is OMITTED when None (not passed as None): REST drops it via
+    ``model_dump(exclude_none=True)``, so a missing key renders as "Required field is
+    missing" on all three transports rather than "Expected string, got NoneType"
+    (#1329 H1). ``ext`` (the AdCP extension carrier) is forwarded on both transports —
+    the MCP wrapper previously omitted it, forking a spec-valid field off one
+    transport under a comment claiming parity (#1329 I4).
+    """
+    kwargs: dict[str, Any] = {"accounts": accounts or [], "context": context, "ext": ext}
+    if idempotency_key is not None:
+        kwargs["idempotency_key"] = idempotency_key
+    with adcp_validation_boundary(context="sync_governance request"):
+        return SyncGovernanceRequest(**kwargs)
+
+
+# ---------------------------------------------------------------------------
 # MCP wrapper
 # ---------------------------------------------------------------------------
 
@@ -262,44 +293,34 @@ async def sync_governance(
     ] = None,
     accounts: list[SyncGovernanceAccountInput] | None = None,
     context: ContextObject | None = None,
+    ext: dict[str, Any] | None = None,
     ctx: Context | ToolContext | None = None,
 ) -> ToolResult:
     """Bind a governance agent per account (MCP tool).
 
     MCP wrapper that accepts individual parameters per AdCP spec and constructs a
-    SyncGovernanceRequest for the shared implementation. ``idempotency_key`` is
-    spec-required, but it is typed ``str | None`` here (not ``str``) so a missing
-    key surfaces as an AdCP validation error at model construction — the same wire
-    shape REST/A2A produce — rather than being rejected earlier by FastMCP's own
-    parameter-schema layer with a different, non-AdCP error shape. The schema's
-    required ``idempotency_key`` still rejects ``None`` (UC-030 grades that).
+    SyncGovernanceRequest — via the shared ``build_sync_governance_request`` builder
+    (the single non-REST field list, also used by the A2A skill) — for the shared
+    implementation. ``idempotency_key`` is spec-required, but it is typed ``str | None``
+    here (not ``str``) so a missing key surfaces as an AdCP validation error at model
+    construction — the same wire shape REST/A2A produce — rather than being rejected
+    earlier by FastMCP's own parameter-schema layer with a different, non-AdCP error
+    shape. The schema's required ``idempotency_key`` still rejects ``None`` (UC-030
+    grades that).
 
     Args:
         idempotency_key: Client-generated at-most-once key (spec-required; a
             missing key is rejected at request construction).
         accounts: Per-account governance agent bindings.
         context: Application-level context per AdCP spec (echoed back).
+        ext: AdCP extension carrier — forwarded through the shared builder so the
+            field is not dropped on this transport (#1329 I4).
         ctx: FastMCP context for authentication.
 
     Returns:
         ToolResult with human-readable text and structured data.
     """
-    # Wrap construction so a schema violation (missing/short idempotency_key,
-    # non-https url, short credentials, agent cardinality) surfaces as the AdCP
-    # VALIDATION_ERROR envelope — the same wire shape REST produces via its own
-    # boundary — instead of a raw pydantic error or FastMCP's parameter-schema
-    # rejection (UC-030 grades these on the wire).
-    #
-    # OMIT idempotency_key when absent (rather than passing None): REST drops it via
-    # model_dump(exclude_none=True), so a missing key there is a "Required field is missing"
-    # error. Passing None here would instead be "Expected string, got NoneType" — a divergent
-    # message + suggestion for the same buyer mistake. Omit it so all three transports render
-    # the same "the buyer omitted the field" error (#1682 review H1).
-    kwargs: dict[str, Any] = {"accounts": accounts or [], "context": context}
-    if idempotency_key is not None:
-        kwargs["idempotency_key"] = idempotency_key
-    with adcp_validation_boundary(context="sync_governance request"):
-        req = SyncGovernanceRequest(**kwargs)
+    req = build_sync_governance_request(accounts=accounts, context=context, ext=ext, idempotency_key=idempotency_key)
     identity = (await ctx.get_state("identity")) if isinstance(ctx, Context) else None
     response = await _sync_governance_impl(req, identity)
     return ToolResult(content=str(response), structured_content=response)

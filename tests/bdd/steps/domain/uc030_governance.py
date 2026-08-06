@@ -35,7 +35,7 @@ from pytest_bdd import given, parsers, then, when
 from tests.bdd.steps._outcome_helpers import _require_response, wire_dict
 from tests.bdd.steps.generic._dispatch import dispatch_request
 from tests.factories import AccountFactory
-from tests.harness.transport import _pinned_error_metadata
+from tests.harness.transport import Transport, _pinned_error_metadata
 from tests.helpers.accounts import seed_account_with_access
 from tests.helpers.governance import (
     DEFAULT_URL,
@@ -83,8 +83,29 @@ def _agent(url: str, *, cred_len: int = 64, credentials: str | None = None, sche
 
 
 def _account_entry(account_id: str, agents: list[dict[str, Any]]) -> dict[str, Any]:
-    # Thin id-form wrapper over the shared request-element builder (#1682 review item 2).
+    # Thin id-form wrapper over the shared request-element builder (#1329).
     return account_entry({"account_id": account_id}, agents=agents)
+
+
+# A >=32-char secret used by the credential-channel scenarios. It must NEVER appear in the
+# rejection envelope on the buyer wire — via the URL userinfo (stripped) or via a mistyped
+# extra authentication key (redacted). The exact value is asserted-absent, so it is unique.
+_LEAK_SECRET = "S3cr3t-must-not-leak-0000000000000"
+
+
+def _leaky_agent(channel: str) -> dict[str, Any]:
+    """Build a governance agent that carries ``_LEAK_SECRET`` on the named credential channel."""
+    if channel == "url-userinfo":
+        # Credential embedded in the URL userinfo: rejected by the userinfo gate, whose
+        # message strips userinfo so the secret is never rendered.
+        return _agent(f"https://svc:{_LEAK_SECRET}@governance.example.com/hook")
+    if channel == "extra-authentication-key":
+        # `credential` (singular) is not in the Authentication schema -> extra_forbidden; the
+        # value is redacted so it never reaches the wire (mirrors the integration redaction test).
+        agent = _agent(DEFAULT_URL)
+        agent["authentication"]["credential"] = _LEAK_SECRET
+        return agent
+    raise ValueError(f"Unknown credential channel: {channel!r}")
 
 
 def _dispatch(ctx: dict, transport: str, *, identity: Any = "__keep__", **kwargs: Any) -> None:
@@ -113,7 +134,7 @@ def _wire_account(ctx: dict, account_id: str) -> dict[str, Any]:
     Finding the entry by its requested id IS the account-ref echo grade: if the wire
     did not echo the requested ref, this raises "No wire account". Callers therefore do
     NOT re-assert ``acct["account"]["account_id"] == account_id`` — that would be
-    tautological against this lookup (#1682 review H).
+    tautological against this lookup (#1329).
     """
     for acct in _wire_accounts(ctx):
         ref = acct.get("account") or {}
@@ -180,7 +201,7 @@ def given_authority_over_implicit(ctx: dict, brand: str, operator: str) -> None:
 
     Unlike ``_owned_account`` (account_id only), the implicit-account scenario resolves by
     natural key, so the row must carry the operator + brand.domain the request references —
-    the canonical seeder carries both (#1682 review item 3).
+    the canonical seeder carries both (#1329).
     """
     tenant, principal = _tenant_principal(ctx)
     account_id = "acc-nk-" + f"{brand}-{operator}".replace(".", "-")
@@ -255,6 +276,25 @@ def when_sync_account_literal_creds(
         idempotency_key=key,
         accounts=[_account_entry(account_id, [_agent(url, credentials=credentials)])],
     )
+
+
+@when(
+    parsers.parse(
+        'the Buyer Agent sends a sync_governance request with idempotency_key "{key}" and '
+        'account "{account_id}" whose governance agent leaks a secret via {channel}'
+    )
+)
+def when_sync_leaky_agent(ctx: dict, key: str, account_id: str, channel: str) -> None:
+    """Dispatch a request whose governance agent carries a secret on the named credential channel.
+
+    The request is rejected at the validation boundary (before account resolution), so no
+    account seeding is needed — only the shared auth Given (so the request passes auth and
+    reaches the boundary). The leaked secret is stashed for the absence assertion. Transport
+    comes from parametrization (a2a/mcp/rest), so this grades every wire.
+    """
+    ctx["leaked_secret"] = _LEAK_SECRET
+    ctx["leak_channel"] = channel
+    _dispatch(ctx, "", idempotency_key=key, accounts=[_account_entry(account_id, [_leaky_agent(channel)])])
 
 
 @when(
@@ -388,7 +428,7 @@ def then_no_operation_errors(ctx: dict) -> None:
     # Falsifiable: the ERROR variant carries a top-level adcp_error and NO accounts[], so
     # pinning adcp_error's absence AND accounts' presence grades that this is genuinely the
     # success variant. (The earlier `"errors" not in body` half was vacuous — the response
-    # model is extra='forbid', so a top-level errors[] can never appear — #1682 review NIT.)
+    # model is extra='forbid', so a top-level errors[] can never appear — #1329.)
     assert body.get("adcp_error") is None, f"expected success variant, got an error envelope: {body}"
     assert body.get("accounts") is not None, f"success variant must carry an accounts array: {body}"
 
@@ -398,7 +438,7 @@ def then_no_operation_errors(ctx: dict) -> None:
 def then_account_status(ctx: dict, account_id: str, status: str) -> None:
     # _wire_account fetches the entry by its echoed ref — the by-id lookup IS the ref-echo
     # grade (it raises "No wire account {id}. Available: ..." if the ref was dropped/wrong),
-    # so no separate membership pre-assert (that is redundant against the lookup, #1682 review item 5).
+    # so no separate membership pre-assert (that is redundant against the lookup, #1329).
     acct = _wire_account(ctx, account_id)
     assert acct["status"] == status, f"account {account_id}: expected status {status}, got {acct['status']}"
     if status == "synced":
@@ -411,7 +451,7 @@ def then_account_status(ctx: dict, account_id: str, status: str) -> None:
 @then(parsers.parse('account "{account_id}" has status "{status}" and carries a per-account errors array'))
 def then_account_status_with_errors(ctx: dict, account_id: str, status: str) -> None:
     # _wire_account's by-id lookup IS the ref-echo grade (raises on a dropped/wrong ref);
-    # no redundant membership pre-assert (#1682 review item 5).
+    # no redundant membership pre-assert (#1329).
     acct = _wire_account(ctx, account_id)
     assert acct["status"] == status, f"account {account_id}: expected status {status}, got {acct['status']}"
     assert acct.get("errors"), f"failed account {account_id} must carry a per-account errors array: {acct}"
@@ -420,7 +460,7 @@ def then_account_status_with_errors(ctx: dict, account_id: str, status: str) -> 
 @then(parsers.parse('the response account "{account_id}" echoes governance_agents[{idx:d}].url "{url}"'))
 def then_echo_url(ctx: dict, account_id: str, idx: int, url: str) -> None:
     # _wire_account's by-id lookup IS the ref-echo grade (raises on a dropped/wrong ref);
-    # no redundant membership pre-assert (#1682 review item 5).
+    # no redundant membership pre-assert (#1329).
     acct = _wire_account(ctx, account_id)
     agents = acct.get("governance_agents") or []
     actual = agents[idx]["url"]
@@ -430,7 +470,7 @@ def then_echo_url(ctx: dict, account_id: str, idx: int, url: str) -> None:
 @then(parsers.parse('the response account "{account_id}" does NOT echo governance_agents[{idx:d}].authentication'))
 def then_no_echo_auth(ctx: dict, account_id: str, idx: int) -> None:
     # _wire_account's by-id lookup IS the ref-echo grade (raises on a dropped/wrong ref);
-    # no redundant membership pre-assert (#1682 review item 5).
+    # no redundant membership pre-assert (#1329).
     acct = _wire_account(ctx, account_id)
     agents = acct.get("governance_agents") or []
     assert "authentication" not in agents[idx], f"credentials must not be echoed: {agents[idx]}"
@@ -442,7 +482,7 @@ def then_adcp_version(ctx: dict) -> None:
     # POST-S4 (adcp_version echoed on every response) is not implemented on sync-tool
     # responses (systemic — sync_accounts has the same gap). xfail HERE (in-step) rather
     # than at the scenario level, so the sync-happy scenario's other wire graders execute
-    # and stay falsifiable; graduates when production echoes the envelope field (#1682 G1).
+    # and stay falsifiable; graduates when production echoes the envelope field (#1329).
     if not body.get("adcp_version"):
         pytest.xfail("POST-S4 adcp_version not echoed on sync responses — spec-production gap (#1329)")
     assert body.get("adcp_version"), f"expected an echoed adcp_version envelope field, got keys {list(body)}"
@@ -458,7 +498,7 @@ def then_per_account_authority_code(ctx: dict) -> None:
     ``ACCOUNT_NOT_FOUND`` code — an existing-but-unowned account is indistinguishable
     from a nonexistent one (the ``*_NOT_FOUND`` uniform-response MUST). ``SCOPE_INSUFFICIENT``
     is deliberately NOT accepted here: ``governance.py`` emits it nowhere and admitting
-    it on the wire would let the exact value the fix removed pass (#1682 review C).
+    it on the wire would let the exact value the fix removed pass (#1329).
     """
     allowed = {"ACCOUNT_NOT_FOUND"}
     failed_errors = [(acct.get("errors") or [{}])[0] for acct in _wire_accounts(ctx) if acct.get("status") == "failed"]
@@ -470,7 +510,7 @@ def then_per_account_authority_code(ctx: dict) -> None:
     assert failed_codes <= allowed, f"per-account authority code(s) {failed_codes} not all in {allowed}"
     # Recovery is wire-graded against the pinned enum (not a literal): flipping
     # governance.py's per-account recovery terminal->transient reddens HERE, not just
-    # off-wire unit/integration (#1682 review G5).
+    # off-wire unit/integration (#1329).
     expected_recovery = _pinned_error_metadata()["ACCOUNT_NOT_FOUND"]["recovery"]
     recoveries = {e.get("recovery") for e in failed_errors}
     assert recoveries == {expected_recovery}, (
@@ -484,7 +524,7 @@ def then_per_account_message_uniform(ctx: dict) -> None:
     NOT carry the authorization-specific ``does not have access to account 'X'`` phrasing
     (which would distinguish exists-but-unowned from not-found — a cross-principal
     enumeration oracle). Restoring the leaky message now reddens a WIRE test, not just
-    off-wire unit/integration (#1682 review C)."""
+    off-wire unit/integration (#1329)."""
     accounts = _wire_accounts(ctx)
     statuses = {a.get("status") for a in accounts}
     assert "failed" in statuses, f"expected a failed per-account entry, got statuses {statuses}"
@@ -516,7 +556,7 @@ def then_per_account_suggestion(ctx: dict, field: str) -> None:
 # The wire echo shows the current sync's result, so proving REPLACE (prior binding gone)
 # and per-account SCOPE (an unnamed account untouched) requires reading the persisted row.
 # These read it back via the shared session-safe persisted_governance_urls, matching the
-# below-wire integration test test_replace_semantics_overwrites_prior_binding (#1682 review item 2).
+# below-wire integration test test_replace_semantics_overwrites_prior_binding (#1329).
 
 
 @then(parsers.parse('the persisted governance agent on "{account_id}" is "{url}"'))
@@ -524,7 +564,7 @@ def then_per_account_suggestion(ctx: dict, field: str) -> None:
 def then_persisted_binding_is(ctx: dict, account_id: str, url: str) -> None:
     # One body, two phrasings (replace-overwrites vs per-account-scope-unchanged): both
     # assert the persisted binding on the account is EXACTLY [url]. Stacked parsers rather
-    # than two identical bodies (#1682 review H; mirrors the stacked @when parsers).
+    # than two identical bodies (#1329; mirrors the stacked @when parsers).
     # An absent/unbound account reads back as [], so the len==1 check also covers persistence.
     urls = persisted_governance_urls(ctx["tenant"].tenant_id, account_id)
     assert len(urls) == 1 and url_eq(urls[0], url), f"expected {account_id} persisted binding == [{url!r}], got {urls}"
@@ -563,16 +603,19 @@ def then_natural_key_account_status(ctx: dict, brand: str, operator: str, status
 # pinned AdCP enum (not a hardcoded "correctable"). Field-level violations pin the STRUCTURED
 # errors[0].field EXACTLY (both layers, via field=) — a substring token like "accounts" or
 # "governance_agents" is a prefix of several governance paths and would stay green on a field
-# wrong for the scenario (#1682 review D). field is transport-stable (the MCP TypeAdapter
+# wrong for the scenario (#1329). field is transport-stable (the MCP TypeAdapter
 # boundary diverges on message, not field). The url https-requirement is a model validator, so
 # its field is empty → assert the message there. Every request-validation rejection also carries
 # a top-level suggestion (require_suggestion=True). Verified against the real per-transport
-# envelopes (#1682 review item 2/D).
+# envelopes (#1329).
 _CREDENTIALS_FIELD = "accounts[0].governance_agents[0].authentication.credentials"
 _AGENTS_FIELD = "accounts[0].governance_agents"
 # The url gates (userinfo/https/SSRF) now raise a field-located error here (was a bare
-# ValueError with an empty field), so the step pins field= too (#1682 review H2).
+# ValueError with an empty field), so the step pins field= too (#1329).
 _URL_FIELD = "accounts[0].governance_agents[0].url"
+# Both credential channels reject at a field under this prefix — the url gate at ...url,
+# the extra_forbidden gate at ...authentication.<mistyped-key>.
+_GOV_AGENT_FIELD_PREFIX = "accounts[0].governance_agents[0]"
 
 
 @then("the error references the url field and indicates https is required")
@@ -587,11 +630,39 @@ def then_error_credentials(ctx: dict) -> None:
     ctx["result"].assert_wire_error("VALIDATION_ERROR", field=_CREDENTIALS_FIELD, require_suggestion=True)
 
 
+@then("the response is a VALIDATION_ERROR on the wire naming the governance agent field")
+def then_secret_channel_wire_error(ctx: dict) -> None:
+    # Wire-graded (a2a/rest): a field-located VALIDATION_ERROR on the governance agent. The
+    # field prefix covers both channels (url gate -> ...url; extra_forbidden -> ...authentication.<key>).
+    ctx["result"].assert_wire_error("VALIDATION_ERROR", field_substr=_GOV_AGENT_FIELD_PREFIX)
+
+
+@then("the wire envelope does NOT contain the leaked secret")
+def then_wire_envelope_omits_secret(ctx: dict) -> None:
+    # The security invariant: a rejected credential must never be echoed. Assert on the REAL
+    # wire envelope (not a reconstruction) so disabling the strip/redaction reddens the wire.
+    #
+    # MCP + extra_forbidden is the ONE ungraded cell: MCP surfaces only the leaf pydantic
+    # message ("Extra inputs are not permitted"), never the input value, so the secret is absent
+    # there for a STRUCTURAL reason, not because the redaction ran — a redaction grade on mcp is
+    # vacuous. Mutation-confirmed: disabling format_validation_error's redaction reddens
+    # a2a-extra + rest-extra but NOT mcp-extra. The url-userinfo channel renders a field-located
+    # message on every transport, so all three (incl. mcp) grade it — confirmed by the sibling
+    # mutation reddening a2a/mcp/rest. So only this one cell is ungraded.
+    if ctx["transport"] == Transport.MCP and ctx.get("leak_channel") == "extra-authentication-key":
+        pytest.xfail(
+            "MCP emits only the leaf pydantic message for an extra_forbidden field — secret-absence is vacuous"
+        )
+    secret = ctx["leaked_secret"]
+    envelope = ctx["result"].wire_error_envelope
+    assert secret not in str(envelope), f"leaked secret reached the wire envelope: {envelope!r}"
+
+
 @then("the error references the governance_agents maximum cardinality")
 def then_error_cardinality_max(ctx: dict) -> None:
     # maxItems 1 and minItems 1 both point at the same field (accounts[0].governance_agents);
     # the distinguishing token lives in the message ("at most" / "at least 1 item") on all
-    # three transports (#1682 review D).
+    # three transports (#1329).
     ctx["result"].assert_wire_error(
         "VALIDATION_ERROR", field=_AGENTS_FIELD, message_substr="at most 1 item", require_suggestion=True
     )

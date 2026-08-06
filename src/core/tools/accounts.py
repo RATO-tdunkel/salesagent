@@ -276,8 +276,8 @@ def _account_fields_changed(db_account: DBAccount, entry: Any) -> dict[str, Any]
     # declares no such field — it is only ever seen via extra="allow", hence always
     # absent), and it is owned by sync_governance (UC-030). Reading an absent field
     # off `entry` yielded None, which a metadata-only re-sync then wrote back as a
-    # change → NULLing an existing governance binding (confirmed data-loss, #1682
-    # review Cluster B). sync_accounts must not touch a field outside its contract.
+    # change → NULLing an existing governance binding (confirmed data-loss,
+    # #1329). sync_accounts must not touch a field outside its contract.
 
     return changes
 
@@ -373,7 +373,7 @@ def _check_billing_policy(
 
     Resolves the accepted set via ``resolve_supported_billing`` — the SAME resolver
     get_adcp_capabilities advertises through — so what the buyer sees in
-    ``account.supported_billing`` is exactly what this gate accepts (#1682 review E).
+    ``account.supported_billing`` is exactly what this gate accepts (#1329).
     """
     from adcp.types import Error
 

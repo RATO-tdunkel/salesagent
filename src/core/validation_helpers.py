@@ -204,7 +204,7 @@ def format_validation_error(validation_error: ValidationError, context: str = "r
             # escapes any nested-key scan, so echoing is unsafe in the general case. The
             # field PATH is the actionable part and always survives; withholding the
             # value keeps a secret off the buyer wire and out of the message-persisting
-            # log/audit sinks (#1682 review C). ``errors[0].message`` feeds those sinks,
+            # log/audit sinks (#1329). ``errors[0].message`` feeds those sinks,
             # so this holds on REST and A2A; MCP surfaces only the leaf Pydantic message.
             if input_val is None:
                 error_details.append(f"  • {field_path}: Extra field not allowed by AdCP spec")

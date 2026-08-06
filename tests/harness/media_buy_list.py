@@ -23,7 +23,9 @@ class MediaBuyListEnv(IntegrationEnv):
     """
 
     EXTERNAL_PATCHES: dict[str, str] = {}
-    REST_ENDPOINT = "/api/v1/media-buys/query"
+    # No REST_ENDPOINT: get_media_buys is not exposed over REST (UC-019 is A2A/MCP-only),
+    # so there is no live /api/v1/media-buys/query route to dispatch to. Declaring a
+    # non-resolving endpoint would 404 on the in-network leg (#1329).
 
     def _configure_mocks(self) -> None:
         """No mocks needed for read-only list operation."""

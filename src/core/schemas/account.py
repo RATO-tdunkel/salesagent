@@ -189,7 +189,7 @@ def _raise_governance_url_error(loc: tuple[str | int, ...], message: str, input_
     empty bullet. Emitting an explicit ``loc`` via ``from_exception_data`` restores the
     ``accounts[i].governance_agents[j].url`` field pointer so error consumers (and the
     BR-UC-030 wire steps) can pin ``field=`` instead of a free-text message match
-    (#1682 review H2). The rendered message must be a literal (no ``{}`` placeholders) —
+    (#1329). The rendered message must be a literal (no ``{}`` placeholders) —
     ``PydanticCustomError`` treats the second arg as a template.
     """
     raise CoreValidationError.from_exception_data(
@@ -218,15 +218,14 @@ class SyncGovernanceRequest(LibrarySyncGovernanceRequest):
 
         Three construction-time gates, uniform across every transport (MCP/A2A/REST
         all build this type), each raising a field-located error at
-        ``accounts[i].governance_agents[j].url`` (#1682 review H2):
+        ``accounts[i].governance_agents[j].url`` (#1329):
 
         1. **no userinfo** (checked FIRST) — ``https://user:pass@host/`` embeds a
            credential in the url, which SSRF hostname checks skip (they read only the
            host) and which would otherwise be persisted verbatim and echoed on the
            wire. Ordering this gate before the https/SSRF gates guarantees a
            credential-bearing url never reaches a gate whose message renders the url;
-           the https message additionally strips userinfo as defense in depth (#1682
-           review B).
+           the https message additionally strips userinfo as defense in depth (#1329).
         2. **https** — the pinned 3.1.1 request schema marks the agent ``url``
            ``pattern: ^https://``, but the generated ``AnyUrl`` field does not carry
            that constraint (SDK codegen gap), so an ``http://`` url would slip
@@ -245,7 +244,7 @@ class SyncGovernanceRequest(LibrarySyncGovernanceRequest):
                 loc = ("accounts", a_idx, "governance_agents", g_idx, "url")
                 # 1. userinfo FIRST — a credential-bearing url must be rejected before any
                 #    gate below renders it (operands checked separately so username-only and
-                #    password-only credentials are both rejected — #1682 review B/D2).
+                #    password-only credentials are both rejected — #1329).
                 if getattr(url, "username", None) or getattr(url, "password", None):
                     _raise_governance_url_error(
                         loc, "governance agent url must not embed userinfo credentials", url_str

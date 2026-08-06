@@ -98,9 +98,10 @@ def then_capabilities_sandbox_flag(ctx: dict, expected: str) -> None:
     )
     # The #1329 account obligation is sandbox=false AND supported_billing (BR-UC-010 names both
     # in one line); grade the billing half on the same wire so the grader closes the whole
-    # obligation it is named for, not just the sandbox flag (#1682 review item 1). This scenario
+    # obligation it is named for, not just the sandbox flag (#1329). This scenario
     # configures no tenant `supported_billing` policy, so production takes the deterministic
-    # default-fallback branch (_build_account_capability -> _DEFAULT_SUPPORTED_BILLING), whose
+    # default-fallback branch (_build_account_capability -> resolve_supported_billing ->
+    # account_helpers.SELLER_ACCOUNT_BILLING), whose
     # honest value is exactly {operator, agent} — pin the exact set, not mere non-emptiness, so
     # dropping/adding a party reddens the grade (order-insensitive).
     billing = account.get("supported_billing")

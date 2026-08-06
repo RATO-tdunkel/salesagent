@@ -956,7 +956,7 @@ def execute_approved_media_buy(media_buy_id: str, tenant_id: str) -> tuple[bool,
                             if not url_str.startswith(("http://", "https://")):
                                 # Strip any userinfo before rendering — the message is logged
                                 # + returned, and a buyer-supplied url could embed a credential
-                                # (same leak class as the governance url gate — #1682 review B).
+                                # (same leak class as the governance url gate — #1329).
                                 raise ValueError(f"agent_url must be HTTP(S), got: {strip_url_userinfo(url_str)}")
                             format_ids_list.append(validated)
                         except (ValueError, ValidationError) as e:

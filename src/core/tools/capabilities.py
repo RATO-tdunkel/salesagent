@@ -98,7 +98,7 @@ def _build_account_capability(tenant: dict[str, Any] | None) -> AccountCapabilit
     supported_billing (required by the schema): the account-billable parties this
     seller accepts, resolved by ``resolve_supported_billing`` — the SAME resolver
     sync_accounts enforces against, so what is advertised here equals what sync_accounts
-    accepts (#1682 review E). A configured value with no account-billable party raises
+    accepts (#1329). A configured value with no account-billable party raises
     (loud) rather than silently substituting the default.
 
     required_for_products and account_financials default to False on the library type,
@@ -163,7 +163,7 @@ def _adcp_metadata() -> Adcp:
     Idempotency(supported=True). The 3.1.1 schema scopes this to ALL mutating requests
     ("the seller deduplicates replays … without re-executing side effects"), and there
     is no per-tool field, so the declaration is agent-wide. Honest status of the
-    mutating tools behind it (#1682 review F):
+    mutating tools behind it (#1329):
 
     * create_media_buy — the spend-committing tool — DOES dedup via
       ``uow.idempotency_attempts`` (a replay returns the cached response, no double

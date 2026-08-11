@@ -1,10 +1,9 @@
 """Shared creative test helpers.
 
-DRY extraction for creative sync and serialization test utilities shared across:
-- test_creative_coverage_gaps
-- test_sync_creatives_format_validation
-- test_creative_response_serialization
-- test_list_creatives_serialization
+DRY extraction for creative test utilities — sync/serialization builders, a
+status-varying DB seeder, and a shared empty-array-filter wire-rejection assertion —
+reused across the creative unit, integration, and BDD suites. Consumers are not
+enumerated here; a grep of the exported names finds them.
 """
 
 from __future__ import annotations
@@ -16,23 +15,34 @@ from unittest.mock import MagicMock, Mock, patch
 
 from tests.factories.creative_asset import AssetSpec, assert_assets, build_assets, image_spec
 from tests.harness import make_mock_uow
+from tests.helpers.envelope_assertions import assert_no_raw_validation_leak
 
 if TYPE_CHECKING:
+    from src.core.database.models import Principal, Tenant
     from tests.harness._base import BaseTestEnv
     from tests.harness.transport import Transport
 
 
-def seed_creative_in_status(tenant: Any, principal: Any, status: str = "approved") -> str:
+def seed_creative_in_status(
+    tenant: Tenant,
+    principal: Principal,
+    status: str = "approved",
+    *,
+    creative_id: str | None = None,
+) -> str:
     """Create one creative owned by *principal* in *status*; return its creative_id.
 
-    The single seeder for the #1502 statuses-filter integration tests (and available to
-    any test that needs one status-varying creative). Only ``status`` varies per call —
-    the remaining fields (format, data with real assets) come from CreativeFactory
-    defaults, which already satisfy the repository's ``data["assets"] IS NOT NULL`` guard.
+    The single seeder for the #1502 statuses-filter tests (and available to any test that
+    needs one status-varying creative). ``status`` varies per call; pass ``creative_id``
+    when the test asserts on a literal id (the repository tests) — otherwise CreativeFactory
+    generates one. The remaining fields (format, data with real assets) come from
+    CreativeFactory defaults, which already satisfy the repository's
+    ``data["assets"] IS NOT NULL`` guard.
     """
     from tests.factories import CreativeFactory
 
-    return CreativeFactory(tenant=tenant, principal=principal, status=status).creative_id
+    extra: dict[str, Any] = {"creative_id": creative_id} if creative_id is not None else {}
+    return CreativeFactory(tenant=tenant, principal=principal, status=status, **extra).creative_id
 
 
 def assert_empty_array_filter_rejected(env: BaseTestEnv, transport: Transport, field: str) -> None:
@@ -46,9 +56,24 @@ def assert_empty_array_filter_rejected(env: BaseTestEnv, transport: Transport, f
     Routes through the harness-provided ``TransportResult.assert_wire_error`` rather than
     hand-rolling the envelope: ``recovery`` defaults to the pinned AdCP enum's classification
     for VALIDATION_ERROR (pin-wins — no hardcoded ``"correctable"`` to drift if the pin
-    reclassifies), and ``require_suggestion`` owns the POST-F3 suggestion check.
+    reclassifies), and ``require_suggestion`` owns the POST-F3 suggestion check. ``message_substr``
+    pins the minItems Pydantic message so the envelope names WHICH constraint failed (matching
+    the floor of the MCP-only sibling ``test_mcp_typeadapter_validation_envelope.py``), and the
+    raw-leak guard runs on the A2A/REST arms that sibling never exercised. Deliberately does NOT
+    assert ``field == f"filters.{field}"`` — that field position holds on MCP only.
+
+    Coupling note (catalog P40): ``message_substr`` pins Pydantic's minItems phrasing, which is
+    framework-internal — a Pydantic/adcp-SDK reword would redden all wire arms at once. It is
+    kept because MCP is leaf-only and carries no AdCP-authored text naming the constraint, so
+    this fragment is the only cross-transport signal for WHICH constraint failed; the code +
+    suggestion + raw-leak assertions are pinned independently and hold without it. Removable
+    once the validation boundary emits a stable in-house constraint fragment on every transport.
     """
-    env.call_via(transport, filters={field: []}).assert_wire_error("VALIDATION_ERROR", require_suggestion=True)
+    result = env.call_via(transport, filters={field: []})
+    result.assert_wire_error("VALIDATION_ERROR", require_suggestion=True, message_substr="List should have")
+    envelope = result.wire_error_envelope
+    assert envelope is not None  # narrowed by assert_wire_error above; re-pinned for the reader below
+    assert_no_raw_validation_leak(envelope["errors"][0]["message"])
 
 
 def make_creative_dict(creative_id: str = "c1", name: str = "Test Banner") -> dict:

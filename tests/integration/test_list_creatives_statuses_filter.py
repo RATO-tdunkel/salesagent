@@ -9,15 +9,16 @@ filter like ``["approved", "rejected"]`` had it silently narrowed to ``["approve
 received FEWER creatives than ``filters_applied`` claimed. The report did not match the
 scoped result set.
 
-The fix mirrors the ``concept_ids`` thread-into-query pattern (#1493): the structured
+The fix mirrors the ``concept_ids`` thread-into-query pattern (#1407): the structured
 ``statuses`` value (into which the flat ``status`` is already folded, flat-wins, by
 ``_build_list_creatives_request``) is threaded in full into
 ``CreativeRepository.get_by_principal`` and applied via ``Creative.status.in_(...)``.
 
-Spec: AdCP 3.1.1 ``core/creative-filters.json`` — ``statuses`` is an array filter with
-match-any semantics (grounded in the array/minItems:1 shape and the file's top-level
-archived-by-default description, not a verbatim per-field phrase). Verified on every wire
-transport (a2a/mcp/rest); the structured filters object reaches all three after #1493.
+The ``statuses`` match-any semantics and their spec grounding are stated once at the
+enforcement site — ``CreativeRepository.get_by_principal``'s ``Creative.status.in_(...)``
+in ``src/core/database/repositories/creative.py``; see that comment rather than
+re-deriving it here. Verified on every wire transport (a2a/mcp/rest); the structured
+filters object reaches all three after #1407.
 """
 
 import pytest
@@ -30,8 +31,12 @@ pytestmark = [pytest.mark.integration, pytest.mark.requires_db]
 
 
 def _returned_creative_ids(result: TransportResult) -> set[str]:
-    """The set of creative_ids in the success-path wire response."""
-    return {c["creative_id"] for c in result.wire_response["creatives"]}
+    """The set of creative_ids in the success-path wire response.
+
+    Reads through the guarded ``require_wire()`` accessor so a wire-absent path fails
+    transport-named instead of raising an opaque ``TypeError`` on ``None`` subscript.
+    """
+    return {c["creative_id"] for c in result.require_wire()["creatives"]}
 
 
 class TestStatusesFilterApplied:
@@ -64,10 +69,19 @@ class TestStatusesFilterApplied:
     def test_multi_value_statuses_matches_any(self, integration_db, transport):
         """statuses=["approved","rejected"] returns both; a third-status creative is excluded.
 
-        This is the case that grades the fix: pre-fix the array was narrowed to its first
-        element (``["approved"]``), so the rejected creative was dropped and the buyer got
-        fewer creatives than filters_applied claimed. Reverting the full-list threading
-        (back to ``statuses[0]``) reddens here.
+        This is the multi-value case that grades BOTH halves of the #1502 bug:
+
+        1. Scoping — pre-fix the array was narrowed to its first element (``["approved"]``),
+           so the rejected creative was dropped. The returned-id assertion reddens on that.
+        2. Reporting — ``filters_applied`` echoed the whole array while the query used only
+           the first status, so the report over-claimed relative to the result set. The
+           ``filters_applied`` assertion pins the FULL applied list on the wire, so a
+           regression that emits only ``statuses=approved`` (first element) into the report
+           while leaving the query correct reddens here too. (The single-value
+           ``test_filters_applied_matches_scoped_results`` cannot catch that — report and
+           result already agree when the array has one element.)
+
+        Reverting the full-list threading (back to ``statuses[0]``) reddens both.
         """
         with CreativeListEnv() as env:
             tenant, principal = env.setup_default_data()
@@ -80,6 +94,12 @@ class TestStatusesFilterApplied:
             assert not result.is_error, f"{transport}: {result.error!r}"
             assert _returned_creative_ids(result) == {approved, rejected}, (
                 f"{transport}: expected only the two matching statuses"
+            )
+            # Reporting half: filters_applied must echo the FULL applied list, not just the
+            # first status — this is the oracle for the report-over-claims-result regression.
+            filters_applied = result.require_wire()["query_summary"]["filters_applied"]
+            assert "statuses=approved,rejected" in filters_applied, (
+                f"{transport}: filters_applied must report the full applied statuses list, got {filters_applied}"
             )
 
 
@@ -103,7 +123,7 @@ class TestStatusesFilterReportedTruthfully:
             result = env.call_via(transport, filters={"statuses": ["approved"]})
 
             assert not result.is_error, f"{transport}: {result.error!r}"
-            filters_applied = result.wire_response["query_summary"]["filters_applied"]
+            filters_applied = result.require_wire()["query_summary"]["filters_applied"]
             # Reported as the enum value ("approved") — the coerced list the query used.
             assert "statuses=approved" in filters_applied, f"{transport}: {filters_applied}"
             # ...and the report is truthful: the scoped set matches what was claimed.

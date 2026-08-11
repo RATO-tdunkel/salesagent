@@ -149,6 +149,27 @@ class TransportResult:
     def is_error(self) -> bool:
         return self.error is not None
 
+    def require_wire(self) -> dict[str, Any]:
+        """The success-path ``wire_response``, or a transport-named failure if absent.
+
+        ``wire_response`` is ``dict[str, Any] | None`` — ``None`` on IMPL (no wire by
+        definition) and whenever a dispatcher did not stash the serialized body.
+        Success-path consumers that subscript it directly would otherwise raise an
+        opaque ``TypeError: 'NoneType' object is not subscriptable`` with no transport
+        context. This narrows the optional in one place, failing with the transport name
+        so a wire-absent regression is legible — the success-path analogue of the
+        ``wire_error_envelope`` check inside ``assert_wire_error``. Every dispatcher
+        records its transport in ``envelope["transport"]``, so the message names it.
+        """
+        if self.wire_response is None:
+            transport = self.envelope.get("transport", "unknown transport")
+            raise AssertionError(
+                f"{transport}: no success-path wire_response captured "
+                f"(is_error={self.is_error}, payload={self.payload!r}). The env did not "
+                "stash the serialized wire for this transport, or the operation errored."
+            )
+        return self.wire_response
+
     def assert_wire_error(
         self,
         code: str,

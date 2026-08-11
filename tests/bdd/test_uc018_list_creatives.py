@@ -76,7 +76,7 @@ is exercised faithfully.
 
 from __future__ import annotations
 
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from pytest_bdd import given, parsers, scenarios, then, when
 
@@ -84,6 +84,9 @@ from tests.bdd.steps._outcome_helpers import _require_response
 from tests.bdd.steps.generic._auth import authenticate_env_as
 from tests.harness.transport import Transport
 from tests.helpers.pinned_schema import validate_against_pinned_schema
+
+if TYPE_CHECKING:
+    from src.core.database.models import Principal, Tenant
 
 # Three genuinely-different formats (display / video / audio) for the "three
 # different formats" precondition. All three are in the standard format registry:
@@ -100,8 +103,8 @@ scenarios("features/BR-UC-018-list-creatives.feature")
 
 
 def _seed_creative(
-    tenant: Any,
-    principal: Any,
+    tenant: Tenant,
+    principal: Principal,
     fmt: str | None = None,
     *,
     status: str = "approved",
@@ -136,7 +139,7 @@ def _seed_creative(
 # ── Given ────────────────────────────────────────────────────────────
 
 
-def _get_or_create_tenant_and_principal(env: Any) -> tuple[Any, Any]:
+def _get_or_create_tenant_and_principal(env: Any) -> tuple[Tenant, Principal]:
     """Idempotently seed the env's tenant + principal (shared e2e_rest DB).
 
     Rationale on ``get_or_create`` (jdy1-M3, #1418): a prior e2e_rest scenario's
@@ -161,7 +164,7 @@ def _get_or_create_tenant_and_principal(env: Any) -> tuple[Any, Any]:
     return tenant, principal
 
 
-def _fresh_tenant(env: Any, prefix: str) -> Any:
+def _fresh_tenant(env: Any, prefix: str) -> Tenant:
     """Create a fresh uniquely-named tenant, switch *env* to it, and return it.
 
     Scenarios that pin exact counts (the @BR-RULE-034 isolation invariants and the
@@ -571,9 +574,10 @@ def then_none_belong_to(ctx: dict, principal_id: str) -> None:
 # ── @BR-RULE-146 statuses-filter invariants (#1502) ─────────────────────
 #
 # BR-RULE-146: filters.statuses is a match-any array — a creative is returned iff its
-# status is one of the requested statuses (AdCP 3.1.1 core/creative-filters.json — the
-# array/minItems:1 shape plus the file's top-level archived-by-default description; the
-# per-field description is only "Filter by creative approval statuses"). Wired
+# status is one of the requested statuses. The semantics and their spec grounding are
+# stated once at the enforcement site (CreativeRepository.get_by_principal's
+# Creative.status.in_(...)); this suite grades the behavior against the pinned schema
+# snapshot (v3.1-04f59d2d5 core/creative-filters.json, statuses). Wired
 # (explicit-statuses success path):
 #   inv-146-2-holds     statuses ["archived"]            -> only archived
 #   inv-146-2-violated  statuses ["approved"]            -> approved, none archived

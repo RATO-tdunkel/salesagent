@@ -3441,8 +3441,11 @@ def _harness_env(request: pytest.FixtureRequest, ctx: dict) -> Generator[None, N
             pytest.xfail("T-UC-018-ext-c list_creatives validation harness wiring is tracked in #1652")
         elif "T-UC-018-inv-146-1-holds" in marker_names:
             pytest.xfail(
-                "BR-RULE-146 INV-1 (no-filter archival-DEFAULT exclusion) is an unimplemented "
-                "production feature tracked in #1738, not a test-wiring gap"
+                "BR-RULE-146 INV-1 (no-filter archival-DEFAULT exclusion) is dormant for two "
+                "reasons: (1) the archival-default exclusion is an unimplemented production "
+                "feature (#1738), and (2) its 'list_creatives request with no filters' When "
+                "phrasing has no UC-018 step binding yet. Both the #1738 implementation and the "
+                "When binding must land before this scenario can grade a real red."
             )
         else:
             pytest.xfail(

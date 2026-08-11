@@ -370,6 +370,107 @@ def when_sync_key_boundary(ctx: dict, transport: str, key: str, account_id: str)
 
 
 # ═══════════════════════════════════════════════════════════════════════
+# When — @bva request-validation boundary outlines (#1329 R9-F1 / Konstantin item 1)
+# ═══════════════════════════════════════════════════════════════════════
+#
+# These wire the @sync @bva boundary outlines whose rows are all REQUEST-VALIDATION cases (no
+# account seeding): the request is dispatched over the parametrized wire and graded by
+# then_request_verdict. The construction-time boundary grades in TestSyncGovernanceBoundaryValues
+# stay; this adds the missing WIRE grade the round-8 xfail gate withheld. Outlines with a
+# response-shape row (credentials "present on response", per-account status enum) or a deferred
+# replay row (idempotency_key) stay xfailed in the conftest UC-030 branch — they need seeding or
+# an unimplemented feature, not just request validation.
+
+# A well-formed agent; only the boundary-under-test deviates from it.
+_BVA_CREDS = "x" * 64
+
+
+def _bva_agent(**overrides: Any) -> dict[str, Any]:
+    agent: dict[str, Any] = {"url": DEFAULT_URL, "authentication": {"schemes": ["Bearer"], "credentials": _BVA_CREDS}}
+    agent.update(overrides)
+    return agent
+
+
+@when(
+    parsers.parse(
+        'the Buyer Agent sends a sync_governance request exercising the governance_agents boundary case "{boundary}"'
+    )
+)
+def when_bva_governance_agents(ctx: dict, boundary: str) -> None:
+    agents = {
+        "governance_agents has 0 entries": [],
+        "governance_agents has 2 entries": [_bva_agent(), _bva_agent()],
+    }[boundary]
+    _dispatch(ctx, "", idempotency_key=_VALID_KEY, accounts=[_account_entry("acct-bva", agents)])
+
+
+@when(
+    parsers.parse('the Buyer Agent sends a sync_governance request exercising the accounts boundary case "{boundary}"')
+)
+def when_bva_accounts(ctx: dict, boundary: str) -> None:
+    n = {"accounts has 0 entries": 0, "accounts has 100 entries": 100, "accounts has 101 entries": 101}[boundary]
+    accounts = [_account_entry(f"acct-bva-{i}", [_bva_agent()]) for i in range(n)]
+    _dispatch(ctx, "", idempotency_key=_VALID_KEY, accounts=accounts)
+
+
+@when(
+    parsers.parse(
+        "the Buyer Agent sends a sync_governance request exercising the authentication.schemes "
+        'boundary case "{boundary}"'
+    )
+)
+def when_bva_auth_schemes(ctx: dict, boundary: str) -> None:
+    auth: dict[str, Any] = {
+        "exactly one valid scheme": {"schemes": ["Bearer"], "credentials": _BVA_CREDS},
+        "empty array (0 items)": {"schemes": [], "credentials": _BVA_CREDS},
+        "two items": {"schemes": ["Bearer", "Bearer"], "credentials": _BVA_CREDS},
+        "single item outside enum": {"schemes": ["definitely-not-a-scheme"], "credentials": _BVA_CREDS},
+        "schemes absent": {"credentials": _BVA_CREDS},
+    }[boundary]
+    _dispatch(ctx, "", idempotency_key=_VALID_KEY, accounts=[_account_entry("acct-bva", [_bva_agent(authentication=auth)])])
+
+
+@when(
+    parsers.parse('the Buyer Agent sends a sync_governance request exercising the url boundary case "{boundary}"')
+)
+def when_bva_url(ctx: dict, boundary: str) -> None:
+    auth = {"schemes": ["Bearer"], "credentials": _BVA_CREDS}
+    if boundary == "https:// URL":
+        agent = _bva_agent()
+    elif boundary == "http:// URL (plaintext)":
+        agent = {"url": "http://governance.example.com/hook", "authentication": auth}
+    elif boundary == "non-uri string":
+        agent = {"url": "not-a-uri", "authentication": auth}
+    elif boundary == "url absent":
+        agent = {"authentication": auth}
+    else:
+        raise AssertionError(f"unknown url boundary {boundary!r}")
+    _dispatch(ctx, "", idempotency_key=_VALID_KEY, accounts=[_account_entry("acct-bva", [agent])])
+
+
+@then(parsers.parse('the request verdict is "{verdict}"'))
+def then_request_verdict(ctx: dict, verdict: str) -> None:
+    """Grade a @bva request-validation boundary on the real wire.
+
+    ``invalid`` → a top-level VALIDATION_ERROR envelope (mutation: relax the boundary check and
+    this reddens). ``valid`` → the request is ACCEPTED at the validation boundary; the response is
+    the success variant (an unseeded account then fails per-account resolution, which is NOT a
+    top-level error), so assert the dispatch did not error (#1329 R9-F1).
+    """
+    result = ctx["result"]
+    if verdict == "invalid":
+        result.assert_wire_error("VALIDATION_ERROR")
+    elif verdict == "valid":
+        assert not result.is_error, (
+            "a boundary-valid request must be accepted at validation (per-account resolution may "
+            "still fail on an unseeded account — the success variant, not a top-level error); "
+            f"got wire error {result.wire_error_envelope!r}"
+        )
+    else:
+        raise AssertionError(f"unknown request verdict {verdict!r}")
+
+
+# ═══════════════════════════════════════════════════════════════════════
 # Then — response variant / per-account / echo (wire assertions)
 # ═══════════════════════════════════════════════════════════════════════
 

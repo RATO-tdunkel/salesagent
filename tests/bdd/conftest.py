@@ -3467,16 +3467,30 @@ def _harness_env(request: pytest.FixtureRequest, ctx: dict) -> Generator[None, N
                 "check_governance (governance enforcement) is an undeclared capability "
                 "(governance-aware-seller) — out of scope for the sync_governance PR (#1329)"
             )
-        # Boundary-value abstract-"verdict" outlines: the generic verdict-step wiring is a
-        # follow-up. The boundary VALUES themselves (schemes empty/two/outside-enum/absent,
-        # credentials absent, url non-uri/absent, accounts 100) are graded at construction
-        # time by tests/unit/test_sync_governance.py::TestSyncGovernanceBoundaryValues — NOT
-        # by the T-UC-030-sync-* scenarios, which exercise one nominal value each (#1329).
-        if "bva" in marker_names:
-            pytest.xfail(
-                "BR-UC-030 @bva abstract verdict-step wiring deferred (#1329); boundary values "
-                "graded at construction time by TestSyncGovernanceBoundaryValues"
-            )
+        # @sync @bva boundary outlines whose rows are all REQUEST-VALIDATION cases
+        # (governance_agents/accounts cardinality, authentication.schemes, governance agent url)
+        # are now WIRED to grade the boundary on the real wire — uc030_governance.py's when_bva_*
+        # steps + then_request_verdict. The remaining @bva outlines are deferred here because
+        # their rows need account seeding (a RESPONSE-shape grade) or an unimplemented feature
+        # (idempotency replay), not just request validation; the boundary VALUES themselves stay
+        # graded at construction time by TestSyncGovernanceBoundaryValues (#1329).
+        _UC030_BVA_DEFERRED: dict[str, str] = {
+            "T-UC-030-bva-idempotency-key": (
+                "idempotency replay/conflict (same key + identical/divergent payload) not implemented "
+                "— spec-production gap (#1329)"
+            ),
+            "T-UC-030-bva-credentials": (
+                "the 'credentials present on response' row is a RESPONSE-shape grade needing a seeded "
+                "account — account-sync-family e2e realize follow-up (#1329)"
+            ),
+            "T-UC-030-bva-sync-account-status": (
+                "per-account status enum is a RESPONSE-shape grade needing a seeded account — "
+                "account-sync-family e2e realize follow-up (#1329)"
+            ),
+        }
+        for tag, reason in _UC030_BVA_DEFERRED.items():
+            if tag in marker_names:
+                pytest.xfail(reason)
         _UC030_XFAIL_TAGS: dict[str, str] = {
             # NOTE: T-UC-030-sync-happy is NOT xfailed at the scenario level. Its only gap is
             # POST-S4 (adcp_version not echoed on sync responses); moving that xfail INTO the

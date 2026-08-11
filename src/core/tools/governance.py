@@ -76,6 +76,7 @@ from src.core.schemas.account import (
     SyncGovernanceResponseAccount,
 )
 from src.core.tool_context import ToolContext
+from src.core.tools._mcp import mcp_result
 from src.core.transport_helpers import resolve_identity_from_context
 from src.core.validation_helpers import adcp_validation_boundary
 
@@ -335,7 +336,11 @@ async def sync_governance(
     req = build_sync_governance_request(accounts=accounts, context=context, ext=ext, idempotency_key=idempotency_key)
     identity = (await ctx.get_state("identity")) if isinstance(ctx, Context) else None
     response = await _sync_governance_impl(req, identity)
-    return ToolResult(content=str(response), structured_content=response)
+    # mcp_result() is the single ToolResult builder (GH #1710): it serializes
+    # structured_content via model_dump(mode="json") so Pattern #4 nested serialization and
+    # AdCPBaseModel's exclude_none default hold — a raw model here would re-leak spec-optional
+    # nulls onto the wire.
+    return mcp_result(response)
 
 
 # ---------------------------------------------------------------------------

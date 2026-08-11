@@ -11,8 +11,10 @@ Out of scope (routed to ``_UC030_XFAIL_TAGS`` in conftest, not stepped here):
   agent deliberately does not declare (``governance-aware-seller``).
 - Idempotency replay / IDEMPOTENCY_CONFLICT and per-operation scope
   (PERMISSION_DENIED) grade behavior this PR defers.
-- ``@bva`` abstract-verdict outlines are covered concretely by the ``T-UC-030-sync-*``
-  scenarios; their generic verdict-step wiring is a follow-up.
+- ``@sync @bva`` request-validation boundary outlines (cardinality, schemes, url) ARE
+  wired here (``when_bva_*`` + ``then_request_verdict``); the ``@bva`` outlines that need
+  account seeding (response-shape rows) or an unimplemented feature (idempotency replay)
+  stay deferred in the conftest UC-030 branch.
 
 Reuses the shared auth Givens ("the Buyer Agent has an authenticated/unauthenticated
 connection") and the generic ``the error code is "X"`` step (uc011_accounts), which
@@ -427,12 +429,12 @@ def when_bva_auth_schemes(ctx: dict, boundary: str) -> None:
         "single item outside enum": {"schemes": ["definitely-not-a-scheme"], "credentials": _BVA_CREDS},
         "schemes absent": {"credentials": _BVA_CREDS},
     }[boundary]
-    _dispatch(ctx, "", idempotency_key=_VALID_KEY, accounts=[_account_entry("acct-bva", [_bva_agent(authentication=auth)])])
+    _dispatch(
+        ctx, "", idempotency_key=_VALID_KEY, accounts=[_account_entry("acct-bva", [_bva_agent(authentication=auth)])]
+    )
 
 
-@when(
-    parsers.parse('the Buyer Agent sends a sync_governance request exercising the url boundary case "{boundary}"')
-)
+@when(parsers.parse('the Buyer Agent sends a sync_governance request exercising the url boundary case "{boundary}"'))
 def when_bva_url(ctx: dict, boundary: str) -> None:
     auth = {"schemes": ["Bearer"], "credentials": _BVA_CREDS}
     if boundary == "https:// URL":
@@ -648,9 +650,7 @@ def then_per_account_suggestion(ctx: dict, field: str) -> None:
                 f"got {values} for account {acct.get('account')}"
             )
         else:
-            assert all(e.get(field) for e in errs), (
-                f"each per-account error must include a non-empty {field!r}: {acct}"
-            )
+            assert all(e.get(field) for e in errs), f"each per-account error must include a non-empty {field!r}: {acct}"
 
 
 # ═══════════════════════════════════════════════════════════════════════

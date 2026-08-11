@@ -22,7 +22,7 @@ from tests.unit._architecture_helpers import assert_violations_match_allowlist, 
 
 # Repo root anchored to THIS file, not the cwd: a cwd-relative path made the guard
 # vacuous when pytest ran from src/ (every module file "not found" → no call-arg sets →
-# green while scanning nothing). Mirrors test_architecture_repository_pattern (#1682 review G).
+# green while scanning nothing). Mirrors test_architecture_repository_pattern (#1329).
 ROOT = Path(__file__).resolve().parents[2]
 TOOLS_DIR = ROOT / "src/core/tools"
 
@@ -112,7 +112,7 @@ def _find_impl_call_args_in_function(file_path: Path, wrapper_name: str, impl_na
     Loud, not vacuous: this is only called for a REGISTERED wrapper, so a missing file or
     an un-findable wrapper function is a real regression (moved/renamed/dynamically built),
     not a reason to silently pass — mirror the loud assert in test_no_toolerror_in_impl
-    (#1682 review I2). The old ``return []`` here let a wrapper that stopped calling its
+    (#1329). The old ``return []`` here let a wrapper that stopped calling its
     _impl by name pass with zero call-arg sets checked.
     """
     assert file_path.exists(), f"registered wrapper file not found (moved/renamed?): {file_path}"
@@ -133,7 +133,7 @@ def _find_impl_call_args_in_function(file_path: Path, wrapper_name: str, impl_na
 
     assert wrapper_node is not None, (
         f"registered wrapper function '{wrapper_name}' not found in {file_path} — "
-        f"the boundary-completeness guard cannot check a wrapper it cannot locate (#1682 review I2)"
+        f"the boundary-completeness guard cannot check a wrapper it cannot locate (#1329)"
     )
 
     # Find _impl calls within the wrapper function body
@@ -166,10 +166,10 @@ def _check_wrapper_completeness(
 
     # A REGISTERED wrapper that never calls its _impl by name is the exact vacuity this
     # guard exists to prevent — the boundary would be checking nothing. Fail loud rather
-    # than the old silent ``return []`` (#1682 review I2).
+    # than the old silent ``return []`` (#1329).
     assert call_arg_sets, (
         f"{wrapper_kind.upper()} wrapper '{wrapper_name}' in {wrapper_module} does not call "
-        f"{impl_name} by name — the boundary-completeness check would be vacuous for it (#1682 review I2)"
+        f"{impl_name} by name — the boundary-completeness check would be vacuous for it (#1329)"
     )
 
     violations = []

@@ -34,6 +34,40 @@ def test_first_validation_error_field_is_owned_by_exception_leaf_module():
     assert first_validation_error_field.__module__ == "src.core.exceptions"
 
 
+def test_first_validation_error_field_strips_generated_union_variant_segments():
+    """A codegen union-variant class name must not reach the buyer-facing field path.
+
+    Pydantic inserts the matched union member class name (e.g. AccountReference1) as a loc
+    segment; the buyer's payload has no such path. The field must be the real dotted path
+    (account.account_id), not account.AccountReference1.account_id (#1329 R9-G3).
+    """
+    from src.core.schemas import SyncGovernanceRequest
+
+    with pytest.raises(ValidationError) as exc_info:
+        # A non-string account_id fails the AccountReferenceById arm; the loc carries the
+        # generated variant tag AccountReference1 between `account` and `account_id`.
+        SyncGovernanceRequest(
+            idempotency_key="k" * 32,
+            accounts=[
+                {
+                    "account": {"account_id": 123},
+                    "governance_agents": [
+                        {
+                            "url": "https://agent.example.com/hook",
+                            "authentication": {"schemes": ["adcp_bearer"], "credentials": "c" * 32},
+                        }
+                    ],
+                }
+            ],
+        )
+
+    field = first_validation_error_field(exc_info.value)
+    assert field is not None
+    assert "AccountReference" not in field, field
+    # The stripped path is a real dotted path into the buyer's request.
+    assert field.startswith("accounts[0].account"), field
+
+
 def test_create_media_buy_boundary_validation_preserves_field_suggestion():
     """Boundary request construction keeps the current field-specific hint."""
     from src.core.tools.media_buy_create import _build_create_media_buy_request
@@ -142,7 +176,7 @@ def test_validation_error_formatting_extra_field_redacts_innocuous_scalar():
 
     The value is withheld for EVERY extra_forbidden rejection, not only
     credential-shaped ones: a deny-list cannot enumerate buyer-invented names, so the
-    only safe policy is to never echo (#1682 review C). The actionable field PATH
+    only safe policy is to never echo (#1329). The actionable field PATH
     always survives.
     """
     try:
@@ -170,7 +204,7 @@ def test_validation_error_formatting_extra_field_with_dict_redacted():
     """An extra field with a dict value is redacted too — the structure could nest a secret.
 
     A value scan cannot prove a dict is credential-free (a list-of-pairs or a
-    buyer-invented key escapes it), so the whole value is withheld (#1682 review C).
+    buyer-invented key escapes it), so the whole value is withheld (#1329).
     """
     try:
         raise ValidationError.from_exception_data(
@@ -200,7 +234,7 @@ def test_validation_error_redacts_declared_field_name_misplaced():
     Redact-all makes the former deny-list's over-match moot: declared field names that
     happened to contain a fragment (``keywords`` -> ``key``, ``idempotency_key``) no
     longer get special treatment — every extra_forbidden value is withheld the same way
-    (#1682 review C).
+    (#1329).
     """
     try:
         raise ValidationError.from_exception_data(
@@ -228,7 +262,7 @@ def test_validation_error_redacts_credential_under_authentication():
     format_validation_error feeds errors[0].message, which reaches the buyer wire
     (REST/A2A) and the error-log + audit sinks. A buyer typo (`credential` for
     `credentials`) still carries the bearer token; redact-all withholds the value while
-    the actionable field PATH is preserved (#1682 review C, was BLOCKER A).
+    the actionable field PATH is preserved (#1329, was BLOCKER A).
     """
     secret = "SUPERSECRETcredential00000000000000"
     try:
@@ -257,7 +291,7 @@ def test_validation_error_redacts_nested_secret_under_unknown_field():
 
     The offending loc segment is innocuous and the value nests a sensitive key several
     levels deep — redact-all withholds it without needing to detect the nesting
-    (#1682 review C).
+    (#1329).
     """
     secret = "NESTEDbearerSECRET00000000000000000"
     try:
@@ -300,7 +334,7 @@ def test_validation_error_redacts_credential_shaped_sibling_of_url(field_name):
     Names like api_key/access_token/client_secret/private_key placed NOT under
     ``authentication`` but as a plain scalar sibling would defeat any nested-key scan;
     redact-all withholds them regardless. A deny-list could never enumerate this open
-    set, which is why the policy redacts every value (#1682 review C).
+    set, which is why the policy redacts every value (#1329).
     """
     secret = "sk-live-" + "z" * 40
     try:

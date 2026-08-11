@@ -1,7 +1,7 @@
 """Unit tests for the envelope-assertion helper's field pinning.
 
 Guards the ``field=`` (exact, both layers) vs ``field_substr=`` (substring, one
-layer) distinction added in #1682 review D: a substring token like
+layer) distinction added in #1329: a substring token like
 ``governance_agents`` is a prefix of several governance field paths and stays
 green on a field wrong for the scenario, so field-level assertions should prefer
 exact ``field=``.

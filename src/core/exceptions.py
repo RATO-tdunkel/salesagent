@@ -1033,6 +1033,21 @@ INVALID_REQUEST_SUGGESTION = "check request parameters and fix"
 VALIDATION_ERROR_SUGGESTION = "review error details and fix field values"
 
 
+def _is_generated_union_variant_segment(loc: str) -> bool:
+    """True if a Pydantic ``loc`` segment is a codegen union-variant CLASS name.
+
+    Pydantic inserts the matched union member's class name as a ``loc`` segment for
+    tagged / smart unions — e.g. ``AccountReference1``/``AccountReference2`` for the
+    ``AccountReference`` union, ``Accounts``/``Accounts3`` for ``SyncAccountsRequest``. That
+    name is NOT a path into the buyer's request (their payload has ``account.account_id``,
+    never ``account.AccountReference1.account_id``), so it must not reach the buyer-facing
+    ``field``. AdCP request field names are snake_case (lowercase, underscores), so a
+    segment beginning with an uppercase letter and containing no underscore is a generated
+    artifact, not a real field (#1329 R9-G3).
+    """
+    return bool(loc) and loc[0].isupper() and "_" not in loc
+
+
 def first_validation_error_field(validation_error: ValidationError) -> str | None:
     """Return the bracket-notation path of the first Pydantic error, or ``None``.
 
@@ -1041,6 +1056,8 @@ def first_validation_error_field(validation_error: ValidationError) -> str | Non
     field path instead of only the rendered message. List indices render as
     ``[i]`` so boundary-derived paths such as ``packages[0].budget`` align with
     the ``packages[].budget`` field strings raised by the implementation layer.
+    Generated union-variant class segments are dropped so a union-typed field points
+    at the buyer's real path, not a codegen tag (#1329 R9-G3).
     """
     errors = validation_error.errors()
     if not errors:
@@ -1049,6 +1066,8 @@ def first_validation_error_field(validation_error: ValidationError) -> str | Non
     for loc in errors[0]["loc"]:
         if isinstance(loc, int):
             parts.append(f"[{loc}]")
+        elif isinstance(loc, str) and _is_generated_union_variant_segment(loc):
+            continue
         elif parts:
             parts.append(f".{loc}")
         else:

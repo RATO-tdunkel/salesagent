@@ -41,7 +41,7 @@ PATTERN_A_PER_FILE_CAP: dict[str, int] = {}
 # ``Error(code=...)`` site (a success-envelope ``errors[]`` entry) from the cap above —
 # but a free-form marker has no counter, so the number of SUPPRESSED sites could grow
 # invisibly. Ratchet the marked-site count per file so a NEW advisory ``Error()`` site is
-# a deliberate, reviewed change, not a silent suppression (#1682 review I3). Only shrinks.
+# a deliberate, reviewed change, not a silent suppression (#1329). Only shrinks.
 MARKED_PATTERN_A_SITES: dict[str, int] = {
     "src/core/tools/accounts.py": 2,
     "src/core/tools/governance.py": 1,
@@ -61,7 +61,7 @@ def _pattern_a_site_lines(filepath: Path, *, keep_marked: bool) -> list[int]:
     ``keep_marked=False`` returns the UNMARKED sites (the capped Pattern-A sites);
     ``keep_marked=True`` returns only the ``# structural-guard:``-marked sites (the
     legitimate per-item advisory results in a success envelope). A single scan with the
-    marker check inverted keeps the two counters in lockstep (#1682 review I3).
+    marker check inverted keeps the two counters in lockstep (#1329).
     """
     from tests.unit._architecture_helpers import collect_error_aliases
 
@@ -140,7 +140,7 @@ class TestNoErrorConstructionInImpl:
     def test_marked_advisory_error_sites_ratcheted(self):
         """The count of ``# structural-guard:``-suppressed ``Error()`` sites only shrinks.
 
-        A free-form suppression marker has no counter (#1682 review I3): without this
+        A free-form suppression marker has no counter (#1329): without this
         ratchet a new advisory ``Error(code=...)`` site could be added invisibly, since
         the marker excludes it from the Pattern-A cap. Assert no file exceeds its recorded
         marked-site count and no new file appears; when a marked site is converted to a

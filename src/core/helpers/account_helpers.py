@@ -8,6 +8,7 @@ beads: salesagent-8n4
 
 from __future__ import annotations
 
+import logging
 from typing import Any
 
 from adcp.types import AccountReference, AccountReferenceById, AccountReferenceByNaturalKey
@@ -21,8 +22,11 @@ from src.core.exceptions import (
     AdCPAccountSetupRequiredError,
     AdCPAccountSuspendedError,
     AdCPAuthorizationError,
+    AdCPConfigurationError,
 )
 from src.core.resolved_identity import ResolvedIdentity
+
+logger = logging.getLogger(__name__)
 
 # The billing parties this seller can bill at the ACCOUNT level. The accounts.billing
 # CHECK constraint (ck_accounts_billing) permits only these, so this is the honest,
@@ -51,23 +55,30 @@ def resolve_supported_billing(tenant: dict[str, Any] | None) -> list[BillingPart
     * a configured list with ≥1 account-billable party → that intersection (a tenant may
       narrow, and any non-account party such as ``advertiser`` is dropped for this
       context, never advertised as account-billable).
-    * an explicit empty list ``[]`` → ``[]`` (the seller intentionally supports no account
-      billing; sync_accounts then rejects every billing value — the pre-existing contract).
-    * a NON-empty configured list that declares NO account-billable party (e.g.
-      ``["advertiser"]`` or a typo ``["bogus"]``) → raise. Silently substituting the default
-      would advertise/accept a set the operator did not configure; fail loud so the
-      misconfiguration is fixed, not masked.
+    * ANY explicitly configured list that yields NO account-billable party — an empty
+      list ``[]`` (the pinned 3.1.1 ``account.supported_billing`` is ``minItems: 1``, so an
+      empty declaration is not spec-expressible), a list naming only non-account parties
+      (``["advertiser"]``), or a typo (``["bogus"]``) → raise ``AdCPConfigurationError``
+      (TERMINAL). This is a SELLER misconfiguration the buyer cannot fix; emitting it as a
+      buyer-correctable ``VALIDATION_ERROR`` (which is what a bare ``ValueError`` maps to)
+      would tell the buyer to retry something only the operator can change, and letting
+      ``[]`` through would surface downstream as a confusing ``account.supported_billing``
+      ``minItems`` 400 on the capabilities wire. The operator diagnostic (the configured
+      list + the internal constraint) goes to the LOG; the buyer message stays generic and
+      discloses neither the tenant config nor the constraint identifier (#1329).
     """
     configured = tenant.get("supported_billing") if tenant else None
     if configured is None:
         return list(SELLER_ACCOUNT_BILLING)
     resolved = [BillingParty(v) for v in configured if v in _PERMITTED_ACCOUNT_BILLING]
-    if configured and not resolved:
-        raise ValueError(
-            f"tenant supported_billing {list(configured)} declares no account-billable party; "
-            f"accounts.billing accepts only {sorted(_PERMITTED_ACCOUNT_BILLING)} "
-            f"(ck_accounts_billing) — fix the tenant's supported_billing configuration"
+    if not resolved:
+        logger.error(
+            "tenant supported_billing %r declares no account-billable party; accounts.billing "
+            "accepts only %s (ck_accounts_billing) — fix the tenant's supported_billing configuration",
+            list(configured),
+            sorted(_PERMITTED_ACCOUNT_BILLING),
         )
+        raise AdCPConfigurationError("Seller account-billing configuration is invalid; contact the seller.")
     return resolved
 
 

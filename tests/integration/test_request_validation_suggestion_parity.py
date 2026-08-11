@@ -189,7 +189,7 @@ class TestSyncAccountsA2ASuggestionParity:
 class TestSyncGovernanceSuggestionParity:
     """sync_governance request-validation must carry a top-level suggestion on A2A + REST.
 
-    Enrols the last sync-family tool absent from this suite (#1682 review C): a missing
+    Enrols the last sync-family tool absent from this suite (#1329): a missing
     idempotency_key is rejected at the shared boundary and the two-layer VALIDATION_ERROR
     envelope must carry error.json's top-level suggestion on both wires.
     """

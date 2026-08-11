@@ -11,8 +11,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Any, TypedDict
 
 from adcp.types.generated_poc.core.account import GovernanceAgent  # url-only DB column model
-from sqlalchemy import cast, select
-from sqlalchemy.dialects.postgresql import JSONB
+from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from src.core.database.models import Account, AgentAccountAccess
@@ -352,22 +351,6 @@ class AccountRepository:
         urls = _serialize_governance_agents(agents) or []
         self._apply_fields(account_id, {"governance_agents": urls})
         return urls
-
-    def get_stored_governance_agents(self, account_id: str) -> list[GovernanceAgentColumn] | None:
-        """Return the RAW stored ``governance_agents`` JSON, bypassing JSONType coercion.
-
-        Casting the column to plain ``JSONB`` skips ``process_result_value``'s per-item
-        ``GovernanceAgent`` (url-only, ``extra='forbid'``) validation, so a caller sees
-        exactly what is on disk: a credential-bearing row is returned as-is instead of
-        raising on read. For the credential-strip verification test (#1329) —
-        regular reads use the typed ``get_by_id().governance_agents``.
-        """
-        return self._session.scalar(
-            select(cast(Account.governance_agents, JSONB)).where(
-                Account.tenant_id == self._tenant_id,
-                Account.account_id == account_id,
-            )
-        )
 
     # ------------------------------------------------------------------
     # AgentAccountAccess methods

@@ -32,7 +32,8 @@ from pydantic_core import ValidationError as CoreValidationError
 
 from src.core.config import get_pydantic_extra_mode
 from src.core.schemas._base import NestedModelSerializerMixin, SalesAgentBaseModel
-from src.core.security.url_validator import check_url_ssrf, strip_url_userinfo
+from src.core.security.url_validator import check_url_ssrf
+from src.core.webhook_validator import webhook_url_for_log
 
 # ---------------------------------------------------------------------------
 # Core domain Account (used in ListAccountsResponse.accounts)
@@ -225,7 +226,8 @@ class SyncGovernanceRequest(LibrarySyncGovernanceRequest):
            host) and which would otherwise be persisted verbatim and echoed on the
            wire. Ordering this gate before the https/SSRF gates guarantees a
            credential-bearing url never reaches a gate whose message renders the url;
-           the https message additionally strips userinfo as defense in depth (#1329).
+           the https message additionally renders via ``webhook_url_for_log`` (userinfo
+           + query + fragment stripped) as defense in depth (#1329).
         2. **https** — the pinned 3.1.1 request schema marks the agent ``url``
            ``pattern: ^https://``, but the generated ``AnyUrl`` field does not carry
            that constraint (SDK codegen gap), so an ``http://`` url would slip
@@ -242,24 +244,32 @@ class SyncGovernanceRequest(LibrarySyncGovernanceRequest):
                 url = agent.url
                 url_str = str(url)
                 loc = ("accounts", a_idx, "governance_agents", g_idx, "url")
+                # A credential can ride in userinfo, the query string, the fragment, or the
+                # path. ``webhook_url_for_log`` (the repo-owned sanitizer, "never credentials
+                # or query") strips userinfo + query + fragment down to ``scheme://host/path``
+                # — strictly stronger than a userinfo-only strip. It is used for BOTH the
+                # rendered message AND the pydantic ``input`` value so no gate below and no
+                # ``str(ValidationError)`` / ``.json()`` consumer can echo a credential (#1329).
+                safe_url = webhook_url_for_log(url_str)
                 # 1. userinfo FIRST — a credential-bearing url must be rejected before any
-                #    gate below renders it (operands checked separately so username-only and
-                #    password-only credentials are both rejected — #1329).
-                if getattr(url, "username", None) or getattr(url, "password", None):
+                #    gate below renders it. Operands read directly (not via ``getattr``
+                #    defaults): ``agent.url`` is an ``AnyUrl``, so a codegen type regression to
+                #    ``str`` must raise ``AttributeError`` loudly here, not silently no-op the
+                #    userinfo gate and let ``https://u:pw@host`` pass (#1329).
+                if url.username or url.password:
                     _raise_governance_url_error(
-                        loc, "governance agent url must not embed userinfo credentials", url_str
+                        loc, "governance agent url must not embed userinfo credentials", safe_url
                     )
-                # 2. https — render a userinfo-stripped url (belt-and-suspenders; gate 1
-                #    already rejected any userinfo-bearing url).
+                # 2. https — show only the sanitized url (gate 1 already rejected userinfo).
                 if not url_str.startswith("https://"):
                     _raise_governance_url_error(
-                        loc, f"governance agent url must use https:// (got '{strip_url_userinfo(url_str)}')", url_str
+                        loc, f"governance agent url must use https:// (got '{safe_url}')", safe_url
                     )
                 # 3. SSRF — reason names the host class, never the url userinfo.
                 ok, reason = check_url_ssrf(url_str, require_https=True, resolve_dns=False)
                 if not ok:
                     _raise_governance_url_error(
-                        loc, f"governance agent url targets a disallowed host: {reason}", url_str
+                        loc, f"governance agent url targets a disallowed host: {reason}", safe_url
                     )
         return self
 

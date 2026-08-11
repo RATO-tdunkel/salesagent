@@ -20,7 +20,7 @@ observable through this discovery call rather than allowed to collapse into a si
 guaranteed-pass.
 
 ctx["env"] is a CapabilitiesEnv (bound by the conftest UC-010 branch).
-#1329 (UC-010) / #1682 review item 1.
+#1329 (UC-010).
 """
 
 from __future__ import annotations
@@ -77,7 +77,7 @@ def then_capabilities_sandbox_flag(ctx: dict, expected: str) -> None:
       requested"): the outline's "invalid" is a REJECTED provisioning request, but this
       discovery endpoint takes no request body, performs no provisioning, and issues no
       rejection — so that outcome is not observable here. Xfailed as ungraded-at-this-boundary
-      rather than left to collapse into a silent guaranteed-pass (#1682 review — vacuous
+      rather than left to collapse into a silent guaranteed-pass (#1329 — vacuous
       partition step).
     """
     if expected == "invalid":

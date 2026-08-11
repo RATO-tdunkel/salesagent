@@ -80,9 +80,9 @@ def _account_id_passed_to_call(func: ast.FunctionDef | ast.AsyncFunctionDef) -> 
     ``print(account_id)``, ``logger.info("%s", account_id)``, ``logger.info(..., extra=account_id)``)
     are skipped: their result is discarded, so passing ``account_id`` to a log/print line
     is not an inspection. Without this, the exemption fired on any call argument — a log
-    line satisfied the guard (#1682 review I1). Deliberately narrower than "the Name appears
+    line satisfied the guard (#1329). Deliberately narrower than "the Name appears
     anywhere in the body": that broader form silently weakened the guard repo-wide for a fix
-    that only needed to cover by-id lookup calls (#1682 review — guard-matcher scope).
+    that only needed to cover by-id lookup calls (#1329 — guard-matcher scope).
     """
 
     def _is_account_id_load(node: ast.expr) -> bool:
@@ -117,9 +117,8 @@ class TestBddStepTextAlignment:
         argument to a call (Load context) — e.g. a by-id lookup helper such as
         ``_wire_account(ctx, account_id)``, whose lookup performs the ref-echo grade itself.
         Requiring only the by-key form was a false positive for helper-mediated inspection: it
-        forced a redundant inline ref-echo assertion at every such call site (#1682 review
-        item 5). The exemption is scoped to a call ARGUMENT (not any Name anywhere in the body,
-        which an incidental f-string/log mention would satisfy — #1682 review, guard-matcher
+        forced a redundant inline ref-echo assertion at every such call site (#1329). The exemption is scoped to a call ARGUMENT (not any Name anywhere in the body,
+        which an incidental f-string/log mention would satisfy — #1329, guard-matcher
         scope). A step that mentions account_id in its text but neither reads it by key nor
         routes it into a call is still flagged.
         """
@@ -168,7 +167,7 @@ def _parse_single_func(src: str) -> ast.FunctionDef | ast.AsyncFunctionDef:
 
 
 class TestAccountIdExemptionSelfTest:
-    """Meta-tests for the ``_account_id_passed_to_call`` exemption (#1682 review I1)."""
+    """Meta-tests for the ``_account_id_passed_to_call`` exemption (#1329)."""
 
     @pytest.mark.parametrize(
         "body",

@@ -67,12 +67,23 @@ def _live_routes() -> set[tuple[str, str]]:
     return routes
 
 
-def _declared_rest_dispatches() -> set[tuple[str, str, str]]:
-    """(env_name, method-lower, endpoint) for every env declaring a non-empty REST_ENDPOINT.
+# A collapsed scan set (import → no-op, or the subclass walk returning nothing) would make
+# every check below pass vacuously, so test_scan_set_is_populated floors this. 12 envs declare
+# a static REST_ENDPOINT today; 10 leaves margin for env churn while still reddening a collapse.
+_MIN_DECLARED_DISPATCHES = 10
 
-    A property-based ``REST_METHOD`` (evaluated per-request, e.g. the media-buy dual
-    env) reads back as a non-str on the class, so its endpoint is checked at the base
-    default verb (``post``) — the verb its non-update path uses.
+
+def _declared_rest_dispatches() -> set[tuple[str, str, str]]:
+    """(env_name, method-lower, endpoint) for every env declaring a STATIC string REST_ENDPOINT.
+
+    Coverage limitation (honest): an env whose ``REST_ENDPOINT`` is a ``@property`` — evaluated
+    per-request, e.g. ``MediaBuyDualEnv`` whose update path yields a concrete
+    ``/api/v1/media-buys/<id>`` — reads back as a non-str on the CLASS, so the ``continue`` below
+    skips it ENTIRELY: it is checked at no verb and no path. (Set-membership against
+    ``_live_routes`` cannot match a templated ``('put', '/api/v1/media-buys/{media_buy_id}')``
+    against a concrete id anyway.) Resolving dynamic envs against ``route.path_format``, or having
+    such envs declare their ``(verb, path)`` pairs on a class attribute this guard can read, is
+    the follow-up that would extend coverage to them (#1329 R9-E2).
     """
     _import_all_harness_modules()
     dispatches: set[tuple[str, str, str]] = set()
@@ -86,20 +97,56 @@ def _declared_rest_dispatches() -> set[tuple[str, str, str]]:
     return dispatches
 
 
-def test_every_harness_rest_endpoint_resolves_to_live_route():
-    """No harness env may declare a REST dispatch that resolves to no live APIRoute."""
-    live = _live_routes()
-    unresolved = {
+def _unresolved(dispatches: set[tuple[str, str, str]], live: set[tuple[str, str]]) -> set[tuple[str, str, str]]:
+    """The dispatches whose (verb, path) resolves to no live route and is not allowlisted.
+
+    Extracted so the detection math is testable directly on a synthetic dispatch set
+    (test_guard_flags_synthetic_verb_path_mismatch), independent of the app route table
+    (#1329 R9-E1).
+    """
+    return {
         (name, method, endpoint)
-        for name, method, endpoint in _declared_rest_dispatches()
+        for name, method, endpoint in dispatches
         if (method, endpoint) not in live and (method, endpoint) not in _KNOWN_UNRESOLVED
     }
+
+
+def test_every_harness_rest_endpoint_resolves_to_live_route():
+    """No harness env may declare a REST dispatch that resolves to no live APIRoute."""
+    unresolved = _unresolved(_declared_rest_dispatches(), _live_routes())
     assert unresolved == set(), (
         f"Harness env(s) declare a REST dispatch that resolves to no live APIRoute: {sorted(unresolved)}. "
         f"A (verb, path) with no matching route falls through to the Flask mount and 404s on the in-network "
         f"leg (#1329). Fix the env's REST_METHOD/REST_ENDPOINT or add the route. Do NOT add to the "
         f"allowlist."
     )
+
+
+def test_scan_set_is_populated():
+    """Floor: a collapsed scan set (no-op import / empty subclass walk) must redden, not pass vacuously.
+
+    Both `_import_all_harness_modules` → no-op and `_declared_rest_dispatches` → set() would make
+    the main check pass with nothing to check; this asserts the scan set is actually populated
+    (#1329 R9-E1).
+    """
+    count = len(_declared_rest_dispatches())
+    assert count >= _MIN_DECLARED_DISPATCHES, (
+        f"Only {count} harness REST dispatches discovered (floor {_MIN_DECLARED_DISPATCHES}) — the scan set "
+        f"collapsed (import no-op or empty subclass walk), which would make the resolution guard vacuous."
+    )
+
+
+def test_guard_flags_synthetic_verb_path_mismatch():
+    """Positive+negative control: the detector flags a bad (verb, path) and passes a live one.
+
+    Grades the DETECTION logic itself (not the route table): a synthetic POST-to-the-GET-only
+    capabilities route must be reported unresolved, while the real GET must pass (#1329 R9-E1).
+    """
+    live = _live_routes()
+    bad = {("SyntheticEnv", "post", "/api/v1/capabilities")}
+    good = {("SyntheticEnv", "get", "/api/v1/capabilities")}
+    assert _unresolved(bad, live) == bad, "detector failed to flag a POST to the GET-only capabilities route"
+    assert _unresolved(good, live) == set(), "detector wrongly flagged a valid GET dispatch"
 
 
 def test_known_unresolved_not_stale():

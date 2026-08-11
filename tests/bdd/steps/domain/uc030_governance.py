@@ -39,8 +39,10 @@ from tests.harness.transport import Transport, _pinned_error_metadata
 from tests.helpers.accounts import seed_account_with_access
 from tests.helpers.governance import (
     DEFAULT_URL,
+    LEAK_SECRET,
     account_entry,
     governance_agent_dict,
+    leaky_governance_agent,
     persisted_governance_urls,
     url_eq,
 )
@@ -87,25 +89,10 @@ def _account_entry(account_id: str, agents: list[dict[str, Any]]) -> dict[str, A
     return account_entry({"account_id": account_id}, agents=agents)
 
 
-# A >=32-char secret used by the credential-channel scenarios. It must NEVER appear in the
-# rejection envelope on the buyer wire — via the URL userinfo (stripped) or via a mistyped
-# extra authentication key (redacted). The exact value is asserted-absent, so it is unique.
-_LEAK_SECRET = "S3cr3t-must-not-leak-0000000000000"
-
-
-def _leaky_agent(channel: str) -> dict[str, Any]:
-    """Build a governance agent that carries ``_LEAK_SECRET`` on the named credential channel."""
-    if channel == "url-userinfo":
-        # Credential embedded in the URL userinfo: rejected by the userinfo gate, whose
-        # message strips userinfo so the secret is never rendered.
-        return _agent(f"https://svc:{_LEAK_SECRET}@governance.example.com/hook")
-    if channel == "extra-authentication-key":
-        # `credential` (singular) is not in the Authentication schema -> extra_forbidden; the
-        # value is redacted so it never reaches the wire (mirrors the integration redaction test).
-        agent = _agent(DEFAULT_URL)
-        agent["authentication"]["credential"] = _LEAK_SECRET
-        return agent
-    raise ValueError(f"Unknown credential channel: {channel!r}")
+# The credential-channel scenarios' leak secret + agent builder are the SHARED
+# tests.helpers.governance.LEAK_SECRET / leaky_governance_agent — one home for the leak
+# contract so this transport-blind BDD grade and the A2A+REST integration grade cannot drift
+# on the secret value or the mistyped-key shape (#1329 R9-K4).
 
 
 def _dispatch(ctx: dict, transport: str, *, identity: Any = "__keep__", **kwargs: Any) -> None:
@@ -292,9 +279,9 @@ def when_sync_leaky_agent(ctx: dict, key: str, account_id: str, channel: str) ->
     reaches the boundary). The leaked secret is stashed for the absence assertion. Transport
     comes from parametrization (a2a/mcp/rest), so this grades every wire.
     """
-    ctx["leaked_secret"] = _LEAK_SECRET
+    ctx["leaked_secret"] = LEAK_SECRET
     ctx["leak_channel"] = channel
-    _dispatch(ctx, "", idempotency_key=key, accounts=[_account_entry(account_id, [_leaky_agent(channel)])])
+    _dispatch(ctx, "", idempotency_key=key, accounts=[_account_entry(account_id, [leaky_governance_agent(channel)])])
 
 
 @when(

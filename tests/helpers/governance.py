@@ -1,7 +1,7 @@
 """Governance test helpers for sync_governance (UC-030 / #1329).
 
 One builder / reader per production boundary the unit, integration, and BDD suites touch, so
-the governance test contract is expressed once rather than N times (#1682 review item 2):
+the governance test contract is expressed once rather than N times (#1329):
 
 - ``account_entry`` — the pinned 3.1.1 request element ``{"account": <ref>, "governance_agents": [...]}``.
 - ``governance_agent_dict`` — one request-side agent (url + write-only authentication).
@@ -22,7 +22,7 @@ from typing import Any
 
 from pydantic import AnyUrl
 
-# Shared request-shape constants for the sync_governance test suites (#1682 review item 4):
+# Shared request-shape constants for the sync_governance test suites (#1329):
 # one governance-agent url + Bearer credentials (>= the schema's minLength 32). Kept here so
 # the unit / integration / BDD suites assert against one source of truth for the pinned
 # 3.1.1 request shape rather than re-declaring these per file.
@@ -31,6 +31,11 @@ GOV_URL = "https://governance.pinnacle-media.com"
 # malformed idempotency_key, unresolvable account) — one shared default across all suites.
 DEFAULT_URL = "https://governance.example.com"
 BEARER_CREDS = "x" * 64
+# A >= 32-char secret for the credential-leak negative channel. It must NEVER appear in the
+# rejection envelope on the buyer wire; the exact value is asserted-absent, so it is unique.
+# ONE constant shared by the BDD and integration leak suites — two copies with different
+# lengths let a length-sensitive redaction regression redden one and not the other (#1329).
+LEAK_SECRET = "S3cr3t-must-not-leak-" + "0" * 40
 
 
 def url_eq(actual: str | None, expected: str) -> bool:
@@ -58,13 +63,36 @@ def governance_agent_dict(
     return {"url": url, "authentication": {"schemes": [scheme], "credentials": creds}}
 
 
+def leaky_governance_agent(channel: str, *, secret: str = LEAK_SECRET) -> dict[str, Any]:
+    """A request-side governance agent carrying ``secret`` on the named credential channel.
+
+    The rejection envelope must NEVER echo ``secret``. One home for the two leak-channel
+    shapes and the exact mistyped-key name, so the BDD (transport-blind) and integration
+    (A2A+REST) leak suites grade the same contract with the SAME secret — two hand-rolled
+    copies with different-length secrets let a length-sensitive redaction regression redden
+    one suite and not the other (#1329 R9-K4). Channels:
+
+    * ``url-userinfo`` — credential embedded in the url userinfo; rejected by the userinfo
+      gate, whose message sanitizes the url so the secret is never rendered.
+    * ``extra-authentication-key`` — ``credential`` (singular) is NOT in the Authentication
+      schema → ``extra_forbidden``; the credential-bearing value is redacted at the boundary.
+    """
+    if channel == "url-userinfo":
+        return governance_agent_dict(f"https://svc:{secret}@governance.example.com/hook")
+    if channel == "extra-authentication-key":
+        agent = governance_agent_dict(DEFAULT_URL)
+        agent["authentication"]["credential"] = secret
+        return agent
+    raise ValueError(f"Unknown credential channel: {channel!r}")
+
+
 def account_entry(account_ref: dict[str, Any], *, agents: list[dict[str, Any]]) -> dict[str, Any]:
     """Build one sync_governance request element: the pinned 3.1.1 request wrapper.
 
     ``account_ref`` passes straight through — an id form (``{"account_id": ...}``) or a
     natural-key form (``{"brand": {...}, "operator": ..., "sandbox": ...}``). Single home for
     the request wrapper so the unit / integration / BDD suites stop re-encoding it per call
-    site (#1682 review item 2).
+    site (#1329).
     """
     return {"account": account_ref, "governance_agents": agents}
 
@@ -76,7 +104,7 @@ def persisted_governance_urls(tenant_id: str, account_id: str) -> list[str]:
     strings INSIDE the block — ORM attributes expire on commit, so reading them after the
     session closes raises ``DetachedInstanceError`` (the drift the BDD copy guarded and the
     integration / sync_accounts copies did not). Returns ``[]`` when the account row is absent
-    or unbound, so callers grade against a plain list of persisted urls (#1682 review item 2).
+    or unbound, so callers grade against a plain list of persisted urls (#1329).
     """
     from src.core.database.repositories.uow import AccountUoW
 
@@ -85,6 +113,38 @@ def persisted_governance_urls(tenant_id: str, account_id: str) -> list[str]:
         if account is None:
             return []
         return [str(a.url) for a in (account.governance_agents or [])]
+
+
+def persisted_governance_agents_raw(tenant_id: str, account_id: str) -> list | None:
+    """Read the RAW stored ``governance_agents`` JSON, bypassing JSONType url-only coercion.
+
+    Casts the column to plain ``JSONB`` so the persisted bytes come back verbatim: a
+    credential-bearing row is returned as-is instead of raising on read. Reading through the
+    typed ORM attribute (``persisted_governance_urls`` above) re-validates each element
+    against the url-only column model and would RAISE on a leaked credential — masking the
+    exact leak the strip test grades, so this deliberately defeats the Layer-3 coercion
+    boundary. TEST-ONLY: it lives here, not as a production repository method a future caller
+    could reach to read unvalidated on-disk bytes (#1329 R9-K3). Opens its own tenant-scoped
+    ``AccountUoW`` on the DB the dispatch committed to and reads INSIDE the block.
+    """
+    import warnings
+
+    from sqlalchemy import cast, select
+    from sqlalchemy.dialects.postgresql import JSONB
+
+    from src.core.database.models import Account
+    from src.core.database.repositories.uow import AccountUoW
+
+    with AccountUoW(tenant_id) as uow, warnings.catch_warnings():
+        # uow.session is the sanctioned test accessor (its deprecation targets production
+        # business logic, not test-only raw reads); silence the notice locally.
+        warnings.simplefilter("ignore", DeprecationWarning)
+        return uow.session.scalar(
+            select(cast(Account.governance_agents, JSONB)).where(
+                Account.tenant_id == tenant_id,
+                Account.account_id == account_id,
+            )
+        )
 
 
 def governance_binding_stub() -> Callable[[str, list[Any]], list[dict[str, str]]]:
@@ -96,7 +156,7 @@ def governance_binding_stub() -> Callable[[str, list[Any]], list[dict[str, str]]
     ``AnyUrl`` (the public coercion the url-only column applies), NOT the module-private
     ``_serialize_governance_agents`` projector, so the unit test grades the tool's echo against
     the repository's public contract rather than coupling to the internal the repo-owned design
-    exists to hide (#1682 review item 2).
+    exists to hide (#1329).
     """
 
     def _side_effect(account_id: str, agents: list[Any]) -> list[dict[str, str]]:

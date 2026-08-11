@@ -331,7 +331,11 @@ class _TestClock:
         return self._iso(datetime.now(UTC) - timedelta(days=days))
 
 
-_BODYLESS_REST_VERBS: frozenset[str] = frozenset({"get", "delete"})
+# Verbs that carry no request body — a JSON body is omitted for these. HEAD/OPTIONS are
+# included: they reject ``json=`` by the identical mechanism GET/DELETE do, so omitting
+# them would reintroduce the round-8 blocker on those verbs.
+_BODYLESS_REST_VERBS: frozenset[str] = frozenset({"get", "delete", "head", "options"})
+_KNOWN_REST_VERBS: frozenset[str] = frozenset({"get", "post", "put", "patch", "delete", "head", "options"})
 
 
 def issue_rest_verb(
@@ -339,19 +343,25 @@ def issue_rest_verb(
 ) -> Any:
     """Issue ``method`` on ``client`` for ``endpoint``, omitting a JSON body for body-less verbs.
 
-    ``httpx.Client``/Starlette ``TestClient`` ``.get()``/``.delete()`` reject a ``json=``
-    kwarg, so the *verb* — not just the endpoint — decides whether a body is sent. This is
-    the SINGLE place the harness dispatches a REST verb, shared by the in-process
-    ``_run_rest_request`` and the in-network ``RestE2EDispatcher`` so the two legs cannot
-    diverge on how a GET/DELETE discovery endpoint is called: a GET env that overrode only
-    one leg (e.g. ``CapabilitiesEnv``) POSTed on the other and 404'd on the live route
-    (#1682 review A).
+    Dispatches via ``client.request(METHOD, ...)`` rather than ``getattr(client, method)``.
+    ``httpx.Client``/Starlette ``TestClient`` accept ``json=`` on ``.request`` for EVERY verb,
+    so the only question is "which verbs carry a body" (``_BODYLESS_REST_VERBS``), not "which
+    bound method rejects the kwarg" — this is what let the round-8 blocker recur on
+    ``head``/``options`` (``client.head(json=...)`` → ``TypeError``). An unknown/uppercase verb
+    raises loudly HERE rather than ``AttributeError``-ing into ``dispatchers.py``'s blanket
+    ``except`` (which would convert a verb bug into an ordinary ``TransportResult(error=...)``
+    a negative Then step could mistake for a legitimate rejection — loud in-network, quiet
+    in-process). This is the SINGLE place the harness dispatches a REST verb, shared by the
+    in-process ``_run_rest_request`` and the in-network ``RestE2EDispatcher`` so the two legs
+    cannot diverge on how a GET/DELETE discovery endpoint is called (#1329).
     """
-    call = getattr(client, method)
+    verb = method.lower()
+    if verb not in _KNOWN_REST_VERBS:
+        raise ValueError(f"Unknown REST verb {method!r}; expected one of {sorted(_KNOWN_REST_VERBS)}")
     call_kwargs: dict[str, Any] = {} if headers is None else {"headers": headers}
-    if method in _BODYLESS_REST_VERBS:
-        return call(endpoint, **call_kwargs)
-    return call(endpoint, json=body, **call_kwargs)
+    if verb not in _BODYLESS_REST_VERBS:
+        call_kwargs["json"] = body
+    return client.request(method.upper(), endpoint, **call_kwargs)
 
 
 class BaseTestEnv:
@@ -933,7 +943,7 @@ class BaseTestEnv:
         ``REST_METHOD`` is the single source of truth for the verb: both this in-process
         leg and the in-network ``RestE2EDispatcher`` read it, so an env need only declare
         ``REST_METHOD = "get"`` (not override this method) to be dispatched correctly on
-        every REST transport (#1682 review A).
+        every REST transport (#1329).
         """
         client, identity = self._prepare_rest_request(kwargs)
         body = self.build_rest_body(**kwargs)

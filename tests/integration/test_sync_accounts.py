@@ -143,7 +143,7 @@ class TestSyncAccountsUpdate:
 
 
 class TestSyncAccountsPreservesGovernanceBinding:
-    """Regression (#1682 review Cluster B): a metadata-only sync_accounts re-sync
+    """Regression (#1329): a metadata-only sync_accounts re-sync
     MUST NOT wipe a governance binding written by sync_governance.
 
     governance_agents is not part of the sync_accounts request contract (it is owned
@@ -171,7 +171,7 @@ class TestSyncAccountsPreservesGovernanceBinding:
 
             # 2. Bind a governance agent via the single governance-write path
             #    (update_fields now refuses governance_agents; set_governance_binding
-            #    owns the url-only projection — #1682 review B).
+            #    owns the url-only projection — #1329).
             with AccountUoW("sync_gov") as uow:
                 repo: AccountRepository = uow.accounts
                 repo.set_governance_binding(account_id, [{"url": gov_url}])
@@ -187,7 +187,7 @@ class TestSyncAccountsPreservesGovernanceBinding:
             assert _action_value(resync.accounts[0].action) == "updated"
 
         # 4. The governance binding MUST survive the metadata update (read back via the shared
-        #    session-safe reader — extracts urls before the session closes, #1682 review item 2).
+        #    session-safe reader — extracts urls before the session closes, #1329).
         persisted = persisted_governance_urls("sync_gov", account_id)
 
         assert persisted, "sync_accounts wiped the governance binding on a metadata re-sync (#1682 Cluster B)"
@@ -196,7 +196,7 @@ class TestSyncAccountsPreservesGovernanceBinding:
 
     @pytest.mark.asyncio
     async def test_update_fields_refuses_repository_owned_governance_agents(self, integration_db):
-        """update_fields REFUSES the repository-owned governance_agents field (#1682 review D).
+        """update_fields REFUSES the repository-owned governance_agents field (#1329).
 
         The refusal is what makes set_governance_binding's url-only strip a structural
         guarantee rather than call-site discipline: a caller that tries to write the raw
@@ -576,7 +576,7 @@ class TestSyncAccountsBillingPolicyTransport:
         {operator, agent} and rejects a non-account-billable party (advertiser) — the
         sync_accounts gate agrees with the account.supported_billing declaration. Reverting
         the gate to a raw read (the old None → accept-all divergence) would accept advertiser
-        here and reopen the honesty gap (#1682 review E).
+        here and reopen the honesty gap (#1329).
         """
         with AccountSyncEnv(
             tenant_id=f"bp_any_{transport.value}",

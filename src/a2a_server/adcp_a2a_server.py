@@ -1948,12 +1948,22 @@ class AdCPRequestHandler(RequestHandler):
         # key renders as "Required field is missing" on all three transports, not
         # "Expected string, got NoneType"), and runs the same validation boundary — so
         # this transport cannot drift from MCP (#1329).
-        request = build_sync_governance_request(
-            accounts=parameters.get("accounts", []),
-            context=parameters.get("context"),
-            ext=parameters.get("ext"),
-            idempotency_key=parameters.get("idempotency_key"),
-        )
+        #
+        # The builder carries its own internal ``adcp_validation_boundary`` (the only
+        # thing protecting the MCP wrapper, which is outside the request-boundary
+        # guard's scan roots), but the transport-boundary guard
+        # (test_guards_rest_request_boundary.py) matches ``build_*_request(...)`` before
+        # consulting its exemption set, so the call site must also sit lexically inside a
+        # boundary — same convention as the sibling ``with adcp_validation_boundary(...)``
+        # handlers above. The outer boundary is a harmless no-op here (it only catches a
+        # raw ``ValidationError``, which the builder already translates) (#1329).
+        with adcp_validation_boundary(context="sync_governance request"):
+            request = build_sync_governance_request(
+                accounts=parameters.get("accounts", []),
+                context=parameters.get("context"),
+                ext=parameters.get("ext"),
+                idempotency_key=parameters.get("idempotency_key"),
+            )
         return await core_sync_governance_tool(req=request, identity=identity)
 
     async def _handle_list_authorized_properties_skill(

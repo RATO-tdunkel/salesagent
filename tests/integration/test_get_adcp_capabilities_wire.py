@@ -35,7 +35,7 @@ def _assert_account_section(account: dict) -> None:
     assert account.get("sandbox") is False, f"account.sandbox must be an honest False, got {account.get('sandbox')!r}"
     # require_operator_auth is honestly False (accounts are buyer-declared via sync_accounts,
     # operators do not authenticate) — grade it on the wire too, else the honesty declaration
-    # is ungraded and a dishonest True would slip through (#1682 review NIT).
+    # is ungraded and a dishonest True would slip through (#1329).
     assert account.get("require_operator_auth") is False, (
         f"account.require_operator_auth must be an honest False, got {account.get('require_operator_auth')!r}"
     )

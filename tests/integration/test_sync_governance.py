@@ -14,8 +14,6 @@ from __future__ import annotations
 
 import pytest
 
-from src.core.database.repositories.account import AccountRepository
-from src.core.database.repositories.uow import AccountUoW
 from src.core.schemas.account import SyncGovernanceRequest
 from tests.factories import AccountFactory, TenantFactory
 from tests.harness.governance_sync import GovernanceSyncEnv
@@ -24,8 +22,11 @@ from tests.helpers.accounts import seed_account_with_access
 from tests.helpers.governance import (
     BEARER_CREDS,
     GOV_URL,
+    LEAK_SECRET,
     account_entry,
     governance_agent_dict,
+    leaky_governance_agent,
+    persisted_governance_agents_raw,
     persisted_governance_urls,
     url_eq,
 )
@@ -35,7 +36,7 @@ pytestmark = [pytest.mark.integration, pytest.mark.requires_db]
 GOV_URL_2 = "https://governance.new-buyer.com"
 
 # Expected recovery on the uniform ACCOUNT_NOT_FOUND per-account error, derived from
-# the pinned spec enum (the authority), not a copied literal (#1682 review C).
+# the pinned spec enum (the authority), not a copied literal (#1329).
 _ACCOUNT_NOT_FOUND_RECOVERY = _pinned_error_metadata()["ACCOUNT_NOT_FOUND"]["recovery"]
 
 
@@ -46,20 +47,6 @@ def _request(
         idempotency_key=key,
         accounts=[account_entry(account_ref, agents=[governance_agent_dict(url)])],
     )
-
-
-def _persisted_agents_raw(tenant_id: str, account_id: str) -> list | None:
-    """Read the RAW stored governance_agents JSON via the repository, bypassing JSONType coercion.
-
-    Reading through the typed ORM attribute re-validates each element against the url-only
-    column model, which would RAISE on a credential-bearing row — masking the exact leak
-    the strip test grades (the assertion would never execute). The repo's raw reader casts
-    to plain JSONB so a persisted credential FAILS the key-set assertion instead of erroring
-    on read (#1682 review B).
-    """
-    with AccountUoW(tenant_id) as uow:
-        repo: AccountRepository = uow.accounts
-        return repo.get_stored_governance_agents(account_id)
 
 
 class TestSyncGovernancePersistence:
@@ -82,8 +69,8 @@ class TestSyncGovernancePersistence:
         # Assert the RAW STORED JSON has exactly one key, `url`. Reading through the ORM
         # (above) re-coerces to the url-only column model, so a leaked credential would
         # RAISE on read rather than fail this assertion — the raw JSONB read makes the
-        # strip assertion actually execute against what is on disk (#1682 review B).
-        raw = _persisted_agents_raw("gov_t1", "acc_gov_1")
+        # strip assertion actually execute against what is on disk (#1329).
+        raw = persisted_governance_agents_raw("gov_t1", "acc_gov_1")
         assert raw == [{"url": GOV_URL + "/"}], f"raw stored governance agent must be url-only, got {raw}"
 
     @pytest.mark.asyncio
@@ -130,7 +117,7 @@ class TestSyncGovernanceAuthority:
         # Existing-but-unowned is collapsed to the SAME ACCOUNT_NOT_FOUND result as a
         # nonexistent account (uniform response → no cross-principal enumeration
         # oracle). NOT SCOPE_INSUFFICIENT (a task-scope code this seller does not
-        # model). #1682 review A1.
+        # model). #1329.
         err = resp.accounts[0].errors[0]
         assert err.code == "ACCOUNT_NOT_FOUND"
         assert err.recovery == _ACCOUNT_NOT_FOUND_RECOVERY
@@ -145,7 +132,7 @@ class TestSyncGovernanceAuthority:
         # Account lives in tenant B; the agent authenticates in tenant A. The sync
         # is scoped to the agent's tenant (AccountUoW(tenant_id) → tenant-filtered
         # repo), so the account is unresolvable there → ACCOUNT_NOT_FOUND, with no
-        # persistence and no cross-tenant existence leak (#1682 review NIT).
+        # persistence and no cross-tenant existence leak (#1329).
         with GovernanceSyncEnv(tenant_id="gov_ta", principal_id="gov_agent_a") as env:
             env.setup_default_data()
             tenant_b = TenantFactory(tenant_id="gov_tb")
@@ -162,7 +149,7 @@ class TestSyncGovernanceAuthority:
     async def test_natural_key_ambiguous_fails_account_ambiguous(self, integration_db):
         """Covers the ACCOUNT_AMBIGUOUS branch: a natural key matching several of the
         caller's OWN accounts (scoped to accessible — no oracle) fails per-account
-        correctable, not synced. Last round's ambiguous fix was 0%-covered (#1682 review C).
+        correctable, not synced. Last round's ambiguous fix was 0%-covered (#1329).
         """
         with GovernanceSyncEnv(tenant_id="gov_amb", principal_id="gov_agent_amb") as env:
             tenant, principal = env.setup_default_data()
@@ -190,7 +177,7 @@ class TestSyncGovernanceAuthority:
     async def test_status_blocked_account_fails_with_status_code(self, integration_db):
         """Covers the ``except AdCPError`` fallthrough: an OWNED but status-blocked account
         surfaces the resolver's own (canonical) code + recovery — an honest per-account
-        failure, not a silent success. Last round's fallthrough was 0%-covered (#1682 review C).
+        failure, not a silent success. Last round's fallthrough was 0%-covered (#1329).
         """
         with GovernanceSyncEnv(tenant_id="gov_susp", principal_id="gov_agent_susp") as env:
             tenant, principal = env.setup_default_data()
@@ -211,7 +198,7 @@ class TestSyncGovernanceCrossTransportWire:
 
     Governance's only non-BDD wire test was REST happy-path; the synced shape on
     A2A/MCP otherwise rode entirely on the BDD sync-partial scenario. This mirrors
-    the capabilities cross-transport wire test (#1682 review A5).
+    the capabilities cross-transport wire test (#1329).
     """
 
     @pytest.mark.parametrize("transport", [Transport.MCP, Transport.A2A])
@@ -243,7 +230,7 @@ class TestSyncGovernanceCrossTransportWire:
     def test_context_echoed_on_wire(self, transport, integration_db):
         """The application ``context`` is echoed unchanged on the wire (what the specialism
         storyboards grade). Previously exercised by zero tests — no test sent a context
-        (#1682 review C). ContextObject allows extra fields, so a conversation id round-trips.
+        (#1329). ContextObject allows extra fields, so a conversation id round-trips.
         """
         tid = f"gov_ctx_{transport.value}"
         with GovernanceSyncEnv(tenant_id=tid, principal_id=f"{tid}_agent") as env:
@@ -262,13 +249,6 @@ class TestSyncGovernanceCrossTransportWire:
         assert echoed.get("conversation_id") == "conv-gov-xyz", f"{transport}: context not echoed: {echoed}"
 
 
-# A 32+ char secret carried on a mistyped, credential-bearing extra field. It must NEVER
-# reach the wire — format_validation_error redacts the extra_forbidden echo under a
-# credential-bearing loc (#1329). Distinct from BEARER_CREDS so the grade pins the extra
-# field's value specifically.
-_REDACTION_SECRET = "leaked-bearer-" + "z" * 40
-
-
 class TestSyncGovernanceCredentialRedactionWire:
     """A credential-bearing ``extra_forbidden`` rejection redacts the secret on the REAL wire.
 
@@ -278,7 +258,7 @@ class TestSyncGovernanceCredentialRedactionWire:
     governance agent with a mistyped ``authentication.credential`` extra field carrying a 32+ char
     secret and asserts the VALIDATION_ERROR envelope does NOT echo the secret — the error-path
     mirror of the success-echo credential grade at ``test_happy_path_synced_on_mcp_and_a2a_wire``
-    (#1682 review item 1).
+    (#1329).
 
     Parametrized over A2A + REST only: those carry ``format_validation_error``'s full message on
     the wire, so disabling the redaction reddens them (verified by mutation). MCP emits only the
@@ -295,15 +275,10 @@ class TestSyncGovernanceCredentialRedactionWire:
 
             # `credential` (singular) is not in the Authentication schema -> extra_forbidden; it
             # carries a 32+ char secret, and the credential-bearing loc makes the boundary redact
-            # the echoed value so it never reaches the wire (#1329).
-            leaky_agent = {
-                "url": GOV_URL,
-                "authentication": {
-                    "schemes": ["Bearer"],
-                    "credentials": BEARER_CREDS,
-                    "credential": _REDACTION_SECRET,
-                },
-            }
+            # the echoed value so it never reaches the wire. The shared builder + LEAK_SECRET are
+            # the same the BDD leak scenario uses, so a length-sensitive redaction regression
+            # cannot redden one suite and not the other (#1329 R9-K4).
+            leaky_agent = leaky_governance_agent("extra-authentication-key")
             result = env.call_via(
                 transport,
                 idempotency_key="uuid-v4-redact-0000000000001",
@@ -313,7 +288,7 @@ class TestSyncGovernanceCredentialRedactionWire:
         assert result.is_error, f"{transport}: expected a validation rejection, got {result.payload!r}"
         result.assert_wire_error("VALIDATION_ERROR")
         envelope = result.wire_error_envelope
-        assert _REDACTION_SECRET not in str(envelope), f"{transport}: redacted secret leaked on the wire: {envelope}"
+        assert LEAK_SECRET not in str(envelope), f"{transport}: redacted secret leaked on the wire: {envelope}"
 
 
 class TestSyncGovernanceRestWire:

@@ -259,9 +259,16 @@ def build_sync_governance_request(
 ) -> SyncGovernanceRequest:
     """Assemble a ``SyncGovernanceRequest`` from loose params (the MCP + A2A wrappers).
 
-    The SINGLE source for the non-REST field list, so the two hand-assembling
-    transports cannot drift — any future H1 field is added HERE once (REST builds
-    generically via ``model_dump(exclude_none=True)`` and needs no counterpart).
+    Owns the CONSTRUCTION SEMANTICS the two hand-assembling transports must share — the
+    validation boundary, the omit-``None``-idempotency_key behaviour, and the boundary
+    context string — so those cannot drift between MCP and A2A. It does NOT own the field
+    LIST: the field names are still enumerated at four sites (these params, the MCP
+    signature below, ``SyncGovernanceBody`` in ``src/routes/api_v1.py``, and the A2A
+    skill's ``parameters.get(...)`` kwargs), and adding a spec field touches each.
+    ``tests/unit/test_boundary_field_forwarding.py::TestSyncGovernanceFieldForwarding``
+    is what actually prevents a field drift — it derives the spec-field set from the
+    request model and asserts both wrappers forward it here (#1329 R9-D1). REST builds
+    generically via ``model_dump(exclude_none=True)`` and needs no counterpart.
     Construction runs inside the AdCP validation boundary so a schema violation
     (missing/short idempotency_key, non-https url, short credentials, agent
     cardinality) surfaces as the VALIDATION_ERROR envelope — the same wire shape REST

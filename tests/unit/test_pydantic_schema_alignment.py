@@ -1015,7 +1015,7 @@ _SUPPLEMENTAL_ALIGNMENTS: list[ResponseAlignment] = [
         # brand/operator/action/status are explicitly declared on the model AND required in
         # the pinned schema; pin them so test_declared_fields_present_in_schema_and_model runs
         # for this row too (an empty declared_fields skips it) — the still-skipped neighbour of
-        # the sync-governance row below (#1682 review NIT).
+        # the sync-governance row below (#1329).
         declared_fields=frozenset({"brand", "operator", "action", "status"}),
         sample={"brand": {"domain": "acme.com"}, "operator": "create", "action": "created", "status": "active"},
     ),

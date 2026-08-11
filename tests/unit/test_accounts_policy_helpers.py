@@ -14,6 +14,9 @@ from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
 
+import pytest
+
+from src.core.exceptions import AdCPConfigurationError
 from src.core.tenant_context import TenantContext
 from src.core.tools.accounts import _build_setup_for_approval, _build_sync_result, _check_billing_policy
 from tests.factories import PrincipalFactory
@@ -63,11 +66,29 @@ class TestCheckBillingPolicy:
         assert errors[0].suggestion is not None
         assert "agent" in errors[0].suggestion
 
-    def test_empty_supported_list_rejects_all(self):
+    def test_empty_supported_list_is_seller_misconfiguration(self):
+        # An explicit empty supported_billing is not spec-expressible at the pin
+        # (account.supported_billing minItems:1) and names no account-billable party,
+        # so it is a SELLER misconfiguration: resolve_supported_billing raises a TERMINAL
+        # CONFIGURATION_ERROR rather than the resolver returning [] and this gate emitting
+        # a buyer-correctable BILLING_NOT_SUPPORTED (#1329 R9-C2).
         identity = _identity_with(supported_billing=[])
-        errors = _check_billing_policy("agent", identity)
-        assert errors is not None
-        assert errors[0].code == "BILLING_NOT_SUPPORTED"
+        with pytest.raises(AdCPConfigurationError) as exc_info:
+            _check_billing_policy("agent", identity)
+        assert exc_info.value.recovery == "terminal"
+        # Buyer message must not disclose the tenant config or the internal constraint name.
+        assert "ck_accounts_billing" not in str(exc_info.value)
+
+    def test_non_account_billing_list_is_seller_misconfiguration(self):
+        # A NON-empty list naming only non-account-billable parties (advertiser is a valid
+        # media-buy party but not account-billable) yields no account-billable party →
+        # same TERMINAL CONFIGURATION_ERROR, buyer-safe message (#1329 R9-C1).
+        identity = _identity_with(supported_billing=["advertiser"])
+        with pytest.raises(AdCPConfigurationError) as exc_info:
+            _check_billing_policy("agent", identity)
+        assert exc_info.value.recovery == "terminal"
+        assert "advertiser" not in str(exc_info.value)
+        assert "ck_accounts_billing" not in str(exc_info.value)
 
     def test_tenant_none_accepts(self):
         identity = PrincipalFactory.make_identity(tenant_id="t1", tenant=None)

@@ -3471,7 +3471,7 @@ def _harness_env(request: pytest.FixtureRequest, ctx: dict) -> Generator[None, N
         # follow-up. The boundary VALUES themselves (schemes empty/two/outside-enum/absent,
         # credentials absent, url non-uri/absent, accounts 100) are graded at construction
         # time by tests/unit/test_sync_governance.py::TestSyncGovernanceBoundaryValues — NOT
-        # by the T-UC-030-sync-* scenarios, which exercise one nominal value each (#1329/#1682 review I).
+        # by the T-UC-030-sync-* scenarios, which exercise one nominal value each (#1329).
         if "bva" in marker_names:
             pytest.xfail(
                 "BR-UC-030 @bva abstract verdict-step wiring deferred (#1329); boundary values "
@@ -3483,7 +3483,7 @@ def _harness_env(request: pytest.FixtureRequest, ctx: dict) -> Generator[None, N
             # then_adcp_version step (the in-step pattern uc010_capabilities.py uses) lets the
             # scenario's other four wire graders — success, status=synced, exact echoed url,
             # credential-non-echo — actually EXECUTE and be graded, instead of being hidden
-            # behind a blanket scenario xfail (#1682 review G1). The exact url echo is graded
+            # behind a blanket scenario xfail (#1329). The exact url echo is graded
             # end-to-end by the integration tests (test_sync_governance.py — a wrong url
             # reddens them); T-UC-030-sync-partial asserts url presence, not the exact value.
             "T-UC-030-sync-idempotent-replay": "idempotency replay dedup not implemented — spec-production gap (#1329)",
@@ -3508,7 +3508,7 @@ def _harness_env(request: pytest.FixtureRequest, ctx: dict) -> Generator[None, N
         # other BR-UC-010 scenario (full capability discovery, signing posture, idempotency-ttl,
         # version-unsupported, ...) has no step definitions and is routed to xfail here, so it is
         # collected-but-xfailed — never run. That keeps this PR from un-dormanting the feature or
-        # its pre-existing account-on-no-tenant gap (#1329/#1682 review item 1). Mirrors the
+        # its pre-existing account-on-no-tenant gap (#1329). Mirrors the
         # UC-030 bind-all + xfail-out-of-scope pattern.
         if "T-UC-010-v31-account-sandbox" not in marker_names:
             pytest.xfail(
@@ -3523,7 +3523,7 @@ def _harness_env(request: pytest.FixtureRequest, ctx: dict) -> Generator[None, N
             ctx["tenant"] = tenant
             # Set ctx["principal"] too (the five sibling UC branches do): a UC-010 scenario
             # that reads it KeyError'd otherwise, and the blanket xfail above was silently
-            # masking that failure rather than a legitimately-dormant scenario (#1682 review G3).
+            # masking that failure rather than a legitimately-dormant scenario (#1329).
             ctx["principal"] = principal
             yield
 

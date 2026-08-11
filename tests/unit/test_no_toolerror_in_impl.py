@@ -15,7 +15,7 @@ import pytest
 
 # Repo root, anchored to THIS file — not the cwd. A cwd-relative path made the
 # guard vacuous when pytest ran from src/ (every file "not found" → zero sites →
-# green while scanning nothing). Mirrors test_architecture_repository_pattern (#1682 review G).
+# green while scanning nothing). Mirrors test_architecture_repository_pattern (#1329).
 ROOT = pathlib.Path(__file__).resolve().parents[2]
 
 # Files that should have zero ToolError raises in _impl functions

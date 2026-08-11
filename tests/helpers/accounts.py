@@ -9,7 +9,7 @@ and status-specific accounts all seed through one helper — no per-suite twin.
 Lives in ``tests/helpers/`` (not ``tests/bdd/steps/generic/``) so the integration suite can
 import it directly, rather than reaching into ``bdd/steps/generic`` from a different layer;
 ``tests/bdd/steps/generic/_account_resolution.py`` re-exports it for the BDD step files that
-already reference it there (#1682 review item 3).
+already reference it there (#1329).
 """
 
 from __future__ import annotations

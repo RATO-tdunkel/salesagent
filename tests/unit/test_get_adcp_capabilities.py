@@ -33,7 +33,7 @@ class TestGetAdcpCapabilitiesSchema:
         """Test that response requires supported_protocols field."""
         from adcp.types.generated_poc.protocol.get_adcp_capabilities_response import (
             Adcp,
-            Idempotency,
+            Idempotency3,
             MajorVersion,
         )
 
@@ -42,7 +42,7 @@ class TestGetAdcpCapabilitiesSchema:
             GetAdcpCapabilitiesResponse(
                 adcp=Adcp(
                     major_versions=[MajorVersion(root=3)],
-                    idempotency=Idempotency(supported=True, replay_ttl_seconds=86400),
+                    idempotency=Idempotency3(supported=False),
                 ),
                 supported_protocols=[],  # Empty not allowed
             )
@@ -51,14 +51,14 @@ class TestGetAdcpCapabilitiesSchema:
         """Test creating a valid minimal response."""
         from adcp.types.generated_poc.protocol.get_adcp_capabilities_response import (
             Adcp,
-            Idempotency,
+            Idempotency3,
             MajorVersion,
         )
 
         response = GetAdcpCapabilitiesResponse(
             adcp=Adcp(
                 major_versions=[MajorVersion(root=3)],
-                idempotency=Idempotency(supported=True, replay_ttl_seconds=86400),
+                idempotency=Idempotency3(supported=False),
             ),
             supported_protocols=[SupportedProtocol.media_buy],
         )
@@ -74,7 +74,7 @@ class TestGetAdcpCapabilitiesSchema:
         from adcp.types.generated_poc.protocol.get_adcp_capabilities_response import (
             Adcp,
             Execution,
-            Idempotency,
+            Idempotency3,
             MajorVersion,
             MediaBuy,
             Portfolio,
@@ -85,7 +85,7 @@ class TestGetAdcpCapabilitiesSchema:
         response = GetAdcpCapabilitiesResponse(
             adcp=Adcp(
                 major_versions=[MajorVersion(root=3)],
-                idempotency=Idempotency(supported=True, replay_ttl_seconds=86400),
+                idempotency=Idempotency3(supported=False),
             ),
             supported_protocols=[SupportedProtocol.media_buy],
             media_buy=MediaBuy(
@@ -170,10 +170,12 @@ class TestGetAdcpCapabilitiesImpl:
         assert response.adcp is not None
         assert response.adcp.major_versions[0].root == 3
         assert SupportedProtocol.media_buy in response.supported_protocols
-        # Idempotency must declare supported=True since MediaBuyRepository.find_by_idempotency_key
-        # actually dedupes against idx_media_buys_idempotency_key.
-        assert response.adcp.idempotency.supported is True
-        assert response.adcp.idempotency.replay_ttl_seconds == 86400
+        # Idempotency declares supported=False (agent-wide). create_media_buy dedups, but
+        # 3 of 4 mutating tools (update_media_buy, sync_accounts, sync_governance) do not,
+        # and the schema's supported is Literal[True] with no per-tool field — so the honest
+        # agent-wide claim is the Idempotency3 (supported=False) variant (#1329 R9-F2).
+        assert response.adcp.idempotency.supported is False
+        assert not hasattr(response.adcp.idempotency, "replay_ttl_seconds")
         # Specialism declaration activates storyboard scenarios bundled under
         # sales-non-guaranteed (inventory_list_*, delivery_reporting, etc.).
         assert response.specialisms is not None
@@ -248,9 +250,9 @@ class TestGetAdcpCapabilitiesWithTenant:
                 assert response.adcp is not None
                 assert response.adcp.major_versions[0].root == 3
                 assert SupportedProtocol.media_buy in response.supported_protocols
-                # Full response must also declare idempotency support consistently.
-                assert response.adcp.idempotency.supported is True
-                assert response.adcp.idempotency.replay_ttl_seconds == 86400
+                # Full response declares idempotency consistently with the minimal path:
+                # supported=False (agent-wide) — see the honesty rationale above (#1329 R9-F2).
+                assert response.adcp.idempotency.supported is False
                 # Specialism declaration must be consistent across minimal and full paths.
                 assert response.specialisms is not None
                 assert AdcpSpecialism.sales_non_guaranteed in response.specialisms
@@ -775,7 +777,7 @@ class TestSupportedBillingParity:
     The advertised default is a hand-maintained subset of BillingParty that mirrors
     the `ck_accounts_billing` CHECK constraint (accounts.billing IN {operator,
     agent}). If the two drift, the seller advertises a billing party its own column
-    rejects. Pin them together (#1682 review NIT).
+    rejects. Pin them together (#1329).
     """
 
     def test_default_billing_equals_db_constraint_allowed_set(self):
@@ -802,7 +804,7 @@ class TestSupportedBillingParity:
         """A tenant may narrow within {operator, agent}; a non-account party is dropped.
 
         Same resolver as sync_accounts, so what is advertised equals what is accepted
-        (#1682 review E).
+        (#1329).
         """
         from src.core.tools.capabilities import _build_account_capability
 
@@ -816,18 +818,22 @@ class TestSupportedBillingParity:
         assert [p.value for p in mixed.supported_billing] == ["operator"]
 
     def test_configured_billing_with_no_account_party_raises(self):
-        """A config declaring no account-billable party fails LOUD, not silent-substitute.
+        """A config declaring no account-billable party fails LOUD and TERMINAL.
 
-        `["advertiser"]` (media-buy-only) and `["bogus"]` (typo) both resolve to an empty
-        account-billable set. Silently substituting the default would advertise/accept a
-        set the operator never configured, so both raise on the capabilities wire — the
-        SAME resolver sync_accounts uses, so the failure is consistent (#1682 review E).
+        `["advertiser"]` (media-buy-only), `["bogus"]` (typo), AND `[]` (not spec-
+        expressible at the pin, account.supported_billing minItems:1) all resolve to an
+        empty account-billable set. This is a SELLER misconfiguration the buyer cannot fix,
+        so it raises a TERMINAL CONFIGURATION_ERROR on the capabilities wire — the SAME
+        resolver sync_accounts uses — with a buyer-safe message that discloses neither the
+        tenant config nor the internal constraint name (#1329 R9-C1/C2).
         """
         import pytest
 
+        from src.core.exceptions import AdCPConfigurationError
         from src.core.tools.capabilities import _build_account_capability
 
-        with pytest.raises(ValueError, match="no account-billable party"):
-            _build_account_capability({"supported_billing": ["advertiser"]})
-        with pytest.raises(ValueError, match="no account-billable party"):
-            _build_account_capability({"supported_billing": ["bogus"]})
+        for configured in (["advertiser"], ["bogus"], []):
+            with pytest.raises(AdCPConfigurationError) as exc_info:
+                _build_account_capability({"supported_billing": configured})
+            assert exc_info.value.recovery == "terminal"
+            assert "ck_accounts_billing" not in str(exc_info.value)

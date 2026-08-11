@@ -62,7 +62,7 @@ def assert_envelope_shape(
                 field wrong for the scenario (e.g. the credentials path). Exact
                 equality on both layers is transport-stable (the MCP TypeAdapter
                 boundary diverges on ``message``, not ``field``) and strictly
-                stronger (#1682 review D).
+                stronger (#1329).
         field_substr: If provided, must appear in ``errors[0].field``. Weaker than
                 ``field`` (substring, one layer) — kept for cases where the exact
                 path is not stable. Prefer ``field`` for field-level validation.

@@ -17,7 +17,7 @@ from __future__ import annotations
 
 # Canonical seeder now lives in tests/helpers/ so the integration suite can import it
 # without reaching into bdd/steps/generic; re-exported here for the BDD step files that
-# reference it via this module (uc004_delivery, uc006_sync_creatives) (#1682 review item 3).
+# reference it via this module (uc004_delivery, uc006_sync_creatives) (#1329).
 from tests.helpers.accounts import seed_account_with_access
 
 __all__ = ["ensure_tenant_principal", "seed_account_with_access"]

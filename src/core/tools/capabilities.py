@@ -24,7 +24,6 @@ from adcp.types.generated_poc.protocol.get_adcp_capabilities_response import (
     Adcp,
     Execution,
     GeoMetros,
-    Idempotency,
     MajorVersion,
     MediaBuy,
     Portfolio,
@@ -33,11 +32,13 @@ from adcp.types.generated_poc.protocol.get_adcp_capabilities_response import (
     # FIXME(#1388): Targeting has a local subclass; import from src.core.schemas (Pattern #7/#4).
     Targeting,
 )
+from adcp.types.generated_poc.protocol.get_adcp_capabilities_response import (
+    Idempotency3 as IdempotencyUnsupported,  # the honest supported=False variant (agent-wide)
+)
 from fastmcp.server.context import Context
 from fastmcp.tools.tool import ToolResult
 
 from src.core.auth import get_principal_object, require_identity
-from src.core.database.repositories.idempotency_attempt import DEFAULT_REPLAY_TTL
 from src.core.database.repositories.uow import TenantConfigUoW
 from src.core.helpers import enum_value
 from src.core.helpers.account_helpers import resolve_supported_billing
@@ -161,28 +162,30 @@ _DECLARED_SPECIALISMS: list[AdcpSpecialism] = [AdcpSpecialism.sales_non_guarante
 def _adcp_metadata() -> Adcp:
     """Agent-level AdCP metadata (major versions + idempotency).
 
-    Idempotency(supported=True). The 3.1.1 schema scopes this to ALL mutating requests
-    ("the seller deduplicates replays … without re-executing side effects"), and there
-    is no per-tool field, so the declaration is agent-wide. Honest status of the
-    mutating tools behind it (#1329):
+    ``idempotency.supported = False`` (the ``Idempotency3`` variant). The 3.1.1 schema
+    scopes the ``supported = True`` claim to ALL mutating requests ("the seller
+    deduplicates replays … without re-executing side effects") and has NO per-tool field,
+    so the declaration is agent-wide. Honest status of the mutating tools (#1329):
 
     * create_media_buy — the spend-committing tool — DOES dedup via
-      ``uow.idempotency_attempts`` (a replay returns the cached response, no double
-      spend).
-    * sync_governance and sync_accounts accept ``idempotency_key`` but do NOT yet
-      dedup — a replay re-executes (sync_governance re-emits its audit event). This is
-      a known gap: replay dedup for the sync tools is tracked as a follow-up (it needs
-      the storyboard-graded replay/CONFLICT/EXPIRED contract), NOT silently claimed as
-      done.
+      ``uow.idempotency_attempts`` (a replay returns the cached response, no double spend).
+    * update_media_buy, sync_accounts and sync_governance accept ``idempotency_key`` but do
+      NOT dedup — a replay re-executes (sync_governance re-emits its audit event).
 
-    The claim stays ``True`` because the spend-committing operation — the one where a
-    double-execution is financially harmful — is covered; the remaining gap is metadata
-    re-emission on the sync tools, which the follow-up closes. It is declared honestly
-    here rather than rationalized as fully implemented.
+    Only 1 of the 4 wire-facing mutating tools dedups, so the agent-wide ``supported =
+    True`` claim would be false. The schema's ``supported`` is a ``Literal[True]`` const, so
+    the only honest way to NOT claim agent-wide dedup is the ``Idempotency3`` (``supported =
+    False``) variant — advertised here. The tension the reviewer noted is real and
+    upstream-worthy: ``False`` UNDERSTATES create_media_buy, but a per-tool declaration does
+    not exist at 3.1.1, and understating a covered tool is safe (a buyer merely retries
+    without relying on server dedup) where OVERSTATING three uncovered tools is not.
+    Implementing storyboard-graded replay (replay/CONFLICT/EXPIRED) for the remaining
+    mutating tools — which would license flipping this to ``True`` — is the tracked
+    follow-up, NOT silently claimed done here.
     """
     return Adcp(
         major_versions=[MajorVersion(root=3)],
-        idempotency=Idempotency(supported=True, replay_ttl_seconds=int(DEFAULT_REPLAY_TTL.total_seconds())),
+        idempotency=IdempotencyUnsupported(supported=False),
     )
 
 

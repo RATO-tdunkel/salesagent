@@ -273,11 +273,12 @@ class RestE2EDispatcher:
         endpoint = env.REST_ENDPOINT  # type: ignore[attr-defined]
 
         with httpx.Client(base_url=base_url, timeout=30) as client:
-            method = getattr(env, "REST_METHOD", "post")
-            # Shared verb dispatch: a body-less verb (GET/DELETE discovery) must NOT
-            # pass json= (httpx rejects it) — the in-process leg honors REST_METHOD the
-            # same way, so both stay in sync on the verb (#1682 review A).
-            response = issue_rest_verb(client, method, endpoint, body, headers=headers)
+            # BaseTestEnv defines REST_METHOD (default "post"), so read it directly — a
+            # getattr default here would be a SECOND default for one concept, able to drift
+            # from the base's (#1329 R9-E3). Shared verb dispatch: a body-less verb (GET/DELETE
+            # discovery) must NOT pass json= — the in-process leg honors REST_METHOD the same
+            # way, so both stay in sync on the verb.
+            response = issue_rest_verb(client, env.REST_METHOD, endpoint, body, headers=headers)
 
         envelope = {
             "transport": "e2e_rest",

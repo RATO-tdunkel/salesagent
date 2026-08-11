@@ -13,7 +13,7 @@ pattern (``test_uc030_manage_governance.py``).
 The wired outline executes against CapabilitiesEnv across a2a/mcp/rest. Step definitions come
 from ``tests.bdd.steps.domain.uc010_capabilities`` (+ the shared generic Givens).
 
-#1329 (UC-010) / #1682 review item 1.
+#1329 (UC-010).
 """
 
 from __future__ import annotations

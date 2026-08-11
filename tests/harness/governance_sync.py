@@ -74,7 +74,10 @@ class GovernanceSyncEnv(IntegrationEnv):
         if kwargs.get("req") is not None:
             return super().build_rest_body(**kwargs)
         body: dict[str, Any] = {}
-        for field in ("idempotency_key", "accounts", "context"):
+        # ``ext`` is a SyncGovernanceRequest field (SyncGovernanceBody exposes it on the HTTP
+        # body); include it so the REST leg forwards it, matching the A2A/MCP wrappers — the
+        # round-8 ext fix would otherwise be unreachable on REST (#1329 R9-D3).
+        for field in ("idempotency_key", "accounts", "context", "ext"):
             if kwargs.get(field) is not None:
                 body[field] = kwargs[field]
         return body

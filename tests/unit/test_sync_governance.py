@@ -276,13 +276,30 @@ class TestSyncGovernanceRequestSchema:
         assert "https" in err["msg"], err
         assert err["loc"] == ("accounts", 0, "governance_agents", 0, "url"), err
 
-    def test_non_https_url_message_strips_userinfo(self):
-        # The https gate is ordered AFTER the userinfo gate, so it only ever renders
-        # userinfo-free urls; even so, the rendered url is userinfo-stripped as defense
-        # in depth — the message must never echo a credential (#1329).
-        err = _first_schema_error(lambda: _make_request(url="http://svc:SuperSecret456@governance.example.com/hook"))
-        # userinfo gate fires first — but assert the secret is absent regardless of which gate.
-        assert "SuperSecret456" not in err["msg"], err
+    @pytest.mark.parametrize(
+        ("url", "secret"),
+        [
+            # userinfo — rejected by gate 1 (the userinfo gate fires first)
+            ("http://svc:USERINFOSECRET01@governance.example.com/hook", "USERINFOSECRET01"),
+            # query string — passes gate 1, rejected by gate 2 (non-https), which renders the url
+            ("http://governance.example.com/hook?token=QUERYSECRET02", "QUERYSECRET02"),
+            # fragment — same path as query
+            ("http://governance.example.com/hook#access_token=FRAGSECRET03", "FRAGSECRET03"),
+        ],
+    )
+    def test_rejected_url_never_echoes_credential(self, url, secret):
+        # A credential can ride in userinfo, the query string, or the fragment. Whichever
+        # gate rejects, the rendered url is sanitized via webhook_url_for_log — so the
+        # secret must appear in NEITHER the message (B1) NOR the pydantic ``input`` value
+        # (B3, which str(ValidationError)/.json() renders). Assert absence from the FULL
+        # rendered error, not just err["msg"], to cover both layers (#1329).
+        # NB: webhook_url_for_log preserves scheme://host/PATH, so a path-embedded secret
+        # is the reviewer-acknowledged residual this helper does not strip; the field
+        # pointer (accounts[i].governance_agents[j].url) still identifies the bad url.
+        with pytest.raises(ValidationError) as exc_info:
+            _make_request(url=url)
+        rendered = str(exc_info.value) + exc_info.value.json()
+        assert secret not in rendered, rendered
 
     def test_agent_url_with_userinfo_rejected(self):
         # A credential embedded in the url (userinfo) must be rejected — it bypasses

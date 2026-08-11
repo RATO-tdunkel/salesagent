@@ -316,6 +316,62 @@ class TestUpdateMediaBuyFieldForwarding:
         assert not missing, f"_build_update_request doesn't include AdCP fields in request_params: {sorted(missing)}"
 
 
+# ---------------------------------------------------------------------------
+# Tests — sync_governance (#1329 R9-D1/D2)
+# ---------------------------------------------------------------------------
+
+GOVERNANCE_FILE = Path("src/core/tools/governance.py")
+A2A_FILE = Path("src/a2a_server/adcp_a2a_server.py")
+
+# AdCP spec fields that must reach SyncGovernanceRequest via build_sync_governance_request.
+# Derived from the request model minus the version markers (see the parity test below),
+# so a new spec field is auto-enrolled rather than hand-copied (#1329 R9-D1).
+_GOVERNANCE_VERSION_FIELDS = {"adcp_version", "adcp_major_version"}
+
+
+def _sync_governance_spec_fields() -> set[str]:
+    from src.core.schemas import SyncGovernanceRequest
+
+    return set(SyncGovernanceRequest.model_fields) - _GOVERNANCE_VERSION_FIELDS
+
+
+class TestSyncGovernanceFieldForwarding:
+    """Both wrappers must forward every spec field to build_sync_governance_request.
+
+    The round-8 ``ext`` fix was pinned statically on only one wrapper (the runtime pin in
+    test_sync_governance.py crossed the MCP wrapper); the drift it prevents — ``ext``
+    forwarded on A2A, dropped on MCP, or vice-versa — is exactly what this two-sided
+    static check catches, the same shape ``_extract_call_kwargs`` already expresses for
+    update_media_buy (#1329 R9-D2).
+    """
+
+    def test_spec_fields_derive_from_request_model(self):
+        # The forwarded set is the request model minus version markers — a subset of both
+        # the MCP wrapper signature and the REST Body, so declared == accepted (#1329 R9-D1).
+        import inspect
+
+        from src.core.tools.governance import sync_governance
+
+        spec = _sync_governance_spec_fields()
+        assert spec == {"accounts", "context", "ext", "idempotency_key"}
+        mcp_params = set(inspect.signature(sync_governance).parameters) - {"ctx"}
+        assert spec <= mcp_params, f"MCP wrapper missing spec params: {sorted(spec - mcp_params)}"
+        from src.routes.api_v1 import SyncGovernanceBody
+
+        body_fields = set(SyncGovernanceBody.model_fields)
+        assert spec <= body_fields, f"SyncGovernanceBody missing spec fields: {sorted(spec - body_fields)}"
+
+    def test_mcp_wrapper_forwards_all_spec_fields_to_builder(self):
+        kwargs = _extract_call_kwargs(GOVERNANCE_FILE, "sync_governance", "build_sync_governance_request")
+        missing = _sync_governance_spec_fields() - kwargs
+        assert not missing, f"MCP wrapper 'sync_governance' drops fields to builder: {sorted(missing)}"
+
+    def test_a2a_skill_forwards_all_spec_fields_to_builder(self):
+        kwargs = _extract_call_kwargs(A2A_FILE, "_handle_sync_governance_skill", "build_sync_governance_request")
+        missing = _sync_governance_spec_fields() - kwargs
+        assert not missing, f"A2A skill '_handle_sync_governance_skill' drops fields to builder: {sorted(missing)}"
+
+
 class TestExtractorModelsBuilderIndirection:
     """Self-tests for the two-hop matcher: a drop at EITHER hop is reported."""
 

@@ -15,7 +15,7 @@ the in-network ``RestE2EDispatcher`` — so ``call_via(Transport.REST)`` (and th
 BDD ``dispatch_request`` REST leg) GETs the discovery endpoint on every transport,
 same as MCP/A2A through the standard harness hooks (which stash the real success-path
 wire). An earlier version overrode only the in-process ``_run_rest_request``, leaving
-the in-network leg POSTing to a GET-only route → live-route 404 (#1682 review A).
+the in-network leg POSTing to a GET-only route → live-route 404 (#1329).
 
 #1329 (UC-010 account/sandbox honesty)
 """
@@ -36,7 +36,7 @@ class CapabilitiesEnv(IntegrationEnv):
 
     EXTERNAL_PATCHES: dict[str, str] = {}
     REST_ENDPOINT = CAPABILITIES_REST_ENDPOINT
-    REST_METHOD = "get"  # GET discovery endpoint; both REST legs read this (#1682 review A)
+    REST_METHOD = "get"  # GET discovery endpoint; both REST legs read this (#1329)
 
     def call_impl(self, **kwargs: Any) -> GetAdcpCapabilitiesResponse:
         from src.core.tools.capabilities import _get_adcp_capabilities_impl

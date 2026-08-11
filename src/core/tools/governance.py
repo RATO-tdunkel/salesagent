@@ -93,7 +93,12 @@ from src.core.validation_helpers import adcp_validation_boundary
 # with create_media_buy/sync_creatives (_resolve_by_id) and tracked separately
 # (#1329 follow-up); it is not introduced by this tool.
 _UNRESOLVED_ACCOUNT_MESSAGE = "Account does not exist or is not accessible to the authenticated agent."
-_UNRESOLVED_ACCOUNT_SUGGESTION = "Use list_accounts to find accounts accessible to this agent."
+# The pinned enum's canonical ACCOUNT_NOT_FOUND suggestion (error-code.json enumMetadata),
+# not a bespoke string: the BDD wire grade (then_per_account_suggestion) pins this against
+# _pinned_error_metadata(), so production and the pin cannot drift. The canonical text is also
+# strictly MORE uniform than the prior "...accessible to this agent" phrasing — it does not
+# hint that the failure is an ACCESS issue, tightening the enumeration-oracle posture (#1329 R9-D5).
+_UNRESOLVED_ACCOUNT_SUGGESTION = "verify account via list_accounts or contact seller"
 
 # Code + recovery for the uniform unresolved-account result are DERIVED from the
 # canonical AdCPAccountNotFoundError class metadata, not copied as literals, so the

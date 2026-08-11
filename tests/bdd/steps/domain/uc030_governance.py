@@ -528,12 +528,28 @@ def then_per_account_suggestion(ctx: dict, field: str) -> None:
     accounts = _wire_accounts(ctx)
     statuses = {a["status"] for a in accounts}
     assert "failed" in statuses, f"expected a failed per-account entry to carry {field!r}, got statuses {statuses}"
+    # Grade the field CONTENT against the pinned enum (the authority) when the enum defines it —
+    # presence-only (`e.get(field)`) is a serializer tautology that stays green if production ships
+    # any non-empty value, so it would not surface a drift from the canonical ACCOUNT_NOT_FOUND
+    # suggestion/recovery. This step is generic over the requested field ("suggestion", "recovery"),
+    # so grade each against its own pinned value; a field the enum does not carry falls back to
+    # presence (#1329 R9-D5).
+    expected = _pinned_error_metadata().get("ACCOUNT_NOT_FOUND", {}).get(field)
     for acct in accounts:
         if acct["status"] != "failed":
             continue
         errs = acct.get("errors") or []
         assert errs, f"failed account {acct.get('account')} must carry a per-account errors array: {acct}"
-        assert all(e.get(field) for e in errs), f"each per-account error must include a non-empty {field!r}: {acct}"
+        values = {e.get(field) for e in errs}
+        if expected is not None:
+            assert values == {expected}, (
+                f"each per-account {field!r} must equal the pinned ACCOUNT_NOT_FOUND {field} {expected!r}, "
+                f"got {values} for account {acct.get('account')}"
+            )
+        else:
+            assert all(e.get(field) for e in errs), (
+                f"each per-account error must include a non-empty {field!r}: {acct}"
+            )
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -600,9 +616,15 @@ _AGENTS_FIELD = "accounts[0].governance_agents"
 # The url gates (userinfo/https/SSRF) now raise a field-located error here (was a bare
 # ValueError with an empty field), so the step pins field= too (#1329).
 _URL_FIELD = "accounts[0].governance_agents[0].url"
-# Both credential channels reject at a field under this prefix — the url gate at ...url,
-# the extra_forbidden gate at ...authentication.<mistyped-key>.
-_GOV_AGENT_FIELD_PREFIX = "accounts[0].governance_agents[0]"
+# The extra_forbidden gate for the mistyped `credential` (singular) key rejects HERE — the
+# leak channel's exact field, transport-stable across a2a/mcp/rest.
+_CREDENTIAL_EXTRA_FIELD = "accounts[0].governance_agents[0].authentication.credential"
+# Exact field per credential leak channel — pinned so a leaf wrong for the scenario reddens
+# (a shared ...governance_agents[0] prefix would stay green on either leaf) (#1329 R9-D4).
+_LEAK_CHANNEL_FIELD = {
+    "url-userinfo": _URL_FIELD,
+    "extra-authentication-key": _CREDENTIAL_EXTRA_FIELD,
+}
 
 
 @then("the error references the url field and indicates https is required")
@@ -619,9 +641,14 @@ def then_error_credentials(ctx: dict) -> None:
 
 @then("the response is a VALIDATION_ERROR on the wire naming the governance agent field")
 def then_secret_channel_wire_error(ctx: dict) -> None:
-    # Wire-graded (a2a/rest): a field-located VALIDATION_ERROR on the governance agent. The
-    # field prefix covers both channels (url gate -> ...url; extra_forbidden -> ...authentication.<key>).
-    ctx["result"].assert_wire_error("VALIDATION_ERROR", field_substr=_GOV_AGENT_FIELD_PREFIX)
+    # Wire-graded: a field-located VALIDATION_ERROR on the governance agent. Pin the EXACT
+    # field per leak channel (transport-stable across a2a/mcp/rest) rather than a shared
+    # ...governance_agents[0] prefix — a substring stays green even if the leaf is wrong for
+    # the scenario, so dropping the trailing `url`/`credential` from the reported loc would
+    # slip past it. require_suggestion=True matches every other request-validation grade in
+    # this file (#1329 R9-D4).
+    expected_field = _LEAK_CHANNEL_FIELD[ctx["leak_channel"]]
+    ctx["result"].assert_wire_error("VALIDATION_ERROR", field=expected_field, require_suggestion=True)
 
 
 @then("the wire envelope does NOT contain the leaked secret")

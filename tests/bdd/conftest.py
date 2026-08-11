@@ -3504,16 +3504,18 @@ def _harness_env(request: pytest.FixtureRequest, ctx: dict) -> Generator[None, N
         marker_names = {m.name for m in request.node.iter_markers()}
         # test_uc010_discover_seller_capabilities.py binds the WHOLE BR-UC-010 feature via
         # scenarios() (the CI shard manifest requires a whole-feature binding), but this PR
-        # WIRES only the @T-UC-010-v31-account-sandbox account/sandbox-honesty grader. Every
-        # other BR-UC-010 scenario (full capability discovery, signing posture, idempotency-ttl,
-        # version-unsupported, ...) has no step definitions and is routed to xfail here, so it is
-        # collected-but-xfailed — never run. That keeps this PR from un-dormanting the feature or
-        # its pre-existing account-on-no-tenant gap (#1329). Mirrors the
-        # UC-030 bind-all + xfail-out-of-scope pattern.
-        if "T-UC-010-v31-account-sandbox" not in marker_names:
+        # WIRES only the honesty graders: the @T-UC-010-v31-account-sandbox account/sandbox flag
+        # and the @T-UC-010-v31-specialisms declaration (each emitted specialism rolls up to a
+        # declared protocol). Every other BR-UC-010 scenario (full capability discovery, signing
+        # posture, idempotency-ttl, version-unsupported, ...) has no step definitions and is
+        # routed to xfail here, so it is collected-but-xfailed — never run. That keeps this PR
+        # from un-dormanting the feature or its pre-existing account-on-no-tenant gap (#1329).
+        # Mirrors the UC-030 bind-all + xfail-out-of-scope pattern.
+        _UC010_WIRED_TAGS = {"T-UC-010-v31-account-sandbox", "T-UC-010-v31-specialisms"}
+        if not (marker_names & _UC010_WIRED_TAGS):
             pytest.xfail(
-                "BR-UC-010 wired only for the @T-UC-010-v31-account-sandbox account/sandbox-honesty "
-                "grader (#1329); the rest of the capabilities feature is not stepped."
+                "BR-UC-010 wired only for the honesty graders (account/sandbox flag + specialisms "
+                "rollup, #1329); the rest of the capabilities feature is not stepped."
             )
         from tests.harness.capabilities import CapabilitiesEnv
 

@@ -40,30 +40,14 @@ def _returned_creative_ids(result: TransportResult) -> set[str]:
 
 
 class TestStatusesFilterApplied:
-    """filters.statuses actually scopes the result set — not merely reported as applied."""
+    """filters.statuses actually scopes the result set — not merely reported as applied.
 
-    @pytest.mark.parametrize("transport", ALL_WIRE)
-    def test_statuses_filter_scopes_results(self, integration_db, transport):
-        """statuses=["approved"] returns only approved; a rejected creative is excluded.
-
-        This single-value case pins the clause end-to-end: the rejected decoy is the
-        falsifiable negative control that leaks back if ``Creative.status.in_(...)`` (or
-        the effective_statuses threading in _impl) is removed entirely. It does NOT grade
-        the specific bug this PR fixes — a single-element filter was already applied on the
-        unfixed code, so this case alone passes there; the multi-value case below is the
-        one that reddens on the real regression.
-        """
-        with CreativeListEnv() as env:
-            tenant, principal = env.setup_default_data()
-            keep = seed_creative_in_status(tenant, principal, "approved")
-            seed_creative_in_status(tenant, principal, "rejected")  # decoy — must be excluded
-
-            result = env.call_via(transport, filters={"statuses": ["approved"]})
-
-            assert not result.is_error, f"{transport}: {result.error!r}"
-            assert _returned_creative_ids(result) == {keep}, (
-                f"{transport}: rejected decoy leaked — statuses filter not applied"
-            )
+    The single-value scoping clause is pinned by ``test_multi_value_statuses_matches_any``'s
+    ``.in_(...)`` redden (below) and by ``test_filters_applied_matches_scoped_results``'s
+    ``== {keep}`` scoped-set assertion (which also seeds an approved keep + rejected decoy
+    with filter ``["approved"]``), so a dedicated single-value scoping test would add no
+    coverage those two don't already provide.
+    """
 
     @pytest.mark.parametrize("transport", ALL_WIRE)
     def test_multi_value_statuses_matches_any(self, integration_db, transport):

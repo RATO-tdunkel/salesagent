@@ -19,6 +19,7 @@ from tests.helpers.envelope_assertions import assert_no_raw_validation_leak
 
 if TYPE_CHECKING:
     from src.core.database.models import Principal, Tenant
+    from src.core.schemas import Creative  # src.core.schemas.Creative — distinct from the models import above
     from tests.harness._base import BaseTestEnv
     from tests.harness.transport import Transport
 
@@ -199,7 +200,7 @@ def make_test_creative(
     principal_id: str = "principal_456",
     status: str = "approved",
     tags: list[str] | None = None,
-) -> Creative:  # type: ignore[name-defined]
+) -> Creative:
     """Build a Creative model with standard fields for serialization tests.
 
     Shared between test_creative_response_serialization and test_list_creatives_serialization.

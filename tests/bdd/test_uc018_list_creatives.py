@@ -385,26 +385,29 @@ def when_list_creatives_concept_ids(ctx: dict, concept_list: str) -> None:
     ctx["requested_concept_ids"] = _dispatch_structured_filter(ctx, "concept_ids", concept_list)
 
 
-def _wire_creatives(ctx: dict) -> list[dict[str, Any]]:
-    """Return the creatives array as the buyer sees it on the wire.
+def _wire_response(ctx: dict) -> dict[str, Any]:
+    """Return the full success response as the buyer sees it on the wire.
 
     REST/A2A/MCP stash the real serialized response on ``ctx["wire_response"]``
-    (CreativeListEnv stashes on all three wire transports), so the concept-field
-    assertions check the actual on-the-wire bytes rather than a re-serialization.
-    Falls back to the production serializer only when no wire was captured (e.g. a
-    non-stashing path), so the step still has data to assert on.
+    (CreativeListEnv stashes on all three wire transports), so callers assert on the
+    actual on-the-wire bytes rather than a re-serialization.
+
+    Loud guard (mirrors uc005_format_id_shape): a real-wire transport (a2a/mcp/rest/
+    e2e_rest) that didn't stash wire_response must trip here, not silently fall back
+    to a model_dump re-serialization and undercut the "real wire bytes" claim. IMPL
+    (and the unparametrized None default) legitimately have no wire, so they fall back
+    to the production serializer.
     """
     wire = ctx.get("wire_response")
     transport = ctx.get("transport")
-    # Loud guard (mirrors uc005_format_id_shape): a real-wire transport (a2a/mcp/rest/
-    # e2e_rest) that didn't stash wire_response must trip here, not silently fall back
-    # to a model_dump re-serialization and undercut the "real wire bytes" claim. IMPL
-    # (and the unparametrized None default) legitimately have no wire.
     if wire is None and transport not in (None, Transport.IMPL):
         raise AssertionError(f"{transport}: wire_response missing — env does not stash success-path wire")
-    if wire is not None:
-        return wire["creatives"]
-    return _serialized_response(ctx)["creatives"]
+    return wire if wire is not None else _serialized_response(ctx)
+
+
+def _wire_creatives(ctx: dict) -> list[dict[str, Any]]:
+    """Return the creatives array as the buyer sees it on the wire (guarded wire read)."""
+    return _wire_response(ctx)["creatives"]
 
 
 @then(parsers.parse('the creatives array should only include creatives belonging to concept "{concept_id}"'))
@@ -671,3 +674,26 @@ def then_none_returned_have_status(ctx: dict, status: str) -> None:
     assert creatives, "list_creatives returned an empty creatives array"
     offenders = [c.get("creative_id") for c in creatives if c.get("status") == status]
     assert not offenders, f"creatives with status {status!r} leaked into the response: {offenders}"
+
+
+@then(parsers.parse('filters_applied reports statuses "{statuses}"'))
+def then_filters_applied_reports_statuses(ctx: dict, statuses: str) -> None:
+    """Assert query_summary.filters_applied echoes the FULL applied statuses list on the wire.
+
+    Grades the REPORTING half of #1502 (report == scoped set) on the wire-authoritative
+    scenario, where the scoping half (the "contains N creatives" count) already runs. #1502
+    is two coupled defects — the query narrowed the array to statuses[0] AND filters_applied
+    echoed the whole array — that only diverge on a multi-value filter. The count assertion
+    above grades scoping; this grades reporting: a regression that emits only the first status
+    into filters_applied while leaving the query correct reddens HERE on every wire transport
+    (a2a/mcp/rest + e2e_rest) and nowhere else in the BDD/e2e suite.
+
+    Reads through the guarded ``_wire_response`` accessor — a real-wire transport that failed
+    to stash the wire trips loudly rather than falling back to a model_dump re-serialization,
+    so this asserts the real on-the-wire ``filters_applied`` value (a list of ``field=values``
+    strings), never a reconstruction.
+    """
+    filters_applied = _wire_response(ctx)["query_summary"]["filters_applied"]
+    assert f"statuses={statuses}" in filters_applied, (
+        f"filters_applied must report the full applied statuses list statuses={statuses!r}, got: {filters_applied!r}"
+    )

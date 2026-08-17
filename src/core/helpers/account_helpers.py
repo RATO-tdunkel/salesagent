@@ -73,9 +73,11 @@ def resolve_supported_billing(tenant: dict[str, Any] | None) -> list[BillingPart
     resolved = [BillingParty(v) for v in configured if v in _PERMITTED_ACCOUNT_BILLING]
     if not resolved:
         logger.error(
-            "tenant supported_billing %r declares no account-billable party; accounts.billing "
-            "accepts only %s (ck_accounts_billing) — fix the tenant's supported_billing configuration",
-            list(configured),
+            "tenant supported_billing configuration declares no account-billable party "
+            "(type=%s, item_count=%s); accounts.billing accepts only %s "
+            "(ck_accounts_billing) — fix the tenant's supported_billing configuration",
+            type(configured).__name__,
+            len(configured) if hasattr(configured, "__len__") else "unknown",
             sorted(_PERMITTED_ACCOUNT_BILLING),
         )
         raise AdCPConfigurationError("Seller account-billing configuration is invalid; contact the seller.")

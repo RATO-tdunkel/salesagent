@@ -137,10 +137,11 @@ Feature: BR-UC-030 Manage Governance Binding
       | extra-authentication-key |
     # PRE-B7, BR-6 — credential channels: a rejected secret (a credential embedded in the
     # agent URL's userinfo, or a mistyped extra authentication key) must be rejected AND
-    # must never be echoed back on the buyer wire. Graded on the a2a + rest wire; mcp is
-    # xfailed because it surfaces only the leaf pydantic message, never the input value, so a
-    # secret-absence grade there is vacuous.
-    # @source repo=adcp ref=v3.1-04f59d2d5 commit=04f59d2d5 path=static/schemas/source/account/sync-governance-request.json
+    # must never be echoed back on the buyer wire. Graded on ALL of a2a + mcp + rest: the MCP
+    # compat middleware now routes a TypeAdapter rejection through the same
+    # format_validation_error redaction path as A2A/REST (#1329 finding 5), so the extra-key
+    # secret is redacted on the MCP wire for the right reason — no transport is xfailed.
+    # @source adcp 3.1.1 (adcp==6.6.0) path=dist/schemas/3.1.1/account/sync-governance-request.json
 
   @T-UC-030-sync-multiple-agents-rejected @sync @validation @partition @boundary @cardinality
   Scenario: sync_governance with more than one governance_agents entry per account is rejected (maxItems 1)

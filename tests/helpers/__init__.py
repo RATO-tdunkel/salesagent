@@ -76,6 +76,7 @@ from tests.helpers.adcp_factories import (
     create_test_property,
     create_test_property_dict,
 )
+from tests.helpers.capabilities import assert_declared_capabilities
 from tests.helpers.envelope_assertions import assert_envelope_shape, assert_no_raw_validation_leak
 from tests.helpers.idempotency_seeds import (
     make_active_cached_success,
@@ -90,6 +91,8 @@ __all__ = [
     # Envelope assertions
     "assert_envelope_shape",
     "assert_no_raw_validation_leak",
+    # Capabilities wire assertion
+    "assert_declared_capabilities",
     # Idempotency cache seeding
     "make_active_cached_success",
     "seed_cached_success",

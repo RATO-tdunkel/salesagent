@@ -36,18 +36,22 @@ stores the durable agent identity (url) and nothing sensitive.
 
 Idempotency replay + IDEMPOTENCY_CONFLICT (same key / different payload) are NOT
 implemented here — a genuine deferred gap, tracked by the xfailed UC-030 replay/
-conflict scenarios (#1329 follow-up). "Side-effect-free replace ⇒ resource-idempotent"
+conflict scenarios and homed on the open follow-up #1934. "Side-effect-free replace ⇒ resource-idempotent"
 answers only the side-effect half; security.mdx L1 rule 4 requires returning the
 STORED inner response WITHOUT re-executing, and replay is observably different from
 re-execution here because per-account authority can change between calls (a replay
 could flip an account synced -> failed). create_media_buy is the sibling that DOES
 dedup (uow.idempotency_attempts); sync_accounts shares this same gap. The agent-wide
-Idempotency(supported=True) capability is honored by create_media_buy (the mutating
-tool with real spend), which is why it stays declared.
+idempotency posture this seller actually declares on the wire lives in ONE place —
+``capabilities._adcp_metadata`` (get_adcp_capabilities) — which declares
+``idempotency.supported=false`` precisely because 3 of the 4 mutating tools (including
+this one) do NOT dedup; see that function's docstring for the full rationale. Do not
+restate the declared value here (it drifted from the code once — #1329 finding 1).
 """
 
 from typing import Annotated, Any
 
+import adcp
 from adcp.types import AccountReference as LibraryAccountReference
 from adcp.types import ContextObject, Error
 from adcp.types.aliases import SyncGovernanceAccount as SyncGovernanceAccountInput
@@ -80,6 +84,11 @@ from src.core.tools._mcp import mcp_result
 from src.core.transport_helpers import resolve_identity_from_context
 from src.core.validation_helpers import adcp_validation_boundary
 
+# The seller's implemented AdCP version echoed on every response (POST-S4), at
+# release precision (major.minor) derived from the pinned spec so it tracks a bump
+# automatically instead of drifting as a literal.
+_WIRE_ADCP_VERSION = ".".join(adcp.get_adcp_spec_version().split(".")[:2])
+
 # Uniform per-account RESPONSE for an unresolved account. The *_NOT_FOUND
 # uniform-response MUST (pinned error-code.json: CREATIVE_NOT_FOUND /
 # SIGNAL_NOT_FOUND / PLAN_NOT_FOUND, generalized by REFERENCE_NOT_FOUND) requires
@@ -92,7 +101,7 @@ from src.core.validation_helpers import adcp_validation_boundary
 # _resolve_by_id raises not-found BEFORE running the access check, so a not-found is
 # a shorter path than an exists-but-unauthorized. That timing side channel is shared
 # with create_media_buy/sync_creatives (_resolve_by_id) and tracked separately
-# (#1329 follow-up); it is not introduced by this tool.
+# on the open follow-up #1934; it is not introduced by this tool.
 _UNRESOLVED_ACCOUNT_MESSAGE = "Account does not exist or is not accessible to the authenticated agent."
 # The pinned enum's canonical ACCOUNT_NOT_FOUND suggestion (error-code.json enumMetadata),
 # not a bespoke string: the BDD wire grade (then_per_account_suggestion) pins this against
@@ -248,7 +257,10 @@ async def _sync_governance_impl(
     audit_logger = get_audit_logger("sync_governance", tenant_id)
     audit_logger.log_info(f"sync_governance completed: {synced}/{len(results)} synced (principal={principal_id})")
 
-    return SyncGovernanceResponse(accounts=results, context=req.context)
+    # Echo the seller's implemented protocol version on the response (POST-S4). Derived
+    # release-precision (major.minor) from the pinned spec so it cannot drift on a bump —
+    # the wire carries release precision even though inputs may be patch-precise (#1329).
+    return SyncGovernanceResponse(accounts=results, context=req.context, adcp_version=_WIRE_ADCP_VERSION)
 
 
 # ---------------------------------------------------------------------------

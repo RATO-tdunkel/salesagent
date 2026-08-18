@@ -1048,39 +1048,81 @@ def _is_generated_union_variant_segment(loc: str) -> bool:
     return bool(loc) and loc[0].isupper() and "_" not in loc
 
 
+def buyer_loc_segments(loc: tuple[str | int, ...] | Sequence[str | int]) -> tuple[str | int, ...]:
+    """Project a Pydantic ``loc`` to the buyer's real request path — the SINGLE rule.
+
+    Every renderer that turns a Pydantic ``loc`` into a buyer-facing field path
+    (``first_validation_error_field`` for ``field``, ``format_validation_error`` for
+    the message, ``build_validation_error_details`` for ``details.loc``) MUST route
+    through here so one envelope cannot report three different paths for one error
+    (#1329 R9-G3 / finding 4).
+
+    The strip is STRUCTURAL, not a name-shape guess:
+
+    * A generated union-variant class segment (``AccountReference1``, ``Accounts3``)
+      is a codegen tag Pydantic inserts BEFORE the real field within the matched
+      union member — it is never the terminal segment, so it is dropped only when a
+      later segment follows it.
+    * The TERMINAL segment is never dropped. An ``extra_forbidden`` key carries the
+      buyer's own name as the last segment (``Authorization``, ``X-Api-Key``,
+      ``Token``), which the capitalization heuristic would otherwise mistake for a
+      variant tag and silently delete — losing the one actionable pointer the buyer
+      has (the echoed value is always redacted on that path). Keeping the terminal
+      segment preserves header-style keys of any capitalization.
+    """
+    segments = tuple(loc)
+    last = len(segments) - 1
+    return tuple(
+        seg
+        for i, seg in enumerate(segments)
+        if i == last or not (isinstance(seg, str) and _is_generated_union_variant_segment(seg))
+    )
+
+
+def format_buyer_field_path(loc: tuple[str | int, ...] | Sequence[str | int]) -> str:
+    """Render a Pydantic ``loc`` as the bracket-notation buyer field path.
+
+    List indices render as ``[i]`` so boundary-derived paths such as
+    ``packages[0].budget`` align with the ``packages[].budget`` field strings the
+    implementation layer raises. Routes through :func:`buyer_loc_segments` so the
+    codegen union-variant strip is applied consistently.
+    """
+    parts: list[str] = []
+    for seg in buyer_loc_segments(loc):
+        if isinstance(seg, int):
+            parts.append(f"[{seg}]")
+        elif parts:
+            parts.append(f".{seg}")
+        else:
+            parts.append(str(seg))
+    return "".join(parts)
+
+
 def first_validation_error_field(validation_error: ValidationError) -> str | None:
     """Return the bracket-notation path of the first Pydantic error, or ``None``.
 
     Lets a transport boundary attach a structured ``field`` to the
     ``AdCPValidationError`` it raises, so the wire envelope carries the offending
-    field path instead of only the rendered message. List indices render as
-    ``[i]`` so boundary-derived paths such as ``packages[0].budget`` align with
-    the ``packages[].budget`` field strings raised by the implementation layer.
-    Generated union-variant class segments are dropped so a union-typed field points
-    at the buyer's real path, not a codegen tag (#1329 R9-G3).
+    field path instead of only the rendered message. Delegates the ``loc`` →
+    buyer-path projection to :func:`format_buyer_field_path` (#1329 R9-G3 / finding 4).
     """
     errors = validation_error.errors()
     if not errors:
         return None
-    parts: list[str] = []
-    for loc in errors[0]["loc"]:
-        if isinstance(loc, int):
-            parts.append(f"[{loc}]")
-        elif isinstance(loc, str) and _is_generated_union_variant_segment(loc):
-            continue
-        elif parts:
-            parts.append(f".{loc}")
-        else:
-            parts.append(str(loc))
-    return "".join(parts)
+    return format_buyer_field_path(errors[0]["loc"])
 
 
 def build_validation_error_details(errors: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
-    """Project Pydantic errors into the buyer-safe structured detail shape."""
+    """Project Pydantic errors into the buyer-safe structured detail shape.
+
+    ``loc`` is projected through :func:`buyer_loc_segments` so the structured detail
+    reports the same buyer path as ``field`` and the message — no codegen union tag
+    leaks into one renderer while the others strip it (#1329 finding 4).
+    """
     return {
         "validation_errors": [
             {
-                "loc": list(error.get("loc", ())),
+                "loc": list(buyer_loc_segments(error.get("loc", ()))),
                 "msg": error.get("msg"),
                 "type": error.get("type"),
             }

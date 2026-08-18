@@ -81,8 +81,12 @@ def _pattern_a_site_lines(filepath: Path, *, keep_marked: bool) -> list[int]:
             matched = True
         if not matched:
             continue
-        if not any(kw.arg == "code" for kw in node.keywords):
-            continue
+        # Match the ``Error`` alias construction REGARDLESS of how ``code`` is supplied.
+        # Gating on a literal ``code=`` kwarg let ``Error(**advisory)`` and
+        # ``Error(ErrorCode.X, "msg")`` (positional code) slip past both the Pattern-A cap
+        # and the marked-site ratchet — a new advisory site could enter business logic
+        # without moving either number (#1329 finding 9). The construction itself is the
+        # wire-shape decision the guard forbids; how ``code`` is passed is immaterial.
         start = node.lineno - 1
         end = (getattr(node, "end_lineno", None) or node.lineno) - 1
         is_marked = any(_SKIP_MARKER in source_lines[i] for i in range(start, min(end + 1, len(source_lines))))
@@ -166,3 +170,35 @@ class TestNoErrorConstructionInImpl:
             f"Marked-site count shrank (file -> (actual, recorded)): {stale}. Lower the recorded number in "
             "MARKED_PATTERN_A_SITES so the ratchet tracks reality."
         )
+
+
+class TestErrorConstructionMatcherSelfTest:
+    """Meta-tests: the matcher must not depend on HOW ``code`` is supplied (#1329 finding 9)."""
+
+    @pytest.mark.parametrize(
+        "body",
+        [
+            'Error(code="X", message="m")',  # literal kwarg (the form the caps were built from)
+            "Error(**advisory)",  # dict-unpack — previously invisible to the guard
+            'Error(ErrorCode.X, "m")',  # positional code — previously invisible to the guard
+        ],
+    )
+    def test_all_error_construction_forms_are_detected(self, tmp_path, body):
+        from tests.unit._architecture_helpers import collect_error_aliases  # noqa: F401 (import-check parity)
+
+        src = "from adcp.types import Error\n\n\ndef _impl():\n    return " + body + "\n"
+        f = tmp_path / "probe.py"
+        f.write_text(src)
+        # Unmarked (no ``# structural-guard:``) → counts as a Pattern-A site regardless of form.
+        assert _count_pattern_a_sites(f) == [5], f"form not detected: {body!r}"
+
+    def test_marked_site_is_excluded_for_any_form(self, tmp_path):
+        src = (
+            "from adcp.types import Error\n\n\n"
+            "def _impl():\n"
+            "    return Error(**advisory)  # structural-guard: advisory per-item result\n"
+        )
+        f = tmp_path / "probe_marked.py"
+        f.write_text(src)
+        assert _count_pattern_a_sites(f) == []  # marked -> not a capped Pattern-A site
+        assert _count_marked_pattern_a_sites(f) == [5]  # but IS counted in the marked ratchet

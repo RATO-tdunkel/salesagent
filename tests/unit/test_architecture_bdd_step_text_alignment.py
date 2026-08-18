@@ -88,13 +88,28 @@ def _account_id_passed_to_call(func: ast.FunctionDef | ast.AsyncFunctionDef) -> 
     def _is_account_id_load(node: ast.expr) -> bool:
         return isinstance(node, ast.Name) and node.id == "account_id" and isinstance(node.ctx, ast.Load)
 
-    # Calls whose value is discarded as a bare expression statement (log/print lines).
-    bare_statement_calls = {
-        id(stmt.value) for stmt in ast.walk(func) if isinstance(stmt, ast.Expr) and isinstance(stmt.value, ast.Call)
-    }
+    # Calls whose RESULT is discarded or used only as a log/error MESSAGE — not inspection.
+    # This covers EVERY call in the subtree, not just the outermost one, so a call nested
+    # inside a log/print/raise/assert-message (``logger.info("x", str(account_id))``,
+    # ``raise AssertionError(str(account_id))``, ``logger.info(repr(account_id))``) no longer
+    # escapes the exclusion the way a single-level "outermost bare Expr call" check let it
+    # (#1329 finding 9). An assert's TEST is deliberately NOT discarded — a call in a real
+    # ``assert account_id in _wire_account_ids(ctx, account_id)`` grade still counts.
+    discarded_calls: set[int] = set()
+    for stmt in ast.walk(func):
+        subtrees: list[ast.expr] = []
+        if isinstance(stmt, ast.Expr):
+            subtrees.append(stmt.value)
+        elif isinstance(stmt, ast.Raise):
+            subtrees.extend(x for x in (stmt.exc, stmt.cause) if x is not None)
+        elif isinstance(stmt, ast.Assert) and stmt.msg is not None:
+            subtrees.append(stmt.msg)
+        for sub in subtrees:
+            for node in iter_call_expressions(sub):
+                discarded_calls.add(id(node))
 
     for call in iter_call_expressions(func):
-        if id(call) in bare_statement_calls:
+        if id(call) in discarded_calls:
             continue
         for arg in call.args:
             value = arg.value if isinstance(arg, ast.Starred) else arg
@@ -176,10 +191,15 @@ class TestAccountIdExemptionSelfTest:
             "print(account_id)",
             'logger.info("acct %s", account_id)',
             'logger.info("acct", extra=account_id)',
+            # Nested calls inside a discarded/message context must NOT escape the exclusion
+            # (#1329 finding 9 — the single-level bare-Expr check let these through).
+            'logger.info("acct %s", str(account_id))',
+            "raise AssertionError(str(account_id))",
+            "logger.info(repr(account_id))",
         ],
     )
     def test_bare_log_or_print_of_account_id_is_not_inspection(self, body):
-        """A bare log/print statement of account_id does NOT satisfy the exemption."""
+        """A bare log/print/raise/message use of account_id does NOT satisfy the exemption."""
         func = _parse_single_func(f"def then_x(ctx, account_id):\n    {body}\n")
         assert not _account_id_passed_to_call(func), f"bare statement wrongly counted as inspection: {body!r}"
 

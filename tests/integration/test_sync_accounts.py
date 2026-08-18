@@ -190,7 +190,7 @@ class TestSyncAccountsPreservesGovernanceBinding:
         #    session-safe reader — extracts urls before the session closes, #1329).
         persisted = persisted_governance_urls("sync_gov", account_id)
 
-        assert persisted, "sync_accounts wiped the governance binding on a metadata re-sync (#1682 Cluster B)"
+        assert persisted, "sync_accounts wiped the governance binding on a metadata re-sync (#1329)"
         assert len(persisted) == 1
         assert persisted[0] == gov_url
 

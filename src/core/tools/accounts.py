@@ -338,6 +338,21 @@ def _build_setup_for_approval(mode: str, tenant_id: str) -> Any:
     return None
 
 
+# Advisory per-account Error code + recovery, DERIVED from the canonical exception
+# class metadata (the governance.py:_UNRESOLVED_ACCOUNT_* pattern) so a per-account
+# advisory cannot drift from the code/recovery the rest of the codebase raises for the
+# same condition (#1329 finding 10). VALIDATION_ERROR has a typed home
+# (AdCPValidationError); BILLING_NOT_SUPPORTED is a demoted spec code with no typed
+# subclass (it maps to UNSUPPORTED_FEATURE at the wire via ERROR_CODE_MAPPING), so its
+# recovery cannot be read off a class — the literal is instead pinned against the
+# pinned error-code.json enumMetadata by
+# test_billing_not_supported_recovery_matches_pinned_enum, which reddens on drift.
+_VALIDATION_ERROR_CODE = AdCPValidationError._default_error_code
+_VALIDATION_ERROR_RECOVERY = AdCPValidationError._default_recovery
+_BILLING_NOT_SUPPORTED_CODE = "BILLING_NOT_SUPPORTED"
+_BILLING_NOT_SUPPORTED_RECOVERY = "correctable"
+
+
 def _check_domain_validity(brand_domain: str) -> list[Any] | None:
     """Check if the brand domain is valid for account provisioning.
 
@@ -351,12 +366,12 @@ def _check_domain_validity(brand_domain: str) -> list[Any] | None:
         if brand_domain.endswith(tld):
             return [
                 Error(  # structural-guard: advisory per-account result in SyncAccountsResponse.errors[]
-                    code="VALIDATION_ERROR",
+                    code=_VALIDATION_ERROR_CODE,
                     message=f"Domain '{brand_domain}' uses reserved TLD '{tld}' "
                     f"and cannot be used for account provisioning.",
                     suggestion="Use a real domain name for production accounts.",
                     field="brand.domain",
-                    recovery="correctable",
+                    recovery=_VALIDATION_ERROR_RECOVERY,
                 )
             ]
     return None
@@ -364,35 +379,32 @@ def _check_domain_validity(brand_domain: str) -> list[Any] | None:
 
 def _check_billing_policy(
     billing_val: str | None,
-    identity: ResolvedIdentity,
+    supported: list[str],
 ) -> list[Any] | None:
-    """Check if the account billing model is supported by the seller.
+    """Check a single account entry's billing model against the seller's accepted set.
 
     Returns a list of Error objects if rejected, None if accepted.
     Per BR-RULE-059: unsupported billing → BILLING_NOT_SUPPORTED.
 
-    Resolves the accepted set via ``resolve_supported_billing`` — the SAME resolver
-    get_adcp_capabilities advertises through — so what the buyer sees in
-    ``account.supported_billing`` is exactly what this gate accepts (#1329).
+    ``supported`` is the accepted set resolved ONCE by the caller (before any DB work)
+    via ``resolve_supported_billing`` — the SAME resolver get_adcp_capabilities
+    advertises through, so what the buyer sees in ``account.supported_billing`` is
+    exactly what this gate accepts (#1329). It is passed in rather than resolved
+    per-entry because the value depends only on ``identity.tenant`` (never on the
+    entry), and a seller-misconfiguration raise must fire as a precondition before the
+    UoW opens, not up to 100 times mid-loop after earlier entries have persisted
+    (#1329 finding 10). This function keeps its "returns errors, never raises" contract.
     """
     from adcp.types import Error
-
-    from src.core.helpers.account_helpers import resolve_supported_billing
-
-    # Read billing policy from tenant configuration (not identity). Both dict and
-    # TenantContext expose .get() identically. A misconfigured tenant raises loudly here
-    # (same as on the capabilities wire) rather than silently accepting a set it can't bill.
-    tenant = identity.tenant if identity else None
-    supported = [b.value for b in resolve_supported_billing(tenant)]
 
     if billing_val not in supported:
         return [
             Error(  # structural-guard: advisory per-account result in SyncAccountsResponse.errors[]
-                code="BILLING_NOT_SUPPORTED",
+                code=_BILLING_NOT_SUPPORTED_CODE,
                 message=f"Billing model '{billing_val}' is not supported by this seller. "
                 f"Supported models: {', '.join(supported)}.",
                 suggestion=f"Use one of the supported billing models: {', '.join(supported)}.",
-                recovery="correctable",
+                recovery=_BILLING_NOT_SUPPORTED_RECOVERY,
             )
         ]
     return None
@@ -456,11 +468,20 @@ async def _sync_accounts_impl(
 
     # BR-RULE-055: sync requires auth (consistent with list_accounts). require_principal_id
     # first so the canonical auth message surfaces for a missing/anonymous token; require_identity
-    # then narrows the type for _check_billing_policy below.
+    # then narrows the type for the tenant lookup + billing precondition below.
     principal_id = require_principal_id(identity, context=req.context)
     identity = require_identity(identity, context=req.context)
     tenant = require_tenant(identity, context=req.context)
     tenant_id = tenant["tenant_id"]
+
+    # Seller-config precondition, resolved ONCE before any DB work (#1329 finding 10):
+    # the accepted billing set depends only on identity.tenant, and a misconfigured
+    # tenant must raise AdCPConfigurationError (TERMINAL) here — beside the auth/tenant
+    # preconditions — not per-entry inside the UoW where it could fire after earlier
+    # accounts have already persisted.
+    from src.core.helpers.account_helpers import resolve_supported_billing
+
+    supported_billing = [b.value for b in resolve_supported_billing(tenant)]
 
     # Validate non-empty accounts array
     if not req.accounts:
@@ -496,8 +517,9 @@ async def _sync_accounts_impl(
                 )
                 continue
 
-            # BR-RULE-059: check billing policy before processing
-            billing_errors = _check_billing_policy(billing_val, identity)
+            # BR-RULE-059: check billing policy before processing (accepted set
+            # resolved once above, not per-entry — #1329 finding 10).
+            billing_errors = _check_billing_policy(billing_val, supported_billing)
             if billing_errors is not None:
                 results.append(
                     _build_sync_result(

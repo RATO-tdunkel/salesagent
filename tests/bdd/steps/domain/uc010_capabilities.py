@@ -27,11 +27,11 @@ from __future__ import annotations
 
 import re
 
-import pytest
 from pytest_bdd import given, parsers, then, when
 
 from tests.bdd.steps._outcome_helpers import wire_dict
 from tests.bdd.steps.generic._dispatch import dispatch_request
+from tests.helpers import assert_declared_capabilities
 
 # specialism -> parent AdCP protocol rollup (AdCP 3.1.1 compliance index). This seller emits
 # only ``sales-non-guaranteed`` (audit-derived — see _DECLARED_SPECIALISMS), whose parent
@@ -72,54 +72,59 @@ def when_call_get_capabilities(ctx: dict) -> None:
 
 @then(parsers.parse("the capabilities response should be {expected} for the sandbox flag"))
 def then_capabilities_sandbox_flag(ctx: dict, expected: str) -> None:
-    """Grade the #1329 sandbox honesty on the real wire, per the outline's ``expected`` verdict.
+    """Grade the #1329 sandbox honesty on the real wire for every boundary row.
 
     This seller has no behavioral sandbox isolation, so get_adcp_capabilities (a tenant-level,
     no-argument discovery endpoint) declares ``account.sandbox=false`` UNCONDITIONALLY — it does
-    not read per-account state, so the boundary_point's hypothetical response shape does not
-    drive the grade. The four Examples rows map onto two graded outcomes via ``expected``:
-
-    - ``expected == "valid"`` (rows 1-3: sandbox true / absent / explicit-false): the seller's
-      honest declaration IS a spec-valid response — assert ``account.sandbox is False`` on the
-      wire. Falsifiable: a regression to a dishonest ``sandbox=true`` reddens this across
-      a2a/mcp/rest.
-    - ``expected == "invalid"`` (row 4: "capability not declared, sandbox provisioning
-      requested"): the outline's "invalid" is a REJECTED provisioning request, but this
-      discovery endpoint takes no request body, performs no provisioning, and issues no
-      rejection — so that outcome is not observable here. Xfailed as ungraded-at-this-boundary
-      rather than left to collapse into a silent guaranteed-pass (#1329 — vacuous
-      partition step).
+    not read per-account state or perform provisioning, so the boundary_point does not drive the
+    grade. The outline's fourth row was re-expressed from a (unobservable) provisioning-rejection
+    to the honest "provisioning requested → still declares false" case, so all four rows are
+    ``valid`` and grade the same unconditional honest declaration (#1329 finding 2) — no per-row
+    xfail. Falsifiable: a dishonest ``sandbox=true`` reddens every row across a2a/mcp/rest.
     """
-    if expected == "invalid":
-        pytest.xfail(
-            "get_adcp_capabilities is a no-argument, read-only discovery endpoint: it cannot grade "
-            "a rejected sandbox-provisioning request (the outline's 'invalid' row). Its honest "
-            "sandbox=false is a capability signal, not a rejection — that path, if modeled, belongs "
-            "to a spend/provisioning tool, not this discovery call (#1329)."
-        )
     if expected != "valid":
         raise AssertionError(f"unknown expected verdict {expected!r} for the sandbox-flag outline")
+    # Grade the WHOLE declared-honesty envelope on the real wire through the single coupling
+    # grader (#1329 finding 1): account.{sandbox, require_operator_auth, required_for_products,
+    # account_financials, supported_billing} + adcp.idempotency.{supported, no
+    # replay_ttl_seconds} + specialisms — and it fails on any emitted-but-ungraded field, so a
+    # new declared capability cannot ship dark. This scenario configures no tenant
+    # supported_billing, so production takes the default-fallback branch whose honest value is
+    # exactly {operator, agent}. Falsifiable: a dishonest sandbox=true or a re-flipped
+    # idempotency.supported=true reddens this across a2a/mcp/rest.
+    assert_declared_capabilities(wire_dict(ctx))
+
+
+@given("the tenant has full capabilities configured")
+def given_tenant_full_capabilities(ctx: dict) -> None:
+    """Record that the scenario intends a fully-configured tenant (informational).
+
+    get_adcp_capabilities declares its idempotency posture UNCONDITIONALLY
+    (_adcp_metadata → supported=False), so this Given does not drive the response — the
+    Then grades the emitted posture on the wire (#1329 finding 1).
+    """
+    ctx["full_capabilities"] = True
+
+
+@then("adcp.idempotency should be present in the response")
+def then_idempotency_present(ctx: dict) -> None:
+    """v3.1 REQUIRES adcp.idempotency on every capabilities response — grade its presence."""
     body = wire_dict(ctx)
-    account = body.get("account")
-    assert account is not None, f"capabilities response must include an account section: {body}"
-    assert account.get("sandbox") is False, (
-        f"account.sandbox must be an honest False for boundary {ctx.get('sandbox_boundary')!r} "
-        f"(expected valid); got {account.get('sandbox')!r}"
-    )
-    # The #1329 account obligation is sandbox=false AND supported_billing (BR-UC-010 names both
-    # in one line); grade the billing half on the same wire so the grader closes the whole
-    # obligation it is named for, not just the sandbox flag (#1329). This scenario
-    # configures no tenant `supported_billing` policy, so production takes the deterministic
-    # default-fallback branch (_build_account_capability -> resolve_supported_billing ->
-    # account_helpers.SELLER_ACCOUNT_BILLING), whose
-    # honest value is exactly {operator, agent} — pin the exact set, not mere non-emptiness, so
-    # dropping/adding a party reddens the grade (order-insensitive).
-    billing = account.get("supported_billing")
-    assert isinstance(billing, list), f"account.supported_billing must be a list on the wire, got {billing!r}"
-    assert set(billing) == {"operator", "agent"}, (
-        "account.supported_billing must be the seller's honest default {'operator', 'agent'} for "
-        f"this scenario (no tenant billing policy configured), got {billing!r}"
-    )
+    adcp_meta = body.get("adcp") or {}
+    assert "idempotency" in adcp_meta, f"adcp.idempotency must be present (v3.1 required): {adcp_meta}"
+
+
+@then("adcp.idempotency.supported should be a boolean discriminator")
+def then_idempotency_supported_boolean(ctx: dict) -> None:
+    """The union discriminator ``supported`` must be a real boolean on the wire.
+
+    This seller declares the honest ``supported=false`` (Idempotency3) variant; grade that it
+    is a boolean discriminator (not absent/null) — the withdrawal VALUE itself is graded by
+    assert_declared_capabilities on the sandbox scenario + the integration wire test (#1329).
+    """
+    body = wire_dict(ctx)
+    supported = (body.get("adcp") or {}).get("idempotency", {}).get("supported")
+    assert isinstance(supported, bool), f"adcp.idempotency.supported must be a boolean discriminator, got {supported!r}"
 
 
 @given(parsers.parse("the tenant claims specialisms {specialisms}"))

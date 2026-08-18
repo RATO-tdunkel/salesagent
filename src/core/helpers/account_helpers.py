@@ -1,7 +1,14 @@
-"""Account resolution helpers.
+"""Account resolution + seller billing-policy helpers.
 
-Bridges AccountReference from request payloads to validated account_id strings.
-Used by _create_media_buy_impl, _sync_creatives_impl, and _sync_governance_impl.
+Two responsibilities, both keyed off the seller's account model:
+
+* ``resolve_account`` bridges an ``AccountReference`` from a request payload to a
+  validated ``account_id`` string (used by ``_create_media_buy_impl``,
+  ``_sync_creatives_impl``, and ``_sync_governance_impl``).
+* ``resolve_supported_billing`` / ``SELLER_ACCOUNT_BILLING`` are the SINGLE source of
+  truth for the account-billable parties this seller accepts — consumed by BOTH the
+  get_adcp_capabilities ``account.supported_billing`` honesty declaration and the
+  sync_accounts billing gate, so declared == accepted (#1329).
 
 beads: salesagent-8n4
 """

@@ -209,6 +209,35 @@ class TestGetAdcpCapabilitiesImpl:
         assert data["account"]["sandbox"] is False
 
 
+def test_declared_specialisms_are_valid_non_deprecated_pinned_enum_ids():
+    """Every declared specialism is a valid, non-deprecated id in the PINNED enum schema.
+
+    The audit's declaration must be backed by machine-readable spec data, not prose that
+    can drift from the artifact it cites (#1329 finding 3). This reads the pinned
+    `enums/specialism.json` (adcp 6.6.0 / AdCP 3.1.1) — the repo's grounding authority —
+    and asserts each `_DECLARED_SPECIALISMS` entry is a real enum member AND absent from
+    `x-deprecated-enum-values`. It reddens if a declared specialism is dropped/deprecated
+    upstream on a spec bump, or if a deprecated slot (e.g. sales-proposal-mode) is ever
+    declared — turning the deprecation rationale in capabilities.py into an enforced check
+    instead of a comment.
+    """
+    from src.core.tools.capabilities import _DECLARED_SPECIALISMS
+    from tests.helpers.pinned_schema import load
+
+    schema = load("enums/specialism.json")
+    valid_ids = set(schema["enum"])
+    deprecated_ids = set(schema.get("x-deprecated-enum-values", []))
+    # Guard the guard: the artifact must actually carry a deprecated set, else this test
+    # would pass vacuously if the schema shape changed.
+    assert deprecated_ids, "pinned specialism.json must declare x-deprecated-enum-values"
+
+    for specialism in _DECLARED_SPECIALISMS:
+        assert specialism.value in valid_ids, f"{specialism.value} is not a pinned AdcpSpecialism enum id"
+        assert specialism.value not in deprecated_ids, (
+            f"{specialism.value} is deprecated in the pinned specialism.json — do not declare a deprecated slot"
+        )
+
+
 class TestGetAdcpCapabilitiesWithTenant:
     """Test get_adcp_capabilities with mocked tenant context."""
 

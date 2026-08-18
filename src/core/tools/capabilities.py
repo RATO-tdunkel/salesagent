@@ -126,8 +126,19 @@ def _build_account_capability(tenant: dict[str, Any] | None) -> AccountCapabilit
 #
 #   DECLARED:
 #   - sales-non-guaranteed  — required_tools {sync_governance, get_products,
-#       create_media_buy}, all now implemented (sync_governance landed with #1329);
-#       storyboard grades sync_governance -> accounts[0].status="synced" (met).
+#       create_media_buy}, all now implemented (sync_governance landed with #1329).
+#       RESIDUAL GAP (#1329 decision rule — named, not asserted-met): per the
+#       specialism's compliance bundle (specialisms/sales-non-guaranteed/index.yaml,
+#       AdCP 3.1.1) the claim is gated on `requires_scenarios` as well as
+#       `required_tools`. Two parts of that gate are NOT backed end-to-end here:
+#       (a) `governance_aware_seller/governance_multi_agent_rejected` grades a
+#       `context` (correlation_id) echo on the validation-error envelope, and this
+#       seller does not echo `context` on a validation rejection — `adcp_validation_
+#       boundary` is codebase-wide and predates #1329, so closing it is out of scope
+#       and homed on #1934; and (b) the `media_buy_seller/*` buy-flow storyboards are
+#       not all verified green end-to-end. The declaration is retained (the tools are
+#       present and the sync_governance -> accounts[0].status="synced" grade is met)
+#       with these gaps named rather than papered over.
 #
 #   NOT DECLARED (media_buy protocol, tool gap):
 #   - sales-guaranteed      — same required_tools; the submitted-task/IO-approval
@@ -137,8 +148,16 @@ def _build_account_capability(tenant: dict[str, Any] | None) -> AccountCapabilit
 #   - sales-catalog-driven  — needs conversion tracking + catalog we don't implement.
 #   - sales-social          — required_tools include sync_audiences, sync_catalogs,
 #       sync_event_sources, preview_creative (none implemented).
-#   - sales-proposal-mode   — DEPRECATED in 3.1 (folded into sales-guaranteed); do
-#       not declare a deprecated slot even though its tools happen to be present.
+#   - sales-proposal-mode   — a DEPRECATED enum value in the PINNED schema: the
+#       adcp 6.6.0 `enums/specialism.json` `x-deprecated-enum-values` lists it, with
+#       the schema's own note that "their corresponding storyboard has been relocated
+#       or removed". (The upstream spec-repo compliance `index.json` still lists it
+#       `stable` — an SDK-vs-spec divergence resolved toward the pin, which is the
+#       repo's grounding authority.) We do not declare a deprecated slot. Its
+#       `required_tools` are in fact empty in the bundle, so a tools-present argument
+#       never applied; the deprecation is the ground. A machine-readable check —
+#       `test_declared_specialisms_are_not_deprecated_in_pinned_schema` — reads the
+#       same `x-deprecated-enum-values` and reddens if a deprecated id is declared.
 #   - audience-sync         — needs sync_audiences (not implemented).
 #   - governance-aware-seller — needs the check_governance enforcement loop; we
 #       register bindings via sync_governance but deliberately do NOT enforce them.

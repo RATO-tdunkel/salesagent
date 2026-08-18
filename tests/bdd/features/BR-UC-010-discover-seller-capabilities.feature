@@ -1056,12 +1056,18 @@ Feature: BR-UC-010 Discover Seller Capabilities
     # sandbox_response_semantics.yaml: account.sandbox on get_adcp_capabilities response
     # @source repo=adcp ref=v3.1-04f59d2d5 commit=04f59d2d5 path=static/schemas/source/protocol/get-adcp-capabilities-response.json
 
+    # NOTE (#1329 finding 2): get_adcp_capabilities is a read-only, no-argument discovery
+    # endpoint — it declares the UNCONDITIONAL honest account.sandbox=false (no behavioral
+    # isolation ships) and performs no provisioning, so every boundary_point resolves to the
+    # same valid honest response. The prior fourth row asked a provisioning-rejection of a
+    # discovery call (unobservable here) and was per-row xfailed; re-expressed as the honest
+    # "provisioning requested → still declares false" case so all four rows grade the wire.
     Examples:
       | boundary_point                                          | expected |
       | sandbox: true in response (sandbox account)             | valid    |
       | sandbox absent in response (production account)         | valid    |
       | sandbox: false in response (explicit production)        | valid    |
-      | capability not declared, sandbox provisioning requested | invalid  |
+      | sandbox provisioning requested — declares honest false  | valid    |
 
   @T-UC-010-v31-version-unsupported-details-bounds @v31 @boundary @partition
   Scenario Outline: details (VERSION_UNSUPPORTED error) boundary - <boundary_point>

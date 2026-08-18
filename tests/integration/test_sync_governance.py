@@ -194,15 +194,18 @@ class TestSyncGovernanceAuthority:
 
 
 class TestSyncGovernanceCrossTransportWire:
-    """Happy-path synced/url-echo/no-credentials shape on the real MCP + A2A wire.
+    """Happy-path synced/url-echo/no-credentials shape on the real MCP + A2A + REST wire.
 
-    Governance's only non-BDD wire test was REST happy-path; the synced shape on
-    A2A/MCP otherwise rode entirely on the BDD sync-partial scenario. This mirrors
-    the capabilities cross-transport wire test (#1329).
+    Grades the synced shape (status, echoed url, NO credential echo) on the actual
+    serialized body across all three wire transports — matching the [MCP, A2A, REST]
+    parametrize of the capabilities cross-transport sibling it mirrors
+    (test_get_adcp_capabilities_wire). REST joins here (rather than a standalone test that
+    asserted on a re-parsed model and skipped the whole-envelope credential scan) so the
+    same assertions hold identically on every transport (#1329 finding 5).
     """
 
-    @pytest.mark.parametrize("transport", [Transport.MCP, Transport.A2A])
-    def test_happy_path_synced_on_mcp_and_a2a_wire(self, transport, integration_db):
+    @pytest.mark.parametrize("transport", [Transport.MCP, Transport.A2A, Transport.REST])
+    def test_happy_path_synced_wire(self, transport, integration_db):
         tid = f"gov_wire_{transport.value}"
         with GovernanceSyncEnv(tenant_id=tid, principal_id=f"{tid}_agent") as env:
             tenant, principal = env.setup_default_data()
@@ -226,7 +229,7 @@ class TestSyncGovernanceCrossTransportWire:
         assert "authentication" not in agents[0], f"{transport}: credentials echoed on wire: {agents[0]}"
         assert BEARER_CREDS not in str(result.wire_response), f"{transport}: credentials leaked on wire"
 
-    @pytest.mark.parametrize("transport", [Transport.MCP, Transport.A2A])
+    @pytest.mark.parametrize("transport", [Transport.MCP, Transport.A2A, Transport.REST])
     def test_context_echoed_on_wire(self, transport, integration_db):
         """The application ``context`` is echoed unchanged on the wire (what the specialism
         storyboards grade). Previously exercised by zero tests — no test sent a context
@@ -260,13 +263,13 @@ class TestSyncGovernanceCredentialRedactionWire:
     mirror of the success-echo credential grade at ``test_happy_path_synced_on_mcp_and_a2a_wire``
     (#1329).
 
-    Parametrized over A2A + REST only: those carry ``format_validation_error``'s full message on
-    the wire, so disabling the redaction reddens them (verified by mutation). MCP emits only the
-    leaf Pydantic message ("Extra inputs are not permitted"), which never echoes the input value,
-    so a redaction grade there would pass vacuously (the reviewer named REST + A2A specifically).
+    Parametrized over A2A + REST + MCP: the MCP compat middleware now routes a TypeAdapter
+    rejection through the SAME ``format_validation_error`` path as A2A/REST (#1329 finding 5),
+    so the credential-bearing value is redacted on the MCP wire for the right reason too —
+    disabling the redaction reddens all three (verified by mutation), no longer a vacuous cell.
     """
 
-    @pytest.mark.parametrize("transport", [Transport.A2A, Transport.REST])
+    @pytest.mark.parametrize("transport", [Transport.MCP, Transport.A2A, Transport.REST])
     def test_credential_bearing_extra_field_redacted_on_wire(self, transport, integration_db):
         tid = f"gov_redact_{transport.value}"
         with GovernanceSyncEnv(tenant_id=tid, principal_id=f"{tid}_agent") as env:
@@ -291,15 +294,7 @@ class TestSyncGovernanceCredentialRedactionWire:
         assert LEAK_SECRET not in str(envelope), f"{transport}: redacted secret leaked on the wire: {envelope}"
 
 
-class TestSyncGovernanceRestWire:
-    """REST wire-path roundtrip: the tool works across the transport boundary."""
-
-    def test_rest_happy_path_synced(self, integration_db):
-        with GovernanceSyncEnv(tenant_id="gov_t5", principal_id="gov_agent5") as env:
-            tenant, principal = env.setup_default_data()
-            seed_account_with_access(tenant, principal, account_id="acc_gov_5")
-
-            resp = env.call_rest(req=_request({"account_id": "acc_gov_5"}))
-
-        assert resp.accounts[0].status == "synced"
-        assert resp.accounts[0].governance_agents[0].url == GOV_URL + "/"
+# TestSyncGovernanceRestWire (REST happy-path roundtrip) was folded into
+# TestSyncGovernanceCrossTransportWire.test_happy_path_synced_wire, which now parametrizes
+# [MCP, A2A, REST] and asserts on the real serialized body + the whole-envelope credential
+# scan on every transport — a strict superset of the deleted test (#1329 finding 5).

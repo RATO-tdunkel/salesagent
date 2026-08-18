@@ -29,17 +29,19 @@ are populated by dispatch_request.
 
 from __future__ import annotations
 
+import re
 from typing import Any
 
-import pytest
 from pytest_bdd import given, parsers, then, when
 
 from tests.bdd.steps._outcome_helpers import _require_response, wire_dict
 from tests.bdd.steps.generic._dispatch import dispatch_request
 from tests.factories import AccountFactory
-from tests.harness.transport import Transport, _pinned_error_metadata
+from tests.factories.principal import _UNSET
+from tests.harness.transport import _pinned_error_metadata
 from tests.helpers.accounts import seed_account_with_access
 from tests.helpers.governance import (
+    BEARER_CREDS,
     DEFAULT_URL,
     LEAK_SECRET,
     account_entry,
@@ -97,7 +99,7 @@ def _account_entry(account_id: str, agents: list[dict[str, Any]]) -> dict[str, A
 # on the secret value or the mistyped-key shape (#1329 R9-K4).
 
 
-def _dispatch(ctx: dict, transport: str, *, identity: Any = "__keep__", **kwargs: Any) -> None:
+def _dispatch(ctx: dict, transport: str, *, identity: Any = _UNSET, **kwargs: Any) -> None:
     """Dispatch raw kwargs through the parametrized wire transport.
 
     ``transport`` (the "via MCP"/"via REST" token from the Gherkin) is accepted
@@ -106,8 +108,12 @@ def _dispatch(ctx: dict, transport: str, *, identity: Any = "__keep__", **kwargs
     wire transports (mirrors the shared auth Given's convention). Raw kwargs (not
     a pre-built request) are sent so request validation happens at the transport
     boundary and produces a real AdCP wire envelope.
+
+    ``identity`` defaults to the repo's ``_UNSET`` sentinel (not a bespoke "__keep__"
+    magic string — #1329 finding 6): unset → dispatch under the scenario's own identity;
+    an explicit value overrides it (the no-auth / wrong-principal scenarios).
     """
-    if identity == "__keep__":
+    if identity is _UNSET:
         dispatch_request(ctx, **kwargs)
     else:
         dispatch_request(ctx, identity=identity, **kwargs)
@@ -383,14 +389,20 @@ def when_sync_key_boundary(ctx: dict, transport: str, key: str, account_id: str)
 # replay row (idempotency_key) stay xfailed in the conftest UC-030 branch — they need seeding or
 # an unimplemented feature, not just request validation.
 
-# A well-formed agent; only the boundary-under-test deviates from it.
-_BVA_CREDS = "x" * 64
 
+def _bva_agent(url: Any = DEFAULT_URL, **overrides: Any) -> dict[str, Any]:
+    """A well-formed request agent; only the boundary-under-test deviates from it.
 
-def _bva_agent(**overrides: Any) -> dict[str, Any]:
-    agent: dict[str, Any] = {"url": DEFAULT_URL, "authentication": {"schemes": ["Bearer"], "credentials": _BVA_CREDS}}
-    agent.update(overrides)
-    return agent
+    Delegates to the shared ``governance_agent_dict`` deviation vocabulary (#1329 finding 6) —
+    a different ``url`` overrides it, ``url=_UNSET`` REMOVES it (the url-absent boundary), and
+    ``**overrides`` (e.g. ``authentication={...}``) replaces another key — instead of re-inlining
+    the pinned shape and a second credentials literal.
+    """
+    if url is _UNSET:
+        agent = governance_agent_dict(DEFAULT_URL, **overrides)
+        del agent["url"]
+        return agent
+    return governance_agent_dict(url, **overrides)
 
 
 @when(
@@ -402,6 +414,13 @@ def when_bva_governance_agents(ctx: dict, boundary: str) -> None:
     agents = {
         "governance_agents has 0 entries": [],
         "governance_agents has 2 entries": [_bva_agent(), _bva_agent()],
+    }[boundary]
+    # Record the EXACT wire discriminator so then_request_verdict tells minItems (0 entries →
+    # "at least 1 item") from maxItems (2 entries → "at most 1 item"): both point at the same
+    # governance_agents field, so a field-only grade left them byte-identical (#1329 finding 5).
+    ctx["bva_grade"] = {
+        "governance_agents has 0 entries": {"field": _AGENTS_FIELD, "message_substr": "at least 1 item"},
+        "governance_agents has 2 entries": {"field": _AGENTS_FIELD, "message_substr": "at most 1 item"},
     }[boundary]
     _dispatch(ctx, "", idempotency_key=_VALID_KEY, accounts=[_account_entry("acct-bva", agents)])
 
@@ -423,11 +442,11 @@ def when_bva_accounts(ctx: dict, boundary: str) -> None:
 )
 def when_bva_auth_schemes(ctx: dict, boundary: str) -> None:
     auth: dict[str, Any] = {
-        "exactly one valid scheme": {"schemes": ["Bearer"], "credentials": _BVA_CREDS},
-        "empty array (0 items)": {"schemes": [], "credentials": _BVA_CREDS},
-        "two items": {"schemes": ["Bearer", "Bearer"], "credentials": _BVA_CREDS},
-        "single item outside enum": {"schemes": ["definitely-not-a-scheme"], "credentials": _BVA_CREDS},
-        "schemes absent": {"credentials": _BVA_CREDS},
+        "exactly one valid scheme": {"schemes": ["Bearer"], "credentials": BEARER_CREDS},
+        "empty array (0 items)": {"schemes": [], "credentials": BEARER_CREDS},
+        "two items": {"schemes": ["Bearer", "Bearer"], "credentials": BEARER_CREDS},
+        "single item outside enum": {"schemes": ["definitely-not-a-scheme"], "credentials": BEARER_CREDS},
+        "schemes absent": {"credentials": BEARER_CREDS},
     }[boundary]
     _dispatch(
         ctx, "", idempotency_key=_VALID_KEY, accounts=[_account_entry("acct-bva", [_bva_agent(authentication=auth)])]
@@ -436,15 +455,16 @@ def when_bva_auth_schemes(ctx: dict, boundary: str) -> None:
 
 @when(parsers.parse('the Buyer Agent sends a sync_governance request exercising the url boundary case "{boundary}"'))
 def when_bva_url(ctx: dict, boundary: str) -> None:
-    auth = {"schemes": ["Bearer"], "credentials": _BVA_CREDS}
+    # Each case is a DELTA against the well-formed agent via the shared deviation vocabulary
+    # (#1329 finding 6): override the url, or REMOVE it with the _UNSET sentinel.
     if boundary == "https:// URL":
         agent = _bva_agent()
     elif boundary == "http:// URL (plaintext)":
-        agent = {"url": "http://governance.example.com/hook", "authentication": auth}
+        agent = _bva_agent(url="http://governance.example.com/hook")
     elif boundary == "non-uri string":
-        agent = {"url": "not-a-uri", "authentication": auth}
+        agent = _bva_agent(url="not-a-uri")
     elif boundary == "url absent":
-        agent = {"authentication": auth}
+        agent = _bva_agent(url=_UNSET)
     else:
         raise AssertionError(f"unknown url boundary {boundary!r}")
     _dispatch(ctx, "", idempotency_key=_VALID_KEY, accounts=[_account_entry("acct-bva", [agent])])
@@ -461,7 +481,14 @@ def then_request_verdict(ctx: dict, verdict: str) -> None:
     """
     result = ctx["result"]
     if verdict == "invalid":
-        result.assert_wire_error("VALIDATION_ERROR")
+        # When the when-step recorded an exact discriminator (field + min/max message), pin it so
+        # a min-vs-max or wrong-field regression reddens; otherwise grade code + pinned-enum
+        # recovery (#1329 finding 5). require_suggestion holds for the discriminated rows.
+        grade = ctx.get("bva_grade")
+        if grade:
+            result.assert_wire_error("VALIDATION_ERROR", require_suggestion=True, **grade)
+        else:
+            result.assert_wire_error("VALIDATION_ERROR")
     elif verdict == "valid":
         assert not result.is_error, (
             "a boundary-valid request must be accepted at validation (per-account resolution may "
@@ -569,13 +596,13 @@ def then_no_echo_auth(ctx: dict, account_id: str, idx: int) -> None:
 @then("the response carries an echoed adcp_version envelope")
 def then_adcp_version(ctx: dict) -> None:
     body = wire_dict(ctx)
-    # POST-S4 (adcp_version echoed on every response) is not implemented on sync-tool
-    # responses (systemic — sync_accounts has the same gap). xfail HERE (in-step) rather
-    # than at the scenario level, so the sync-happy scenario's other wire graders execute
-    # and stay falsifiable; graduates when production echoes the envelope field (#1329).
-    if not body.get("adcp_version"):
-        pytest.xfail("POST-S4 adcp_version not echoed on sync responses — spec-production gap (#1329)")
-    assert body.get("adcp_version"), f"expected an echoed adcp_version envelope field, got keys {list(body)}"
+    # POST-S4: sync_governance now echoes the seller's implemented adcp_version at release
+    # precision (_sync_governance_impl -> _WIRE_ADCP_VERSION). Graded on the real wire — the
+    # prior in-step xfail is gone; the field IS emitted now (#1329 finding 2).
+    version = body.get("adcp_version")
+    assert version, f"expected an echoed adcp_version envelope field, got keys {list(body)}"
+    # Release-precision (major.minor) per the wire contract, not patch-precise.
+    assert re.fullmatch(r"\d+\.\d+", version), f"adcp_version must be release-precision (major.minor), got {version!r}"
 
 
 @then("the per-account errors include an ACCOUNT_NOT_FOUND code")
@@ -757,17 +784,13 @@ def then_wire_envelope_omits_secret(ctx: dict) -> None:
     # The security invariant: a rejected credential must never be echoed. Assert on the REAL
     # wire envelope (not a reconstruction) so disabling the strip/redaction reddens the wire.
     #
-    # MCP + extra_forbidden is the ONE ungraded cell: MCP surfaces only the leaf pydantic
-    # message ("Extra inputs are not permitted"), never the input value, so the secret is absent
-    # there for a STRUCTURAL reason, not because the redaction ran — a redaction grade on mcp is
-    # vacuous. Mutation-confirmed: disabling format_validation_error's redaction reddens
-    # a2a-extra + rest-extra but NOT mcp-extra. The url-userinfo channel renders a field-located
-    # message on every transport, so all three (incl. mcp) grade it — confirmed by the sibling
-    # mutation reddening a2a/mcp/rest. So only this one cell is ungraded.
-    if ctx["transport"] == Transport.MCP and ctx.get("leak_channel") == "extra-authentication-key":
-        pytest.xfail(
-            "MCP emits only the leaf pydantic message for an extra_forbidden field — secret-absence is vacuous"
-        )
+    # Graded on ALL transports including MCP + extra_forbidden. That cell was previously xfailed
+    # because MCP surfaced only FastMCP's leaf pydantic message ("Extra inputs are not
+    # permitted"), so the secret's absence was structural (vacuous), not a proof the redaction
+    # ran. The MCP compat middleware now routes a TypeAdapter rejection through the SAME
+    # format_validation_error path A2A/REST use (#1329 finding 5), so the extra_forbidden value
+    # is redacted on the MCP wire for the RIGHT reason. Mutation-confirmed: disabling
+    # format_validation_error's redaction now reddens a2a/mcp/rest for the extra channel.
     secret = ctx["leaked_secret"]
     envelope = ctx["result"].wire_error_envelope
     assert secret not in str(envelope), f"leaked secret reached the wire envelope: {envelope!r}"

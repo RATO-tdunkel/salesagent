@@ -514,6 +514,11 @@ async def sync_governance(body: SyncGovernanceBody, identity: ResolvedIdentity =
     from src.core.schemas.account import SyncGovernanceRequest
 
     with adcp_validation_boundary(context="sync_governance request"):
+        # adcp_version is excluded from request construction (the Body's transport-level
+        # "1.0.0" default is not a value the request's release-precision `3.x` pattern
+        # accepts); the buyer's declared version is instead forwarded to the response-side
+        # version-compat layer, the same duty get_products performs (#1329 finding 10),
+        # so the transport no longer accepts and silently discards the field.
         req = SyncGovernanceRequest(**body.model_dump(exclude_none=True, exclude={"adcp_version"}))
     response = await governance_module.sync_governance_raw(req=req, identity=identity)
-    return response.model_dump(mode="json")
+    return apply_version_compat("sync_governance", response.model_dump(mode="json"), body.adcp_version)

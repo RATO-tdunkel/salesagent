@@ -54,7 +54,7 @@ def test_first_validation_error_field_strips_generated_union_variant_segments():
                     "governance_agents": [
                         {
                             "url": "https://agent.example.com/hook",
-                            "authentication": {"schemes": ["adcp_bearer"], "credentials": "c" * 32},
+                            "authentication": {"schemes": ["Bearer"], "credentials": "c" * 32},
                         }
                     ],
                 }
@@ -66,6 +66,44 @@ def test_first_validation_error_field_strips_generated_union_variant_segments():
     assert "AccountReference" not in field, field
     # The stripped path is a real dotted path into the buyer's request.
     assert field.startswith("accounts[0].account"), field
+
+
+def test_extra_forbidden_header_style_key_survives_in_field():
+    """An extra_forbidden key with a header-style name must stay in the buyer field path.
+
+    The union-variant strip keys on capitalization (uppercase initial, no underscore),
+    which also matches a buyer's own header-style key (Authorization, X-Api-Key, Token)
+    when it is the TERMINAL loc segment of an extra_forbidden rejection. That key is the
+    one actionable pointer the buyer has (the echoed value is always [redacted]), so the
+    strip must never drop the terminal segment (#1329 finding 4).
+    """
+    from src.core.schemas import SyncGovernanceRequest
+
+    with pytest.raises(ValidationError) as exc_info:
+        SyncGovernanceRequest(
+            idempotency_key="k" * 32,
+            accounts=[
+                {
+                    "account": {"account_id": "acct_1"},
+                    "governance_agents": [
+                        {
+                            "url": "https://agent.example.com/hook",
+                            "authentication": {
+                                "schemes": ["Bearer"],
+                                "credentials": "c" * 32,
+                                # Header-style extra key: capitalized, no underscore, terminal.
+                                "Authorization": "Bearer secret-value",
+                            },
+                        }
+                    ],
+                }
+            ],
+        )
+
+    field = first_validation_error_field(exc_info.value)
+    assert field is not None
+    # The buyer's own key must survive as the terminal segment, not be stripped.
+    assert field.endswith(".Authorization"), field
 
 
 def test_create_media_buy_boundary_validation_preserves_field_suggestion():
@@ -149,9 +187,12 @@ def test_validation_error_formatting():
         # Use the shared helper function
         error_msg = format_validation_error(e, context="test request")
 
-        # Check that we got a helpful error message
+        # Check that we got a helpful error message. The codegen union-variant tag
+        # (BrandManifest) is stripped from the message path too — the message reports
+        # the same buyer path as `field`/`details.loc` (#1329 finding 4).
         assert "Invalid test request:" in error_msg
-        assert "brand_manifest.BrandManifest.target_audience" in error_msg
+        assert "brand_manifest.target_audience" in error_msg
+        assert "brand_manifest.BrandManifest" not in error_msg
         assert "Expected string, got object" in error_msg
         assert "AdCP spec requires this field to be a simple string" in error_msg
         assert "https://adcontextprotocol.org/schemas/v1/" in error_msg

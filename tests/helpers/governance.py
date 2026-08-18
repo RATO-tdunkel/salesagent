@@ -5,11 +5,15 @@ the governance test contract is expressed once rather than N times (#1329):
 
 - ``account_entry`` — the pinned 3.1.1 request element ``{"account": <ref>, "governance_agents": [...]}``.
 - ``governance_agent_dict`` — one request-side agent (url + write-only authentication).
+- ``leaky_governance_agent`` — a request-side agent carrying ``LEAK_SECRET`` on a named
+  credential-leak channel (the rejection envelope must never echo it).
 - ``persisted_governance_urls`` — the below-wire persisted-binding read-back (session-safe).
+- ``persisted_governance_agents_raw`` — the RAW stored JSON, bypassing url-only coercion
+  (test-only, for the credential-strip grade).
 - ``governance_binding_stub`` — a ``set_governance_binding`` side_effect mirroring the repo's
   PUBLIC url-only write contract (no coupling to the private projector).
-- ``GOV_URL`` / ``DEFAULT_URL`` / ``BEARER_CREDS`` / ``url_eq`` — the shared request constants
-  and the trailing-slash-tolerant url comparison.
+- ``GOV_URL`` / ``DEFAULT_URL`` / ``BEARER_CREDS`` / ``LEAK_SECRET`` / ``url_eq`` — the shared
+  request constants, the leak secret, and the trailing-slash-tolerant url comparison.
 
 Account SEEDING stays in ``tests.helpers.accounts.seed_account_with_access`` (the canonical
 seeder shared with every suite), never a governance-local twin.
@@ -21,6 +25,8 @@ from collections.abc import Callable
 from typing import Any
 
 from pydantic import AnyUrl
+
+from tests.factories.principal import _UNSET
 
 # Shared request-shape constants for the sync_governance test suites (#1329):
 # one governance-agent url + Bearer credentials (>= the schema's minLength 32). Kept here so
@@ -53,14 +59,28 @@ def governance_agent_dict(
     cred_len: int = 64,
     credentials: str | None = None,
     scheme: str = "Bearer",
+    **overrides: Any,
 ) -> dict[str, Any]:
     """Build a request-side governance agent (``url`` + write-only ``authentication``).
 
     Credentials default to ``cred_len`` ``x``s (>= the schema's minLength 32) so the
     only thing under test is the account/authority path, not request validation.
+
+    DEVIATION VOCABULARY (#1329 finding 6): a boundary/negative case is expressed as a DELTA
+    against the pinned shape, not a hand-rolled copy. Each ``**overrides`` key REPLACES a
+    top-level agent key (e.g. ``authentication={...}`` for a schemes boundary), and the
+    ``_UNSET`` sentinel (the repo's factory idiom) REMOVES one (``url=_UNSET`` for the
+    url-absent boundary) — so a boundary suite states the one thing that deviates and a schema
+    change propagates by construction instead of drifting across N inlined copies.
     """
     creds = credentials if credentials is not None else "x" * cred_len
-    return {"url": url, "authentication": {"schemes": [scheme], "credentials": creds}}
+    agent: dict[str, Any] = {"url": url, "authentication": {"schemes": [scheme], "credentials": creds}}
+    for key, value in overrides.items():
+        if value is _UNSET:
+            agent.pop(key, None)
+        else:
+            agent[key] = value
+    return agent
 
 
 def leaky_governance_agent(channel: str, *, secret: str = LEAK_SECRET) -> dict[str, Any]:
@@ -115,7 +135,7 @@ def persisted_governance_urls(tenant_id: str, account_id: str) -> list[str]:
         return [str(a.url) for a in (account.governance_agents or [])]
 
 
-def persisted_governance_agents_raw(tenant_id: str, account_id: str) -> list | None:
+def persisted_governance_agents_raw(tenant_id: str, account_id: str) -> list[dict[str, Any]] | None:
     """Read the RAW stored ``governance_agents`` JSON, bypassing JSONType url-only coercion.
 
     Casts the column to plain ``JSONB`` so the persisted bytes come back verbatim: a

@@ -216,7 +216,7 @@ class TestSyncGovernanceSuggestionParity:
             assert result.is_error, f"{transport}: missing idempotency_key must be rejected, got {result.payload!r}"
             # The buyer OMITTED the key, so the message is the same "Required field is missing"
             # on all three transports — not "Expected string, got NoneType" (the pre-fix A2A/MCP
-            # rendering that passed an explicit None). message_substr pins that divergence (#1682 H1).
+            # rendering that passed an explicit None). message_substr pins that divergence (#1329).
             result.assert_wire_error(
                 "VALIDATION_ERROR",
                 recovery="correctable",

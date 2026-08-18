@@ -154,6 +154,7 @@ class TransportResult:
         message_substr: str | None = None,
         field: str | None = None,
         field_substr: str | None = None,
+        suggestion_substr: str | None = None,
     ) -> None:
         """Assert this result carries the AdCP two-layer wire error ``code``.
 
@@ -164,6 +165,12 @@ class TransportResult:
         non-vacuous without per-scenario duplication. This is the single
         harness-provided way to verify an error on the wire — step definitions
         must not hand-roll envelope parsing.
+
+        ``message_substr`` / ``suggestion_substr`` pin the buyer-facing message and
+        suggestion CONTENT (not merely their presence), so a transport-blind scenario
+        can assert the SAME strings on every transport — a per-transport message/
+        suggestion fork (e.g. MCP surfacing a different text than A2A/REST) then reddens
+        instead of passing because ``field`` alone matched (#1329 finding 5).
         """
         from tests.helpers import assert_envelope_shape
 
@@ -189,6 +196,11 @@ class TransportResult:
             field=field,
             field_substr=field_substr,
         )
-        if require_suggestion:
+        if require_suggestion or suggestion_substr is not None:
             suggestion = extract_wire_suggestion(envelope)
             assert suggestion, f"Expected a non-empty suggestion in the {code} wire envelope: {envelope}"
+            if suggestion_substr is not None:
+                assert suggestion_substr in suggestion, (
+                    f"Expected suggestion to contain {suggestion_substr!r} in the {code} wire envelope, "
+                    f"got {suggestion!r}"
+                )

@@ -16,6 +16,7 @@ from pydantic import ValidationError
 from src.core.exceptions import (
     AdCPValidationError,
     build_validation_error_details,
+    buyer_loc_segments,
 )
 from src.core.exceptions import (
     first_validation_error_field as first_validation_error_field,
@@ -50,13 +51,35 @@ def adcp_validation_boundary(context: str = "parameters", field: str | None = No
     try:
         yield
     except ValidationError as e:
-        errors = e.errors()
-        raise AdCPValidationError(
-            format_validation_error(e, context=context),
-            field=field if field is not None else first_validation_error_field(e),
-            suggestion=suggest_validation_fix(e),
-            details=build_validation_error_details(errors),
-        ) from e
+        raise adcp_validation_error_from(e, context=context, field=field) from e
+
+
+def adcp_validation_error_from(
+    validation_error: ValidationError, *, context: str = "parameters", field: str | None = None
+) -> AdCPValidationError:
+    """Build the typed ``AdCPValidationError`` for a caught Pydantic ``ValidationError``.
+
+    The SINGLE construction shared by the two places a Pydantic ``ValidationError``
+    is turned into the buyer-facing validation envelope:
+
+    * ``adcp_validation_boundary`` — the request-body path A2A and REST run (and the
+      MCP wrapper body, when the params clear FastMCP's own TypeAdapter first);
+    * ``RequestCompatMiddleware`` — the MCP path for a rejection FastMCP's TypeAdapter
+      raises BEFORE the wrapper body, which previously produced only the leaf Pydantic
+      message and so forked MCP's wire message/suggestion off A2A/REST (#1329 finding 5).
+
+    Routing both through here means a validation rejection carries the same rich
+    ``format_validation_error`` message, the same ``suggest_validation_fix``
+    suggestion, the same ``buyer_loc_segments`` field path, and the same structured
+    ``details`` on every transport — so a transport-blind scenario can assert the
+    same strings everywhere.
+    """
+    return AdCPValidationError(
+        format_validation_error(validation_error, context=context),
+        field=field if field is not None else first_validation_error_field(validation_error),
+        suggestion=suggest_validation_fix(validation_error),
+        details=build_validation_error_details(validation_error.errors()),
+    )
 
 
 def run_async_in_sync_context(coroutine):
@@ -180,7 +203,10 @@ def format_validation_error(validation_error: ValidationError, context: str = "r
     """
     error_details = []
     for error in validation_error.errors():
-        field_path = ".".join(str(loc) for loc in error["loc"])
+        # Buyer field path via the single loc→path rule: strips codegen union-variant
+        # tags but never the terminal segment, so the message reports the same path as
+        # ``field`` and ``details.loc`` (#1329 finding 4).
+        field_path = ".".join(str(seg) for seg in buyer_loc_segments(error["loc"]))
         error_type = error["type"]
         msg = error["msg"]
         input_val = error.get("input")
@@ -243,7 +269,7 @@ def suggest_validation_fix(validation_error: ValidationError) -> str:
         return "Correct the request to match the AdCP specification and resend."
 
     first = errors[0]
-    field_path = ".".join(str(loc) for loc in first.get("loc", ())) or "request"
+    field_path = ".".join(str(seg) for seg in buyer_loc_segments(first.get("loc", ()))) or "request"
     error_type = first.get("type", "")
 
     if "missing" in error_type:

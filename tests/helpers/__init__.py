@@ -84,6 +84,7 @@ from tests.helpers.idempotency_seeds import (
     seed_media_buy,
     seed_principal,
 )
+from tests.helpers.log_assertions import rendered_log_calls
 
 __all__ = [
     # Auth helpers
@@ -93,6 +94,8 @@ __all__ = [
     "assert_no_raw_validation_leak",
     # Capabilities wire assertion
     "assert_declared_capabilities",
+    # Log-call assertions
+    "rendered_log_calls",
     # Idempotency cache seeding
     "make_active_cached_success",
     "seed_cached_success",

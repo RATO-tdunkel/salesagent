@@ -67,56 +67,80 @@ def _field_names_referenced(func: ast.FunctionDef | ast.AsyncFunctionDef) -> set
     return names
 
 
-def _account_id_passed_to_call(func: ast.FunctionDef | ast.AsyncFunctionDef) -> bool:
-    """True if the ``account_id`` parameter is routed into a call whose RESULT is used.
+def _is_account_id_load(node: ast.expr) -> bool:
+    return isinstance(node, ast.Name) and node.id == "account_id" and isinstance(node.ctx, ast.Load)
 
-    Recognizes helper-mediated inspection like ``acct = _wire_account(ctx, account_id)`` —
-    the parameter is routed into a lookup that performs the ref-echo grade itself — WITHOUT
-    matching an incidental mention (an f-string failure message), where ``account_id`` is
-    nested inside a ``JoinedStr`` rather than being a direct call argument. Only ``ast.Load``
-    uses count (reading the parameter, not rebinding it).
 
-    Calls that are a bare expression STATEMENT (``logger.info(account_id)``,
-    ``print(account_id)``, ``logger.info("%s", account_id)``, ``logger.info(..., extra=account_id)``)
-    are skipped: their result is discarded, so passing ``account_id`` to a log/print line
-    is not an inspection. Without this, the exemption fired on any call argument — a log
-    line satisfied the guard (#1329). Deliberately narrower than "the Name appears
-    anywhere in the body": that broader form silently weakened the guard repo-wide for a fix
-    that only needed to cover by-id lookup calls (#1329 — guard-matcher scope).
-    """
-
-    def _is_account_id_load(node: ast.expr) -> bool:
-        return isinstance(node, ast.Name) and node.id == "account_id" and isinstance(node.ctx, ast.Load)
-
-    # Calls whose RESULT is discarded or used only as a log/error MESSAGE — not inspection.
-    # This covers EVERY call in the subtree, not just the outermost one, so a call nested
-    # inside a log/print/raise/assert-message (``logger.info("x", str(account_id))``,
-    # ``raise AssertionError(str(account_id))``, ``logger.info(repr(account_id))``) no longer
-    # escapes the exclusion the way a single-level "outermost bare Expr call" check let it
-    # (#1329 finding 9). An assert's TEST is deliberately NOT discarded — a call in a real
-    # ``assert account_id in _wire_account_ids(ctx, account_id)`` grade still counts.
-    discarded_calls: set[int] = set()
-    for stmt in ast.walk(func):
-        subtrees: list[ast.expr] = []
-        if isinstance(stmt, ast.Expr):
-            subtrees.append(stmt.value)
-        elif isinstance(stmt, ast.Raise):
-            subtrees.extend(x for x in (stmt.exc, stmt.cause) if x is not None)
-        elif isinstance(stmt, ast.Assert) and stmt.msg is not None:
-            subtrees.append(stmt.msg)
-        for sub in subtrees:
-            for node in iter_call_expressions(sub):
-                discarded_calls.add(id(node))
-
-    for call in iter_call_expressions(func):
-        if id(call) in discarded_calls:
-            continue
-        for arg in call.args:
-            value = arg.value if isinstance(arg, ast.Starred) else arg
-            if _is_account_id_load(value):
-                return True
-        if any(_is_account_id_load(kw.value) for kw in call.keywords):
+def _call_carries_account_id(call: ast.Call) -> bool:
+    """True if ``account_id`` (a ``Load`` Name) is a positional/keyword ARG of this call."""
+    for arg in call.args:
+        value = arg.value if isinstance(arg, ast.Starred) else arg
+        if _is_account_id_load(value):
             return True
+    return any(_is_account_id_load(kw.value) for kw in call.keywords)
+
+
+def _account_id_graded_by_assertion(func: ast.FunctionDef | ast.AsyncFunctionDef) -> bool:
+    """True iff ``account_id`` is routed into a lookup whose RESULT is CONSUMED by an assertion.
+
+    Recognizes helper-mediated inspection where the by-id lookup performs the ref-echo grade —
+    ``acct = _wire_account(ctx, account_id); assert acct["status"] == ...`` — including a
+    transitive chain (``acct`` → ``agents`` → ``actual`` → ``assert``). A lookup whose result is
+    NEVER consumed by an assertion (``acct = _wire_account(ctx, account_id)`` followed only by
+    ``assert ctx["other"] == 1``) does NOT satisfy the exemption — that was the hole finding 9
+    named: the earlier "passed to any non-discarded call" form fired on a lookup that graded
+    nothing. Two shapes count:
+
+    * DIRECT — a call carrying ``account_id`` appears inside an ``assert`` TEST
+      (``assert account_id in _wire_account_ids(ctx, account_id)``);
+    * TAINT — a name bound from an ``account_id``-carrying call, propagated through subsequent
+      assignments (``agents = acct.get(...)``, ``actual = agents[idx]["url"]``), is READ in some
+      ``assert`` TEST.
+    """
+    # DIRECT: a call carrying account_id inside an assert test.
+    for stmt in ast.walk(func):
+        if isinstance(stmt, ast.Assert):
+            for call in iter_call_expressions(stmt.test):
+                if _call_carries_account_id(call):
+                    return True
+
+    # TAINT: bind names from account_id-carrying calls, propagate through assignments to a
+    # fixpoint, then require an assert TEST to read a tainted name.
+    assigns: list[tuple[list[str], ast.expr]] = []
+    for stmt in ast.walk(func):
+        if isinstance(stmt, ast.Assign) and stmt.value is not None:
+            names = [t.id for t in stmt.targets if isinstance(t, ast.Name)]
+            if names:
+                assigns.append((names, stmt.value))
+        elif isinstance(stmt, ast.AnnAssign) and isinstance(stmt.target, ast.Name) and stmt.value is not None:
+            assigns.append(([stmt.target.id], stmt.value))
+
+    def _value_has_account_id_call(value: ast.expr) -> bool:
+        return any(_call_carries_account_id(call) for call in iter_call_expressions(value))
+
+    def _value_reads(value: ast.expr, names: set[str]) -> bool:
+        return any(isinstance(n, ast.Name) and isinstance(n.ctx, ast.Load) and n.id in names for n in ast.walk(value))
+
+    tainted: set[str] = set()
+    for names, value in assigns:
+        if _value_has_account_id_call(value):
+            tainted.update(names)
+    changed = True
+    while changed:
+        changed = False
+        for names, value in assigns:
+            if all(n in tainted for n in names):
+                continue
+            if _value_reads(value, tainted):
+                tainted.update(names)
+                changed = True
+
+    for stmt in ast.walk(func):
+        if isinstance(stmt, ast.Assert):
+            if any(
+                isinstance(n, ast.Name) and isinstance(n.ctx, ast.Load) and n.id in tainted for n in ast.walk(stmt.test)
+            ):
+                return True
     return False
 
 
@@ -128,21 +152,21 @@ class TestBddStepTextAlignment:
         """Then steps mentioning account_id must inspect account_id somewhere in the body.
 
         "Inspect" is satisfied by a literal ``"account_id"`` string / ``.account_id``
-        attribute (the by-key read) OR by the ``account_id`` step parameter being passed as an
-        argument to a call (Load context) — e.g. a by-id lookup helper such as
-        ``_wire_account(ctx, account_id)``, whose lookup performs the ref-echo grade itself.
-        Requiring only the by-key form was a false positive for helper-mediated inspection: it
-        forced a redundant inline ref-echo assertion at every such call site (#1329). The exemption is scoped to a call ARGUMENT (not any Name anywhere in the body,
-        which an incidental f-string/log mention would satisfy — #1329, guard-matcher
-        scope). A step that mentions account_id in its text but neither reads it by key nor
-        routes it into a call is still flagged.
+        attribute (the by-key read) OR by the ``account_id`` step parameter being routed into a
+        lookup whose RESULT is CONSUMED by an assertion (``_account_id_graded_by_assertion``) —
+        e.g. ``acct = _wire_account(ctx, account_id); assert acct["status"] == ...``, whose by-id
+        lookup performs the ref-echo grade. A lookup whose result is never asserted on
+        (``acct = _wire_account(ctx, account_id)`` with only ``assert ctx["other"] == 1``) is
+        NOT exempt — the earlier "passed to any non-discarded call" form let that vacuous shape
+        through (#1329 finding 9). A step that mentions account_id in its text but neither reads
+        it by key nor grades a lookup of it is still flagged.
         """
         violations = []
         for py_file, func, step_text in _iter_then_steps():
             if "account_id" not in step_text:
                 continue
             referenced = _field_names_referenced(func)
-            if "account_id" not in referenced and not _account_id_passed_to_call(func):
+            if "account_id" not in referenced and not _account_id_graded_by_assertion(func):
                 violations.append(
                     f"{py_file.relative_to(Path.cwd())}:{func.lineno} {func.name} — step mentions account_id"
                 )
@@ -182,36 +206,43 @@ def _parse_single_func(src: str) -> ast.FunctionDef | ast.AsyncFunctionDef:
 
 
 class TestAccountIdExemptionSelfTest:
-    """Meta-tests for the ``_account_id_passed_to_call`` exemption (#1329)."""
+    """Meta-tests for the ``_account_id_graded_by_assertion`` exemption (#1329 finding 9)."""
 
     @pytest.mark.parametrize(
         "body",
         [
+            # Bare log/print/raise/message uses — account_id's result is discarded.
             "logger.info(account_id)",
             "print(account_id)",
             'logger.info("acct %s", account_id)',
             'logger.info("acct", extra=account_id)',
-            # Nested calls inside a discarded/message context must NOT escape the exclusion
-            # (#1329 finding 9 — the single-level bare-Expr check let these through).
             'logger.info("acct %s", str(account_id))',
             "raise AssertionError(str(account_id))",
             "logger.info(repr(account_id))",
+            # The hole finding 9 named: a lookup whose RESULT is never consumed by an assertion.
+            "acct = _wire_account(ctx, account_id)",
+            "return _wire_account(ctx, account_id)",
+            'acct = _wire_account(ctx, account_id)\n    assert ctx["other"] == 1',
         ],
     )
-    def test_bare_log_or_print_of_account_id_is_not_inspection(self, body):
-        """A bare log/print/raise/message use of account_id does NOT satisfy the exemption."""
+    def test_lookup_not_graded_by_assertion_is_not_exempt(self, body):
+        """A use of account_id whose result never reaches an assertion does NOT satisfy the exemption."""
         func = _parse_single_func(f"def then_x(ctx, account_id):\n    {body}\n")
-        assert not _account_id_passed_to_call(func), f"bare statement wrongly counted as inspection: {body!r}"
+        assert not _account_id_graded_by_assertion(func), f"vacuous use wrongly counted as inspection: {body!r}"
 
     @pytest.mark.parametrize(
         "body",
         [
-            "acct = _wire_account(ctx, account_id)",
+            # Direct: the account_id-carrying call is in the assert test.
             "assert account_id in _wire_account_ids(ctx, account_id)",
-            "return _wire_account(ctx, account_id)",
+            # Bound result consumed by an assertion.
+            'acct = _wire_account(ctx, account_id)\n    assert acct["status"] == "synced"',
+            # Transitive taint: acct -> agents -> actual -> assert.
+            'acct = _wire_account(ctx, account_id)\n    agents = acct.get("governance_agents")'
+            '\n    actual = agents[0]["url"]\n    assert actual == "https://h/"',
         ],
     )
-    def test_used_result_call_with_account_id_is_inspection(self, body):
-        """Routing account_id into a call whose result is used IS inspection."""
+    def test_lookup_graded_by_assertion_is_exempt(self, body):
+        """Routing account_id into a lookup whose result is consumed by an assertion IS inspection."""
         func = _parse_single_func(f"def then_x(ctx, account_id):\n    {body}\n")
-        assert _account_id_passed_to_call(func), f"real inspection wrongly rejected: {body!r}"
+        assert _account_id_graded_by_assertion(func), f"real graded inspection wrongly rejected: {body!r}"

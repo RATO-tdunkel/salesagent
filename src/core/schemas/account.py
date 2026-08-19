@@ -17,6 +17,7 @@ from typing import Any, Literal, NoReturn
 from adcp.types import Account as LibraryAccountDomain
 from adcp.types import AccountReference as LibraryAccountReference
 from adcp.types import ContextObject as LibraryContextObject
+from adcp.types import CoreGovernanceAgent as LibraryGovernanceAgent
 from adcp.types import Error as LibraryError
 from adcp.types import ListAccountsRequest as LibraryListAccountsRequest
 from adcp.types import ListAccountsResponse as LibraryListAccountsResponse
@@ -274,24 +275,6 @@ class SyncGovernanceRequest(LibrarySyncGovernanceRequest):
         return self
 
 
-class SyncedGovernanceAgent(SalesAgentBaseModel):
-    """A governance agent as echoed on the sync_governance response.
-
-    URL-only by construction. The request-side agent carries ``authentication``
-    (schemes + credentials); the response MUST NOT echo credentials
-    (sync-governance-response.json success ``governance_agents.items`` requires
-    only ``url``). Modelling the echo with a url-only type makes that a
-    structural guarantee, not a call-site discipline.
-
-    Deliberately a parallel, minimal SDK-decoupled type rather than reusing the
-    library ``GovernanceAgent`` (which also models the response as url-only): the
-    echo contract is a bare ``{url}`` and owning it keeps the response shape
-    independent of SDK codegen churn on the request-side agent type.
-    """
-
-    url: str
-
-
 class SyncGovernanceResponseAccount(SalesAgentBaseModel):
     """Per-account result in a sync_governance response.
 
@@ -306,9 +289,14 @@ class SyncGovernanceResponseAccount(SalesAgentBaseModel):
     account: LibraryAccountReference
     # Two-member enum per the pinned sync-governance-response.json (status.enum
     # ["synced","failed"]); a Literal makes the constraint structural rather than
-    # call-site discipline (mirrors the SyncedGovernanceAgent url-only rationale).
+    # call-site discipline.
     status: Literal["synced", "failed"]
-    governance_agents: list[SyncedGovernanceAgent] | None = None
+    # The echoed agent is the SDK's url-only ``CoreGovernanceAgent`` (Pattern #1): the
+    # response MUST NOT echo credentials (sync-governance-response.json success
+    # ``governance_agents.items`` = url only), and the SDK ships exactly that url-only
+    # type — reusing it makes credential-strip a structural guarantee AND keeps the echo
+    # in lockstep with the pinned schema instead of a hand-maintained parallel type.
+    governance_agents: list[LibraryGovernanceAgent] | None = None
     errors: list[LibraryError] | None = None
 
 
@@ -341,7 +329,6 @@ __all__ = [
     "ListAccountsResponse",
     "SyncAccountsRequest",
     "SyncAccountsResponse",
-    "SyncedGovernanceAgent",
     "SyncGovernanceRequest",
     "SyncGovernanceResponse",
     "SyncGovernanceResponseAccount",

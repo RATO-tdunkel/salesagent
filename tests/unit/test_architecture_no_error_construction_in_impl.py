@@ -42,9 +42,11 @@ PATTERN_A_PER_FILE_CAP: dict[str, int] = {}
 # but a free-form marker has no counter, so the number of SUPPRESSED sites could grow
 # invisibly. Ratchet the marked-site count per file so a NEW advisory ``Error()`` site is
 # a deliberate, reviewed change, not a silent suppression (#1329). Only shrinks.
+# accounts.py + governance.py no longer construct advisory Error() directly: both route
+# through the single ``build_advisory_error`` builder at the error boundary (outside the scan
+# dirs), so their marker count dropped to zero (#1329 finding 9). media_buy_delivery /
+# media_buy_list are pre-existing per-item advisory sites not yet migrated to the builder.
 MARKED_PATTERN_A_SITES: dict[str, int] = {
-    "src/core/tools/accounts.py": 2,
-    "src/core/tools/governance.py": 1,
     "src/core/tools/media_buy_delivery.py": 4,
     "src/core/tools/media_buy_list.py": 3,
 }

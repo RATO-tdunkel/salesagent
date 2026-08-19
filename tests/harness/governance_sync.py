@@ -7,7 +7,7 @@ Real: get_db_session, AccountRepository, resolve_account, all persistence logic
 Requires: integration_db fixture (creates test PostgreSQL DB).
 
 Mirrors AccountSyncEnv (sibling account-domain write tool). Used by the
-sync_governance integration tests and, later, the UC-030 BDD ledger.
+sync_governance integration tests and the UC-030 BDD ledger.
 
 #1329
 """

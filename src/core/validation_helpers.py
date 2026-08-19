@@ -16,7 +16,7 @@ from pydantic import ValidationError
 from src.core.exceptions import (
     AdCPValidationError,
     build_validation_error_details,
-    buyer_loc_segments,
+    format_buyer_field_path,
 )
 from src.core.exceptions import (
     first_validation_error_field as first_validation_error_field,
@@ -203,11 +203,11 @@ def format_validation_error(validation_error: ValidationError, context: str = "r
     """
     error_details = []
     for error in validation_error.errors():
-        # Buyer field path via the single loc→path rule: strips codegen union-variant
-        # tags but never the terminal segment, so the message reports the same path as
-        # ``field`` and ``details.loc`` (#1329 finding 4).
-        field_path = ".".join(str(seg) for seg in buyer_loc_segments(error["loc"]))
         error_type = error["type"]
+        # Buyer field path via the SINGLE bracket renderer, forwarding the error type so the
+        # message reports the exact same path as ``field``, the suggestion, and ``details.loc``
+        # (one spelling, brackets: ``accounts[0].governance_agents[0]...``) — #1329 finding 3.
+        field_path = format_buyer_field_path(error["loc"], error_type=str(error_type))
         msg = error["msg"]
         input_val = error.get("input")
 
@@ -269,8 +269,9 @@ def suggest_validation_fix(validation_error: ValidationError) -> str:
         return "Correct the request to match the AdCP specification and resend."
 
     first = errors[0]
-    field_path = ".".join(str(seg) for seg in buyer_loc_segments(first.get("loc", ()))) or "request"
     error_type = first.get("type", "")
+    # Same SINGLE bracket renderer as the field + message (#1329 finding 3).
+    field_path = format_buyer_field_path(first.get("loc", ()), error_type=str(error_type)) or "request"
 
     if "missing" in error_type:
         return f"Provide the required '{field_path}' field and resend the request."

@@ -30,9 +30,13 @@ Spec grounding (pinned AdCP 3.1.1 / adcp 6.6.0):
   task-scope / ``allowed_tasks`` code this seller does not model). See
   ``_sync_one_account`` for the full per-account error-code rationale.
 
-Credentials are never persisted: the ``accounts.governance_agents`` column model
-(core/account.json GovernanceAgent) is url-only by construction, so the binding
-stores the durable agent identity (url) and nothing sensitive.
+Credentials are never persisted. Two independent grounds: (1) the persistence path is
+url-only by construction — ``set_governance_binding`` projects each request agent to the
+SDK ``CoreGovernanceAgent`` (a ``{url}`` record) before writing, so the write physically
+carries no ``authentication`` blob; and (2) this seller declines the
+``governance-aware-seller`` specialism and never runs ``check_governance``, so it never
+needs the credentials it was handed. The binding stores the durable agent identity (url)
+and nothing sensitive.
 
 Idempotency replay + IDEMPOTENCY_CONFLICT (same key / different payload) are NOT
 implemented here — a genuine deferred gap, tracked by the xfailed UC-030 replay/
@@ -53,7 +57,7 @@ from typing import Annotated, Any
 
 import adcp
 from adcp.types import AccountReference as LibraryAccountReference
-from adcp.types import ContextObject, Error
+from adcp.types import ContextObject
 from adcp.types.aliases import SyncGovernanceAccount as SyncGovernanceAccountInput
 from fastmcp.server.context import Context
 from fastmcp.tools.tool import ToolResult
@@ -70,11 +74,11 @@ from src.core.exceptions import (
     AdCPError,
     AdCPValidationError,
     RecoveryHint,
+    build_advisory_error,
 )
 from src.core.helpers.account_helpers import resolve_account
 from src.core.resolved_identity import ResolvedIdentity
 from src.core.schemas.account import (
-    SyncedGovernanceAgent,
     SyncGovernanceRequest,
     SyncGovernanceResponse,
     SyncGovernanceResponseAccount,
@@ -88,6 +92,12 @@ from src.core.validation_helpers import adcp_validation_boundary
 # release precision (major.minor) derived from the pinned spec so it tracks a bump
 # automatically instead of drifting as a literal.
 _WIRE_ADCP_VERSION = ".".join(adcp.get_adcp_spec_version().split(".")[:2])
+
+# The validation-boundary context string for sync_governance, referenced ONCE (inside the
+# shared builder below). Every transport routes construction through the builder, so this is
+# the single source for the "Invalid sync_governance request: …" message prefix — MCP/A2A/REST
+# no longer each carry their own copy of the literal (#1329 finding 2).
+_SYNC_GOVERNANCE_CONTEXT = "sync_governance request"
 
 # Uniform per-account RESPONSE for an unresolved account. The *_NOT_FOUND
 # uniform-response MUST (pinned error-code.json: CREATIVE_NOT_FOUND /
@@ -111,12 +121,11 @@ _UNRESOLVED_ACCOUNT_MESSAGE = "Account does not exist or is not accessible to th
 _UNRESOLVED_ACCOUNT_SUGGESTION = "verify account via list_accounts or contact seller"
 
 # Code + recovery for the uniform unresolved-account result are DERIVED from the
-# canonical AdCPAccountNotFoundError class metadata, not copied as literals, so the
-# per-account wire code/recovery cannot drift from the exception the rest of the
-# codebase raises for ACCOUNT_NOT_FOUND (#1329). The class docstring pins
-# recovery=terminal against the pinned enumMetadata.
-_UNRESOLVED_ACCOUNT_CODE = AdCPAccountNotFoundError._default_error_code
-_UNRESOLVED_ACCOUNT_RECOVERY = AdCPAccountNotFoundError._default_recovery
+# canonical AdCPAccountNotFoundError class metadata via the PUBLIC advisory_defaults()
+# accessor (not the private _default_* attrs — #1329 finding 9), so the per-account wire
+# code/recovery cannot drift from the exception the rest of the codebase raises for
+# ACCOUNT_NOT_FOUND. The class docstring pins recovery=terminal against the pinned enumMetadata.
+_UNRESOLVED_ACCOUNT_CODE, _UNRESOLVED_ACCOUNT_RECOVERY, _ = AdCPAccountNotFoundError.advisory_defaults()
 
 
 def _failed_account_result(
@@ -136,16 +145,13 @@ def _failed_account_result(
     a non-retryable authz/not-found failure (#1329). The code is the
     spec-facing per-account code set explicitly, not read from the exception's wire
     code — the authority failure is relabeled to the uniform ``ACCOUNT_NOT_FOUND``
-    (see ``_sync_one_account``).
+    (see ``_sync_one_account``). The advisory ``Error`` is built by the single shared
+    ``build_advisory_error`` builder at the error boundary (#1329 finding 9).
     """
     return SyncGovernanceResponseAccount(
         account=account_ref,
         status="failed",
-        errors=[
-            Error(  # structural-guard: advisory per-account result in SyncGovernanceResponse.accounts[].errors[]
-                code=code, message=message, suggestion=suggestion, recovery=recovery
-            )
-        ],
+        errors=[build_advisory_error(code=code, message=message, suggestion=suggestion, recovery=recovery)],
     )
 
 
@@ -202,21 +208,24 @@ def _sync_one_account(
             e.error_code,
             recovery=e.recovery,
             message=str(e),
-            suggestion=getattr(e, "suggestion", None),
+            # ``AdCPError.__init__`` always assigns ``suggestion`` (its own default when
+            # none is passed), so read it directly — a ``getattr`` default would silently
+            # ship ``None`` to the buyer on a codegen rename instead of failing loudly.
+            suggestion=e.suggestion,
         )
 
     # Persist through the repository, which OWNS the url-only projection (credentials
-    # never persisted — #1329) and returns the stored list as typed GovernanceAgentColumn
-    # records ({url: str}). Echo from that same list so persisted and echoed can never
-    # disagree; the typed record means ``agent["url"]`` is statically key-checked — a column
-    # rename fails mypy here rather than becoming a runtime KeyError (#1329).
+    # never persisted — #1329) and returns the stored list as url-only SDK
+    # ``CoreGovernanceAgent`` records — the SAME type the response echoes. Echo those
+    # records directly so persisted and echoed can never disagree; the shared SDK type
+    # means a schema change lands on both at once (Pattern #1).
     # set_governance_binding replaces the prior binding (per-account replace semantics).
-    agent_urls = repo.set_governance_binding(account_id, entry.governance_agents)
+    agent_records = repo.set_governance_binding(account_id, entry.governance_agents)
 
     return SyncGovernanceResponseAccount(
         account=entry.account,
         status="synced",
-        governance_agents=[SyncedGovernanceAgent(url=agent["url"]) for agent in agent_urls],
+        governance_agents=agent_records,
     )
 
 
@@ -257,9 +266,12 @@ async def _sync_governance_impl(
     audit_logger = get_audit_logger("sync_governance", tenant_id)
     audit_logger.log_info(f"sync_governance completed: {synced}/{len(results)} synced (principal={principal_id})")
 
-    # Echo the seller's implemented protocol version on the response (POST-S4). Derived
-    # release-precision (major.minor) from the pinned spec so it cannot drift on a bump —
-    # the wire carries release precision even though inputs may be patch-precise (#1329).
+    # Echo the seller's implemented protocol version on the response (POST-S4, graded by
+    # BR-UC-030). Derived release-precision (major.minor) from the pinned spec so it cannot
+    # drift on a bump — the wire carries release precision even though inputs may be
+    # patch-precise (#1329). This is the only tool that stamps adcp_version in _impl; folding
+    # the echo into a shared response base so every tool echoes it identically is a
+    # cross-cutting change deferred to #1934 (the echo must stay here until then — it is graded).
     return SyncGovernanceResponse(accounts=results, context=req.context, adcp_version=_WIRE_ADCP_VERSION)
 
 
@@ -275,22 +287,23 @@ def build_sync_governance_request(
     ext: dict[str, Any] | None,
     idempotency_key: str | None,
 ) -> SyncGovernanceRequest:
-    """Assemble a ``SyncGovernanceRequest`` from loose params (the MCP + A2A wrappers).
+    """Assemble a ``SyncGovernanceRequest`` from loose params — the SINGLE constructor.
 
-    Owns the CONSTRUCTION SEMANTICS the two hand-assembling transports must share — the
-    validation boundary, the omit-``None``-idempotency_key behaviour, and the boundary
-    context string — so those cannot drift between MCP and A2A. It does NOT own the field
-    LIST: the field names are still enumerated at four sites (these params, the MCP
-    signature below, ``SyncGovernanceBody`` in ``src/routes/api_v1.py``, and the A2A
-    skill's ``parameters.get(...)`` kwargs), and adding a spec field touches each.
+    Owns the CONSTRUCTION SEMANTICS every transport shares — the validation boundary, the
+    omit-``None``-idempotency_key behaviour, and the boundary context string
+    (``_SYNC_GOVERNANCE_CONTEXT``, referenced once) — so those cannot drift between MCP, A2A,
+    and REST. All three transports call this builder (REST too, as of #1329 finding 2), so it
+    carries its own internal boundary and callers need not re-wrap it (the REST-request-boundary
+    guard recognises self-bounding builders — see ``self_bounding_builders``). It does NOT own
+    the field LIST: the field names are still enumerated at the call sites (these params, the MCP
+    signature below, ``SyncGovernanceBody`` in ``src/routes/api_v1.py``, and the A2A skill's
+    ``parameters.get(...)`` kwargs), and adding a spec field touches each.
     ``tests/unit/test_boundary_field_forwarding.py::TestSyncGovernanceFieldForwarding``
-    is what actually prevents a field drift — it derives the spec-field set from the
-    request model and asserts both wrappers forward it here (#1329 R9-D1). REST builds
-    generically via ``model_dump(exclude_none=True)`` and needs no counterpart.
-    Construction runs inside the AdCP validation boundary so a schema violation
-    (missing/short idempotency_key, non-https url, short credentials, agent
-    cardinality) surfaces as the VALIDATION_ERROR envelope — the same wire shape REST
-    produces — on both transports (#1329).
+    is what actually prevents a field drift — it derives the spec-field set from the request
+    model and asserts the wrappers forward it here (#1329 R9-D1). Construction runs inside the
+    AdCP validation boundary so a schema violation (missing/short idempotency_key, non-https url,
+    short credentials, agent cardinality) surfaces as the VALIDATION_ERROR envelope — the same
+    wire shape on every transport (#1329).
 
     ``idempotency_key`` is OMITTED when None (not passed as None): REST drops it via
     ``model_dump(exclude_none=True)``, so a missing key renders as "Required field is
@@ -302,7 +315,7 @@ def build_sync_governance_request(
     kwargs: dict[str, Any] = {"accounts": accounts or [], "context": context, "ext": ext}
     if idempotency_key is not None:
         kwargs["idempotency_key"] = idempotency_key
-    with adcp_validation_boundary(context="sync_governance request"):
+    with adcp_validation_boundary(context=_SYNC_GOVERNANCE_CONTEXT):
         return SyncGovernanceRequest(**kwargs)
 
 

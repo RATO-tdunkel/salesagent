@@ -25,21 +25,11 @@ ctx["env"] is a CapabilitiesEnv (bound by the conftest UC-010 branch).
 
 from __future__ import annotations
 
-import re
-
 from pytest_bdd import given, parsers, then, when
 
 from tests.bdd.steps._outcome_helpers import wire_dict
 from tests.bdd.steps.generic._dispatch import dispatch_request
 from tests.helpers import assert_declared_capabilities
-
-# specialism -> parent AdCP protocol rollup (AdCP 3.1.1 compliance index). This seller emits
-# only ``sales-non-guaranteed`` (audit-derived — see _DECLARED_SPECIALISMS), whose parent
-# protocol is ``media_buy``, which IS in supported_protocols. A newly-emitted specialism absent
-# from this map KeyErrors loudly in then_specialisms_roll_up, forcing its rollup to be verified
-# before it can pass rather than silently accepted (#1329 R9-F1).
-_SPECIALISM_PARENT_PROTOCOL = {"sales-non-guaranteed": "media_buy"}
-_KEBAB_CASE = re.compile(r"^[a-z0-9]+(-[a-z0-9]+)*$")
 
 
 @given(parsers.parse("the tenant account is configured for {boundary_point}"))
@@ -141,34 +131,35 @@ def given_tenant_claims_specialisms(ctx: dict, specialisms: str) -> None:
 
 @then("specialisms should be a unique array of kebab-case enum IDs")
 def then_specialisms_kebab_unique(ctx: dict) -> None:
-    """Grade the emitted specialisms on the real wire: a unique array of kebab-case enum IDs.
+    """Grade the emitted specialisms on the real wire through the single coupling grader.
 
-    Falsifiable: emptying _DECLARED_SPECIALISMS reddens (non-empty assertion); a non-kebab or
-    duplicated id reddens the per-item checks (#1329 R9-F1).
+    Routes through ``assert_declared_capabilities`` (#1329 finding 4) rather than
+    re-implementing its specialism asserts — the grader pins ``specialisms`` BY VALUE against
+    the production audit table (kebab-case enum ids by construction) and unique. Falsifiable: a
+    specialism the wire declares that the audit does not reddens the exact-set check.
     """
-    body = wire_dict(ctx)
-    specialisms = body.get("specialisms")
-    assert isinstance(specialisms, list) and specialisms, f"specialisms must be a non-empty array: {body}"
-    assert len(specialisms) == len(set(specialisms)), f"specialisms must be unique, got {specialisms}"
-    for s in specialisms:
-        assert isinstance(s, str) and _KEBAB_CASE.match(s), f"specialism {s!r} is not a kebab-case enum id"
+    assert_declared_capabilities(wire_dict(ctx))
 
 
 @then("each specialism should roll up to a protocol in supported_protocols")
 def then_specialisms_roll_up(ctx: dict) -> None:
     """Every emitted specialism's parent protocol must be in supported_protocols.
 
-    The spec requires each declared specialism to map to a protocol the seller actually
-    supports. Grading the EMITTED list against the wire's supported_protocols is what would
-    surface a declaration defect (a specialism whose parent protocol is undeclared) — which is
-    exactly why graduating this scenario is worthwhile, not merely green (#1329 R9-F1).
+    Parent protocols are derived from the production ``_SPECIALISM_AUDIT`` table (the SSOT),
+    NOT a hand-copied map — a test whose oracle is a hand-copy of the claim it grades cannot
+    catch that claim being wrong (#1329 finding 1). A KeyError on an emitted specialism absent
+    from the audit is a loud failure (the audit must cover every declared id).
     """
+    from adcp.types.generated_poc.enums.specialism import AdcpSpecialism
+
+    from src.core.tools.capabilities import _SPECIALISM_AUDIT
+
     body = wire_dict(ctx)
     specialisms = body.get("specialisms") or []
     protocols = set(body.get("supported_protocols") or [])
     assert protocols, f"supported_protocols must be present to grade rollup: {body}"
     for s in specialisms:
-        parent = _SPECIALISM_PARENT_PROTOCOL[s]  # loud KeyError on an unmapped emitted specialism
+        parent = _SPECIALISM_AUDIT[AdcpSpecialism(s)].parent_protocol  # loud on an un-audited id
         assert parent in protocols, (
             f"specialism {s!r} rolls up to protocol {parent!r}, absent from supported_protocols {protocols}"
         )

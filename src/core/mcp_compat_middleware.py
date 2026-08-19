@@ -15,6 +15,7 @@ from fastmcp.server.middleware import Middleware, MiddlewareContext
 from fastmcp.tools.tool import ToolResult
 from mcp.types import CallToolRequestParams
 from pydantic import ValidationError
+from typing_extensions import TypeIs
 
 from src.core.request_compat import deep_strip_to_schema, normalize_request_params, strip_unknown_params
 from src.core.tool_error_logging import _translate_to_tool_error, record_boundary_error
@@ -125,10 +126,11 @@ class RequestCompatMiddleware(Middleware):
             # everything else), so the shared builder applies uniformly.
             from src.core.validation_helpers import adcp_validation_error_from
 
-            # Narrow for the type checker: the guard above re-raised anything that is not
-            # a TypeAdapter ValidationError, so exc (or the reassigned retry_exc) is one here.
-            assert isinstance(exc, ValidationError)
-            typed = adcp_validation_error_from(exc)
+            # ``exc`` is narrowed to ValidationError by the ``TypeIs`` guard above (the
+            # ``if not self._is_typeadapter_validation_error(exc): raise`` re-raised everything
+            # else), so no runtime assert is needed — pass the tool name so MCP renders the same
+            # ``Invalid <tool> request: …`` context A2A/REST produce (#1329 finding 2).
+            typed = adcp_validation_error_from(exc, context=f"{tool_name} request")
             tenant_id = None
             principal_id = None
             if context.fastmcp_context is not None:
@@ -168,8 +170,14 @@ class RequestCompatMiddleware(Middleware):
         return is_production() and RequestCompatMiddleware._is_typeadapter_validation_error(exc)
 
     @staticmethod
-    def _is_typeadapter_validation_error(exc: Exception) -> bool:
-        """Return True for FastMCP TypeAdapter validation failures."""
+    def _is_typeadapter_validation_error(exc: Exception) -> TypeIs[ValidationError]:
+        """Return True for FastMCP TypeAdapter validation failures.
+
+        Typed ``TypeIs[ValidationError]`` so the caller's ``if not ...: raise`` guard narrows
+        ``exc`` to ``ValidationError`` for the type checker without an ``assert isinstance`` —
+        which ``python -O`` strips, leaving the following ``exc.errors()`` unguarded (#1329
+        finding 10).
+        """
         return isinstance(exc, ValidationError) and exc.title.startswith("call[")
 
     async def _get_tool_schema(

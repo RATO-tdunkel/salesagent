@@ -6,7 +6,7 @@ core success path, the per-account authority failure, the partial-failure model,
 and the request-validation boundary all execute and assert on the wire across
 a2a/mcp/rest (no IMPL — BDD grades wire conformance).
 
-Out of scope (routed to ``_UC030_XFAIL_TAGS`` in conftest, not stepped here):
+Out of scope (routed to the conftest ``_XFAIL_TAGS`` registry, not stepped here):
 - ``@check`` scenarios grade ``check_governance`` (enforcement), a capability this
   agent deliberately does not declare (``governance-aware-seller``).
 - Idempotency replay / IDEMPOTENCY_CONFLICT and per-operation scope
@@ -47,8 +47,8 @@ from tests.helpers.governance import (
     account_entry,
     governance_agent_dict,
     leaky_governance_agent,
+    normalize_url,
     persisted_governance_urls,
-    url_eq,
 )
 
 # A valid, well-formed idempotency_key (pattern ^[A-Za-z0-9_.:-]{16,255}$) and
@@ -415,13 +415,7 @@ def when_bva_governance_agents(ctx: dict, boundary: str) -> None:
         "governance_agents has 0 entries": [],
         "governance_agents has 2 entries": [_bva_agent(), _bva_agent()],
     }[boundary]
-    # Record the EXACT wire discriminator so then_request_verdict tells minItems (0 entries →
-    # "at least 1 item") from maxItems (2 entries → "at most 1 item"): both point at the same
-    # governance_agents field, so a field-only grade left them byte-identical (#1329 finding 5).
-    ctx["bva_grade"] = {
-        "governance_agents has 0 entries": {"field": _AGENTS_FIELD, "message_substr": "at least 1 item"},
-        "governance_agents has 2 entries": {"field": _AGENTS_FIELD, "message_substr": "at most 1 item"},
-    }[boundary]
+    ctx["bva_grade"] = _BVA_GRADE.get(boundary)
     _dispatch(ctx, "", idempotency_key=_VALID_KEY, accounts=[_account_entry("acct-bva", agents)])
 
 
@@ -431,6 +425,7 @@ def when_bva_governance_agents(ctx: dict, boundary: str) -> None:
 def when_bva_accounts(ctx: dict, boundary: str) -> None:
     n = {"accounts has 0 entries": 0, "accounts has 100 entries": 100, "accounts has 101 entries": 101}[boundary]
     accounts = [_account_entry(f"acct-bva-{i}", [_bva_agent()]) for i in range(n)]
+    ctx["bva_grade"] = _BVA_GRADE.get(boundary)
     _dispatch(ctx, "", idempotency_key=_VALID_KEY, accounts=accounts)
 
 
@@ -448,6 +443,7 @@ def when_bva_auth_schemes(ctx: dict, boundary: str) -> None:
         "single item outside enum": {"schemes": ["definitely-not-a-scheme"], "credentials": BEARER_CREDS},
         "schemes absent": {"credentials": BEARER_CREDS},
     }[boundary]
+    ctx["bva_grade"] = _BVA_GRADE.get(boundary)
     _dispatch(
         ctx, "", idempotency_key=_VALID_KEY, accounts=[_account_entry("acct-bva", [_bva_agent(authentication=auth)])]
     )
@@ -467,6 +463,7 @@ def when_bva_url(ctx: dict, boundary: str) -> None:
         agent = _bva_agent(url=_UNSET)
     else:
         raise AssertionError(f"unknown url boundary {boundary!r}")
+    ctx["bva_grade"] = _BVA_GRADE.get(boundary)
     _dispatch(ctx, "", idempotency_key=_VALID_KEY, accounts=[_account_entry("acct-bva", [agent])])
 
 
@@ -481,14 +478,17 @@ def then_request_verdict(ctx: dict, verdict: str) -> None:
     """
     result = ctx["result"]
     if verdict == "invalid":
-        # When the when-step recorded an exact discriminator (field + min/max message), pin it so
-        # a min-vs-max or wrong-field regression reddens; otherwise grade code + pinned-enum
-        # recovery (#1329 finding 5). require_suggestion holds for the discriminated rows.
+        # Every invalid @bva row MUST carry a _BVA_GRADE entry (recorded by its when-step), so
+        # the field + exact message_substr + suggestion_substr are pinned — a min-vs-max, wrong-
+        # field, or missing-suggestion regression reddens, and two different boundaries can no
+        # longer pass on one byte-identical assertion (#1329 finding 6). A missing entry is a
+        # loud failure, not a silent degrade to a bare code check.
         grade = ctx.get("bva_grade")
-        if grade:
-            result.assert_wire_error("VALIDATION_ERROR", require_suggestion=True, **grade)
-        else:
-            result.assert_wire_error("VALIDATION_ERROR")
+        assert grade is not None, (
+            f"invalid @bva boundary has no _BVA_GRADE entry — every invalid row must pin "
+            f"field + message_substr + suggestion_substr (#1329 finding 6); ctx={ctx.get('bva_boundary')!r}"
+        )
+        result.assert_wire_error("VALIDATION_ERROR", require_suggestion=True, **grade)
     elif verdict == "valid":
         assert not result.is_error, (
             "a boundary-valid request must be accepted at validation (per-account resolution may "
@@ -581,7 +581,7 @@ def then_echo_url(ctx: dict, account_id: str, idx: int, url: str) -> None:
     acct = _wire_account(ctx, account_id)
     agents = acct.get("governance_agents") or []
     actual = agents[idx]["url"]
-    assert url_eq(actual, url), f"account {account_id}: expected echoed url {url}, got {actual}"
+    assert actual == normalize_url(url), f"account {account_id}: expected echoed url {url}, got {actual}"
 
 
 @then(parsers.parse('the response account "{account_id}" does NOT echo governance_agents[{idx:d}].authentication'))
@@ -698,7 +698,7 @@ def then_persisted_binding_is(ctx: dict, account_id: str, url: str) -> None:
     # than two identical bodies (#1329; mirrors the stacked @when parsers).
     # An absent/unbound account reads back as [], so the len==1 check also covers persistence.
     urls = persisted_governance_urls(ctx["tenant"].tenant_id, account_id)
-    assert len(urls) == 1 and url_eq(urls[0], url), f"expected {account_id} persisted binding == [{url!r}], got {urls}"
+    assert urls == [normalize_url(url)], f"expected {account_id} persisted binding == [{url!r}], got {urls}"
 
 
 @then(parsers.parse('the previous binding to "{url}" is no longer present'))
@@ -709,7 +709,7 @@ def then_previous_binding_absent(ctx: dict, url: str) -> None:
     assert prior, "no prior binding recorded by the pre-binding Given"
     account_id = next(iter(prior))
     urls = persisted_governance_urls(ctx["tenant"].tenant_id, account_id)
-    assert not any(url_eq(p, url) for p in urls), f"stale binding {url!r} still present on {account_id}: {urls}"
+    assert normalize_url(url) not in urls, f"stale binding {url!r} still present on {account_id}: {urls}"
 
 
 @then(parsers.parse('the account for brand "{brand}" on operator "{operator}" has status "{status}"'))
@@ -752,6 +752,73 @@ _CREDENTIAL_EXTRA_FIELD = "accounts[0].governance_agents[0].authentication.crede
 _LEAK_CHANNEL_FIELD = {
     "url-userinfo": _URL_FIELD,
     "extra-authentication-key": _CREDENTIAL_EXTRA_FIELD,
+}
+
+_ACCOUNTS_FIELD = "accounts"
+_SCHEMES_FIELD = "accounts[0].governance_agents[0].authentication.schemes"
+_SCHEMES_ITEM_FIELD = "accounts[0].governance_agents[0].authentication.schemes[0]"
+
+# The expected wire envelope for EVERY invalid @bva boundary row, keyed on the Examples
+# `boundary` string (the _LEAK_CHANNEL_FIELD pattern above). Before this, only the
+# governance_agents when-step recorded an exact grade and the other three when-steps recorded
+# nothing, so `then_request_verdict` degraded to a bare `assert_wire_error("VALIDATION_ERROR")`
+# for 8 rows × 3 transports — e.g. `url absent` and `non-uri string` graded by a byte-identical
+# assertion (#1329 finding 6). Every invalid row now pins field + message_substr +
+# suggestion_substr; then_request_verdict fails loudly if an invalid row has no entry. Values
+# verified against the real per-transport envelope (message_substr distinguishes minItems from
+# maxItems on a shared field; suggestion_substr pins the corrective verb).
+_BVA_GRADE: dict[str, dict[str, str]] = {
+    "governance_agents has 0 entries": {
+        "field": _AGENTS_FIELD,
+        "message_substr": "at least 1 item",
+        "suggestion_substr": "Provide a valid",
+    },
+    "governance_agents has 2 entries": {
+        "field": _AGENTS_FIELD,
+        "message_substr": "at most 1 item",
+        "suggestion_substr": "Provide a valid",
+    },
+    "accounts has 0 entries": {
+        "field": _ACCOUNTS_FIELD,
+        "message_substr": "at least 1 item",
+        "suggestion_substr": "Provide a valid",
+    },
+    "accounts has 101 entries": {
+        "field": _ACCOUNTS_FIELD,
+        "message_substr": "at most 100 items",
+        "suggestion_substr": "Provide a valid",
+    },
+    "empty array (0 items)": {
+        "field": _SCHEMES_FIELD,
+        "message_substr": "at least 1 item",
+        "suggestion_substr": "Provide a valid",
+    },
+    "two items": {"field": _SCHEMES_FIELD, "message_substr": "at most 1 item", "suggestion_substr": "Provide a valid"},
+    "single item outside enum": {
+        "field": _SCHEMES_ITEM_FIELD,
+        "message_substr": "Input should be 'Bearer'",
+        "suggestion_substr": "Correct the",
+    },
+    "schemes absent": {
+        "field": _SCHEMES_FIELD,
+        "message_substr": "Required field is missing",
+        "suggestion_substr": "Provide the required",
+    },
+    "http:// URL (plaintext)": {
+        "field": _URL_FIELD,
+        "message_substr": "must use https://",
+        "suggestion_substr": "Correct the",
+    },
+    "non-uri string": {
+        "field": _URL_FIELD,
+        "message_substr": "should be a valid URL",
+        "suggestion_substr": "Correct the",
+    },
+    "url absent": {
+        "field": _URL_FIELD,
+        "message_substr": "Required field is missing",
+        "suggestion_substr": "Provide the required",
+    },
 }
 
 

@@ -19,7 +19,7 @@ from pydantic import BaseModel, ValidationError
 if TYPE_CHECKING:
     from collections.abc import Iterator, Mapping, Sequence
 
-    from adcp.types import ContextObject
+    from adcp.types import ContextObject, Error
 
 logger = logging.getLogger(__name__)
 
@@ -278,6 +278,19 @@ class AdCPError(Exception):
         self.error_code = error_code if error_code is not None else type(self)._default_error_code
         self.status_code = status_code if status_code is not None else type(self)._default_status_code
         self.recovery = recovery if recovery is not None else type(self)._default_recovery
+
+    @classmethod
+    def advisory_defaults(cls) -> tuple[str, RecoveryHint, str | None]:
+        """Public ``(error_code, recovery, suggestion)`` for building a per-item advisory.
+
+        A per-account/per-item advisory ``Error`` in a SUCCESS envelope's ``errors[]`` cannot
+        raise, so it needs this class's pinned wire metadata as literals. This is the SANCTIONED
+        public read of the class ``_default_*`` attributes — callers outside this module (the
+        ``build_advisory_error`` builder and the tool derivation constants) MUST use it rather
+        than reaching into the private ``_default_error_code`` / ``_default_recovery`` (#1329
+        finding 9), so a codegen/refactor rename of those attributes breaks in one place.
+        """
+        return cls._default_error_code, cls._default_recovery, cls._default_suggestion
 
     @property
     def wire_error_code(self) -> str:
@@ -1026,6 +1039,30 @@ def build_two_layer_error_envelope(exc: AdCPError) -> dict[str, Any]:
     return envelope
 
 
+def build_advisory_error(
+    *,
+    code: str,
+    message: str,
+    recovery: RecoveryHint,
+    suggestion: str | None = None,
+    field: str | None = None,
+) -> Error:
+    """Build one per-item advisory ``Error`` for a SUCCESS envelope's ``errors[]`` entry.
+
+    The SINGLE construction site for an advisory per-item ``Error`` — the kind that lives in a
+    success envelope (``SyncGovernanceResponse.accounts[].errors[]``,
+    ``SyncAccountsResponse.errors[]``) rather than being raised at the boundary. Before this,
+    every tool hand-built the ``Error(code=...)`` and carried its own ``# structural-guard:``
+    marker; centralizing it here — beside ``build_two_layer_error_envelope`` at the error
+    boundary, OUTSIDE ``src/core/tools/`` — means the wire-shape decision has one home and the
+    per-tool markers disappear (#1329 finding 9). Derive ``code`` / ``recovery`` /
+    ``suggestion`` from a typed class via :meth:`AdCPError.advisory_defaults` at the call site.
+    """
+    from adcp.types import Error
+
+    return Error(code=code, message=message, suggestion=suggestion, recovery=recovery, field=field)
+
+
 # Canonical buyer-facing suggestions from error-code.json enumMetadata (AdCP 3.1.1):
 # each code carries its own default hint, so a VALIDATION_ERROR must not borrow
 # INVALID_REQUEST's text.
@@ -1048,47 +1085,51 @@ def _is_generated_union_variant_segment(loc: str) -> bool:
     return bool(loc) and loc[0].isupper() and "_" not in loc
 
 
-def buyer_loc_segments(loc: tuple[str | int, ...] | Sequence[str | int]) -> tuple[str | int, ...]:
+def buyer_loc_segments(
+    loc: tuple[str | int, ...] | Sequence[str | int], *, error_type: str = ""
+) -> tuple[str | int, ...]:
     """Project a Pydantic ``loc`` to the buyer's real request path — the SINGLE rule.
 
-    Every renderer that turns a Pydantic ``loc`` into a buyer-facing field path
-    (``first_validation_error_field`` for ``field``, ``format_validation_error`` for
-    the message, ``build_validation_error_details`` for ``details.loc``) MUST route
-    through here so one envelope cannot report three different paths for one error
-    (#1329 R9-G3 / finding 4).
+    Every renderer that turns a Pydantic error into a buyer-facing field path
+    (``first_validation_error_field`` for ``field``, ``format_validation_error`` for the
+    message, ``suggest_validation_fix`` for the suggestion, ``build_validation_error_details``
+    for ``details.loc``) MUST route through here so one envelope cannot report two different
+    paths for one error (#1329 finding 3). The projection needs the error TYPE, not only the
+    ``loc``, because the correct rule depends on it:
 
-    The strip is STRUCTURAL, not a name-shape guess:
+    * ``extra_forbidden`` — the loc is kept VERBATIM. Its terminal segment is the buyer's OWN
+      rejected key (``Authorization``, ``X-Api-Key``, ``Token``) — arbitrary casing, and the
+      one place a PascalCase-looking segment is a real buyer pointer rather than a codegen tag.
+    * every other type — a codegen union-variant class segment (``AccountReference1``,
+      ``Accounts3``) is dropped at ANY position, INCLUDING the terminal. A ``model_type`` error's
+      loc ends in the variant name (``('accounts', 0, 'account', 'AccountReference1')``), which
+      is not a path into the buyer's payload, so the terminal must be dropped too (the "never
+      drop the terminal" rule this replaces leaked that name to the buyer).
 
-    * A generated union-variant class segment (``AccountReference1``, ``Accounts3``)
-      is a codegen tag Pydantic inserts BEFORE the real field within the matched
-      union member — it is never the terminal segment, so it is dropped only when a
-      later segment follows it.
-    * The TERMINAL segment is never dropped. An ``extra_forbidden`` key carries the
-      buyer's own name as the last segment (``Authorization``, ``X-Api-Key``,
-      ``Token``), which the capitalization heuristic would otherwise mistake for a
-      variant tag and silently delete — losing the one actionable pointer the buyer
-      has (the echoed value is always redacted on that path). Keeping the terminal
-      segment preserves header-style keys of any capitalization.
+    Detection is a NAME-SHAPE heuristic (``_is_generated_union_variant_segment``), not a
+    structural SDK-class-name lookup: AdCP request fields are snake_case (lowercase +
+    underscores), so on any error other than ``extra_forbidden`` a first-upper, no-underscore
+    segment is a generated variant tag. A structural scan of the SDK generated namespace is
+    ~2.5s per call — far too slow for the rejection path — and the snake_case invariant plus
+    the ``extra_forbidden`` carve-out makes the heuristic safe.
     """
-    segments = tuple(loc)
-    last = len(segments) - 1
-    return tuple(
-        seg
-        for i, seg in enumerate(segments)
-        if i == last or not (isinstance(seg, str) and _is_generated_union_variant_segment(seg))
-    )
+    if "extra_forbidden" in error_type:
+        return tuple(loc)
+    return tuple(seg for seg in loc if not (isinstance(seg, str) and _is_generated_union_variant_segment(seg)))
 
 
-def format_buyer_field_path(loc: tuple[str | int, ...] | Sequence[str | int]) -> str:
-    """Render a Pydantic ``loc`` as the bracket-notation buyer field path.
+def format_buyer_field_path(loc: tuple[str | int, ...] | Sequence[str | int], *, error_type: str = "") -> str:
+    """Render a Pydantic error's ``loc`` as the bracket-notation buyer field path.
 
-    List indices render as ``[i]`` so boundary-derived paths such as
-    ``packages[0].budget`` align with the ``packages[].budget`` field strings the
-    implementation layer raises. Routes through :func:`buyer_loc_segments` so the
-    codegen union-variant strip is applied consistently.
+    List indices render as ``[i]`` so boundary-derived paths such as ``packages[0].budget``
+    align with the ``packages[].budget`` field strings the implementation layer raises. This is
+    the SINGLE renderer for ``field``, the message bullet, AND the suggestion, so all three
+    carry one identical string (#1329 finding 3). Routes through :func:`buyer_loc_segments`,
+    forwarding ``error_type`` so the codegen union-variant strip and the ``extra_forbidden``
+    carve-out are applied consistently.
     """
     parts: list[str] = []
-    for seg in buyer_loc_segments(loc):
+    for seg in buyer_loc_segments(loc, error_type=error_type):
         if isinstance(seg, int):
             parts.append(f"[{seg}]")
         elif parts:
@@ -1104,25 +1145,27 @@ def first_validation_error_field(validation_error: ValidationError) -> str | Non
     Lets a transport boundary attach a structured ``field`` to the
     ``AdCPValidationError`` it raises, so the wire envelope carries the offending
     field path instead of only the rendered message. Delegates the ``loc`` →
-    buyer-path projection to :func:`format_buyer_field_path` (#1329 R9-G3 / finding 4).
+    buyer-path projection to :func:`format_buyer_field_path`, forwarding the error type so the
+    codegen-variant strip / ``extra_forbidden`` carve-out apply (#1329 finding 3).
     """
     errors = validation_error.errors()
     if not errors:
         return None
-    return format_buyer_field_path(errors[0]["loc"])
+    first = errors[0]
+    return format_buyer_field_path(first["loc"], error_type=str(first.get("type", "")))
 
 
 def build_validation_error_details(errors: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
     """Project Pydantic errors into the buyer-safe structured detail shape.
 
-    ``loc`` is projected through :func:`buyer_loc_segments` so the structured detail
-    reports the same buyer path as ``field`` and the message — no codegen union tag
-    leaks into one renderer while the others strip it (#1329 finding 4).
+    ``loc`` is projected through :func:`buyer_loc_segments` (forwarding the error type) so the
+    structured detail reports the same buyer path as ``field``, the message, and the suggestion —
+    no codegen union tag leaks into one renderer while the others strip it (#1329 finding 3).
     """
     return {
         "validation_errors": [
             {
-                "loc": list(buyer_loc_segments(error.get("loc", ()))),
+                "loc": list(buyer_loc_segments(error.get("loc", ()), error_type=str(error.get("type", "")))),
                 "msg": error.get("msg"),
                 "type": error.get("type"),
             }

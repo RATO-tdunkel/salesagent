@@ -11,7 +11,6 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 from adcp.types import GetAdcpCapabilitiesResponse
-from adcp.types.generated_poc.enums.specialism import AdcpSpecialism
 from adcp.types.generated_poc.protocol.get_adcp_capabilities_response import (
     SupportedProtocol,
 )
@@ -176,18 +175,26 @@ class TestGetAdcpCapabilitiesImpl:
         # agent-wide claim is the Idempotency3 (supported=False) variant (#1329 R9-F2).
         assert response.adcp.idempotency.supported is False
         assert not hasattr(response.adcp.idempotency, "replay_ttl_seconds")
-        # Specialism declaration activates storyboard scenarios bundled under
-        # sales-non-guaranteed (inventory_list_*, delivery_reporting, etc.).
-        assert response.specialisms is not None
-        assert AdcpSpecialism.sales_non_guaranteed in response.specialisms
+        # No specialism is declared (#1329): sales-non-guaranteed was withdrawn — its
+        # requires_scenarios gate is not backed end-to-end (see _SPECIALISM_AUDIT). The
+        # exact declared set is graded on the wire by assert_declared_capabilities.
+        assert response.specialisms == []
         # #1329 gap 13: sandbox is declared FALSE (no behavioral isolation ships).
         # Declaring the account capability requires the schema-required supported_billing.
         assert response.account is not None
         assert response.account.sandbox is False
         assert response.account.supported_billing  # non-empty (schema-required)
 
-    def test_impl_returns_valid_adcp_response(self):
-        """Test that impl response can be serialized to valid JSON."""
+    def test_impl_response_is_json_serializable(self):
+        """The _impl response round-trips through model_dump(mode="json").
+
+        A structural smoke check of the _impl layer only — it asserts the envelope keys
+        are present and JSON-serializable, NOT the honesty VALUES (specialisms set,
+        account.sandbox). Those are the buyer contract and are graded on the real wire by
+        ``tests/helpers/capabilities.py::assert_declared_capabilities`` across a2a/mcp/rest
+        (#1329 finding 4) — a model_dump() equality here is a self-consistency check, not a
+        wire grade, so it must not masquerade as one.
+        """
         from src.core.config_loader import current_tenant
         from src.core.tools.capabilities import _get_adcp_capabilities_impl
 
@@ -195,18 +202,9 @@ class TestGetAdcpCapabilitiesImpl:
         current_tenant.set(None)
 
         response = _get_adcp_capabilities_impl(None, None)
-
-        # Should be able to serialize - use mode="json" for JSON-compatible output
         data = response.model_dump(mode="json")
 
-        assert "adcp" in data
-        assert "supported_protocols" in data
-        assert data["supported_protocols"] == ["media_buy"]
-        assert "specialisms" in data
-        assert data["specialisms"] == ["sales-non-guaranteed"]
-        # #1329 gap 13: sandbox=False present at the wire (honesty assertion,
-        # mirroring the property_list_filtering / catalog_management pattern).
-        assert data["account"]["sandbox"] is False
+        assert {"adcp", "supported_protocols", "specialisms", "account"} <= data.keys()
 
 
 def test_declared_specialisms_are_valid_non_deprecated_pinned_enum_ids():
@@ -236,6 +234,68 @@ def test_declared_specialisms_are_valid_non_deprecated_pinned_enum_ids():
         assert specialism.value not in deprecated_ids, (
             f"{specialism.value} is deprecated in the pinned specialism.json — do not declare a deprecated slot"
         )
+
+
+def test_specialism_audit_gate():
+    """Walk the specialism audit table and machine-check every DECLARED specialism (#1329 finding 1).
+
+    The audit is DATA (`_SPECIALISM_AUDIT`), not prose, so a wrong declaration reddens HERE
+    instead of only when a human re-reads a comment. For each row whose decision is DECLARED:
+
+    * parent_protocol is in the emitted supported_protocols;
+    * every required_tools entry is a REAL registered tool (from the FastMCP registry);
+    * every requires_scenarios entry has an executing in-repo mirror (`_BACKED_SPECIALISM_SCENARIOS`
+      resolves to an importable `module::symbol`).
+
+    Also asserts the table covers every pinned enum member (a new upstream specialism forces an
+    audit decision) and that `_DECLARED_SPECIALISMS` is exactly the derived declared set.
+    Today no specialism is declared, so the per-declared checks are vacuous — but re-declaring
+    `sales-non-guaranteed` (whose requires_scenarios are NOT in the backed map) reddens gate #3,
+    which is the mechanism that keeps an unbacked declaration out.
+    """
+    import importlib
+
+    from adcp.types.generated_poc.enums.specialism import AdcpSpecialism
+
+    from src.core.main import mcp
+    from src.core.tools.capabilities import (
+        _BACKED_SPECIALISM_SCENARIOS,
+        _DECLARED_SPECIALISMS,
+        _SPECIALISM_AUDIT,
+        _SUPPORTED_PROTOCOL_IDS,
+        _SpecialismDecision,
+    )
+    from src.core.validation_helpers import run_async_in_sync_context
+
+    # Completeness: every pinned enum member has an audit decision.
+    assert set(_SPECIALISM_AUDIT) == set(AdcpSpecialism), (
+        "every pinned AdcpSpecialism must have an _SPECIALISM_AUDIT row — a new upstream "
+        "specialism forces an explicit declared/declined decision"
+    )
+
+    # Derived list matches the table (they cannot drift).
+    derived = [sid for sid, row in _SPECIALISM_AUDIT.items() if row.decision is _SpecialismDecision.DECLARED]
+    assert _DECLARED_SPECIALISMS == derived
+
+    registered_tools = {t.name for t in run_async_in_sync_context(mcp.list_tools())}
+
+    for sid, row in _SPECIALISM_AUDIT.items():
+        if row.decision is not _SpecialismDecision.DECLARED:
+            continue
+        # Gate 1 — parent protocol is hosted.
+        assert row.parent_protocol in _SUPPORTED_PROTOCOL_IDS, (
+            f"{sid.value}: parent protocol {row.parent_protocol!r} not in supported_protocols"
+        )
+        # Gate 2 — every required tool is really registered.
+        missing_tools = set(row.required_tools) - registered_tools
+        assert not missing_tools, f"{sid.value}: declared but required tools not registered: {missing_tools}"
+        # Gate 3 — every requires_scenarios entry has an executing in-repo mirror.
+        for scenario in row.requires_scenarios:
+            symbol = _BACKED_SPECIALISM_SCENARIOS.get(scenario)
+            assert symbol, f"{sid.value}: requires_scenarios {scenario!r} has no backed in-repo mirror"
+            module_name, _, attr = symbol.partition("::")
+            module = importlib.import_module(module_name)
+            assert hasattr(module, attr), f"{sid.value}: backed mirror {symbol!r} does not resolve"
 
 
 class TestGetAdcpCapabilitiesWithTenant:
@@ -282,9 +342,8 @@ class TestGetAdcpCapabilitiesWithTenant:
                 # Full response declares idempotency consistently with the minimal path:
                 # supported=False (agent-wide) — see the honesty rationale above (#1329 R9-F2).
                 assert response.adcp.idempotency.supported is False
-                # Specialism declaration must be consistent across minimal and full paths.
-                assert response.specialisms is not None
-                assert AdcpSpecialism.sales_non_guaranteed in response.specialisms
+                # No specialism declared (#1329) — consistent across minimal and full paths.
+                assert response.specialisms == []
                 # #1329 gap 13: sandbox declared False at the wire (honesty), consistent
                 # across minimal and full paths.
                 assert response.account is not None

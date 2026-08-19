@@ -12,8 +12,9 @@ the governance test contract is expressed once rather than N times (#1329):
   (test-only, for the credential-strip grade).
 - ``governance_binding_stub`` — a ``set_governance_binding`` side_effect mirroring the repo's
   PUBLIC url-only write contract (no coupling to the private projector).
-- ``GOV_URL`` / ``DEFAULT_URL`` / ``BEARER_CREDS`` / ``LEAK_SECRET`` / ``url_eq`` — the shared
-  request constants, the leak secret, and the trailing-slash-tolerant url comparison.
+- ``GOV_URL`` / ``DEFAULT_URL`` / ``BEARER_CREDS`` / ``LEAK_SECRET`` / ``normalize_url`` — the
+  shared request constants, the leak secret, and the SDK ``AnyUrl`` normalization used to pin
+  an echoed url by EXACT equality (the ``CoreGovernanceAgent.url`` echo is always normalized).
 
 Account SEEDING stays in ``tests.helpers.accounts.seed_account_with_access`` (the canonical
 seeder shared with every suite), never a governance-local twin.
@@ -24,6 +25,7 @@ from __future__ import annotations
 from collections.abc import Callable
 from typing import Any
 
+from adcp.types import CoreGovernanceAgent
 from pydantic import AnyUrl
 
 from tests.factories.principal import _UNSET
@@ -44,13 +46,16 @@ BEARER_CREDS = "x" * 64
 LEAK_SECRET = "S3cr3t-must-not-leak-" + "0" * 40
 
 
-def url_eq(actual: str | None, expected: str) -> bool:
-    """Compare governance-agent urls tolerant of AnyUrl trailing-slash normalization.
+def normalize_url(url: str) -> str:
+    """Return ``url`` as the SDK ``AnyUrl`` renders it (the form the wire echoes).
 
-    ``actual`` is null-guarded (``AnyUrl`` may serialize with a trailing ``/``; a missing
-    echo surfaces as ``None``), so a dropped url fails rather than raising.
+    ``CoreGovernanceAgent.url`` is an ``AnyUrl`` (Pattern #1 SDK type), so the persisted and
+    echoed url is ALWAYS the normalized string (a bare host gains a trailing ``/``). Pinning an
+    echoed url against ``normalize_url(expected)`` with EXACT ``==`` is strictly stronger than the
+    old trailing-slash-tolerant comparator — a wire that is not AnyUrl-normalized now FAILS
+    instead of being tolerated (#1329 finding 8).
     """
-    return (actual or "").rstrip("/") == expected.rstrip("/")
+    return str(AnyUrl(url))
 
 
 def governance_agent_dict(
@@ -167,21 +172,22 @@ def persisted_governance_agents_raw(tenant_id: str, account_id: str) -> list[dic
         )
 
 
-def governance_binding_stub() -> Callable[[str, list[Any]], list[dict[str, str]]]:
+def governance_binding_stub() -> Callable[[str, list[Any]], list[CoreGovernanceAgent]]:
     """A ``set_governance_binding`` side_effect mirroring the repo's PUBLIC write contract.
 
-    Projects each request agent to the persisted url-only record — ``{"url": <url>}`` with
-    credentials stripped and the url ``AnyUrl``-normalized (trailing slash), which is the
-    documented return of ``AccountRepository.set_governance_binding``. Normalization goes through
-    ``AnyUrl`` (the public coercion the url-only column applies), NOT the module-private
-    ``_serialize_governance_agents`` projector, so the unit test grades the tool's echo against
-    the repository's public contract rather than coupling to the internal the repo-owned design
-    exists to hide (#1329).
+    Projects each request agent to the persisted url-only SDK record —
+    ``CoreGovernanceAgent(url=<url>)`` with credentials stripped and the url ``AnyUrl``-normalized
+    (trailing slash), which is the documented return type of
+    ``AccountRepository.set_governance_binding`` (#1329 finding 8: the repo returns the SDK
+    ``CoreGovernanceAgent``, not a bare dict). Constructing the SDK type directly — not the
+    module-private ``_serialize_governance_agents`` projector — grades the tool's echo against the
+    repository's public contract, not the internal the repo-owned design exists to hide.
     """
 
-    def _side_effect(account_id: str, agents: list[Any]) -> list[dict[str, str]]:
+    def _side_effect(account_id: str, agents: list[Any]) -> list[CoreGovernanceAgent]:
         return [
-            {"url": str(AnyUrl(agent["url"] if isinstance(agent, dict) else agent.url))} for agent in (agents or [])
+            CoreGovernanceAgent(url=(agent["url"] if isinstance(agent, dict) else agent.url))
+            for agent in (agents or [])
         ]
 
     return _side_effect

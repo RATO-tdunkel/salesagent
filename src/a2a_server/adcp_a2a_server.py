@@ -633,9 +633,12 @@ class AdCPRequestHandler(RequestHandler):
                     skill_name = invocation["skill"]
                     parameters = invocation["parameters"]
                     # Keys only, never values: parameters may carry write-only
-                    # credentials (sync_governance authentication.credentials).
-                    # Matches the keys-only sibling at _handle_explicit_skill (#1329).
-                    logger.info("Processing explicit skill: %s with parameters: %s", skill_name, sorted(parameters))
+                    # credentials (sync_governance authentication.credentials). Same
+                    # ``list(parameters.keys())`` spelling as the keys-only siblings at
+                    # _handle_explicit_skill and the sync_creatives handler (#1329 finding 12).
+                    logger.info(
+                        "Processing explicit skill: %s with parameters: %s", skill_name, list(parameters.keys())
+                    )
 
                     try:
                         result = await self._handle_explicit_skill(
@@ -1943,27 +1946,20 @@ class AdCPRequestHandler(RequestHandler):
         """
         from src.core.tools.governance import build_sync_governance_request
 
-        # The shared builder is the single non-REST field list (also used by the MCP
-        # wrapper): it forwards ``ext``, OMITS an absent idempotency_key (so a missing
-        # key renders as "Required field is missing" on all three transports, not
-        # "Expected string, got NoneType"), and runs the same validation boundary — so
-        # this transport cannot drift from MCP (#1329).
-        #
-        # The builder carries its own internal ``adcp_validation_boundary`` (the only
-        # thing protecting the MCP wrapper, which is outside the request-boundary
-        # guard's scan roots), but the transport-boundary guard
-        # (test_guards_rest_request_boundary.py) matches ``build_*_request(...)`` before
-        # consulting its exemption set, so the call site must also sit lexically inside a
-        # boundary — same convention as the sibling ``with adcp_validation_boundary(...)``
-        # handlers above. The outer boundary is a harmless no-op here (it only catches a
-        # raw ``ValidationError``, which the builder already translates) (#1329).
-        with adcp_validation_boundary(context="sync_governance request"):
-            request = build_sync_governance_request(
-                accounts=parameters.get("accounts", []),
-                context=parameters.get("context"),
-                ext=parameters.get("ext"),
-                idempotency_key=parameters.get("idempotency_key"),
-            )
+        # The shared builder is the single constructor used by every transport (MCP, REST,
+        # A2A): it forwards ``ext``, OMITS an absent idempotency_key (so a missing key renders
+        # as "Required field is missing" on all three transports, not "Expected string, got
+        # NoneType"), and runs the same validation boundary — so this transport cannot drift.
+        # The builder carries its OWN internal ``adcp_validation_boundary``, and the
+        # request-boundary guard now recognises self-bounding builders (see
+        # ``self_bounding_builders``), so no redundant outer ``with`` is needed here (#1329
+        # finding 2).
+        request = build_sync_governance_request(
+            accounts=parameters.get("accounts", []),
+            context=parameters.get("context"),
+            ext=parameters.get("ext"),
+            idempotency_key=parameters.get("idempotency_key"),
+        )
         return await core_sync_governance_tool(req=request, identity=identity)
 
     async def _handle_list_authorized_properties_skill(

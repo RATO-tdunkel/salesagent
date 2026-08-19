@@ -8,7 +8,8 @@ This module follows the MCP/A2A shared implementation pattern from CLAUDE.md.
 
 import logging
 from datetime import UTC, datetime
-from typing import Any
+from enum import StrEnum
+from typing import Any, NamedTuple
 
 from adcp.types import GetAdcpCapabilitiesRequest, GetAdcpCapabilitiesResponse
 from adcp.types.generated_poc.core.media_buy_features import MediaBuyFeatures
@@ -116,66 +117,189 @@ def _build_account_capability(tenant: dict[str, Any] | None) -> AccountCapabilit
     )
 
 
-# Specialisms audit (AdCP 3.1.1, #1329 gap 14). Each specialism maps to a
-# compliance storyboard bundle at /compliance/3.1.1/specialisms/{id}/, gated by
-# BOTH its parent protocol (must appear in supported_protocols) AND its
-# `required_tools` (compliance/3.1.1/index.json), which must all be implemented
-# end-to-end. We declare `media_buy` only, so any specialism whose parent
-# protocol is governance/creative/brand/signals/sponsored-intelligence is out on
-# the parent-protocol rule alone. The full audit against index.json:
-#
-#   DECLARED:
-#   - sales-non-guaranteed  — required_tools {sync_governance, get_products,
-#       create_media_buy}, all now implemented (sync_governance landed with #1329).
-#       RESIDUAL GAP (#1329 decision rule — named, not asserted-met): per the
-#       specialism's compliance bundle (specialisms/sales-non-guaranteed/index.yaml,
-#       AdCP 3.1.1) the claim is gated on `requires_scenarios` as well as
-#       `required_tools`. Two parts of that gate are NOT backed end-to-end here:
-#       (a) `governance_aware_seller/governance_multi_agent_rejected` grades a
-#       `context` (correlation_id) echo on the validation-error envelope, and this
-#       seller does not echo `context` on a validation rejection — `adcp_validation_
-#       boundary` is codebase-wide and predates #1329, so closing it is out of scope
-#       and homed on #1934; and (b) the `media_buy_seller/*` buy-flow storyboards are
-#       not all verified green end-to-end. The declaration is retained (the tools are
-#       present and the sync_governance -> accounts[0].status="synced" grade is met)
-#       with these gaps named rather than papered over.
-#
-#   NOT DECLARED (media_buy protocol, tool gap):
-#   - sales-guaranteed      — same required_tools; the submitted-task/IO-approval
-#       path exists, but the guaranteed IO-approval storyboard is not yet verified
-#       green end-to-end. Candidate for a follow-up once confirmed.
-#   - sales-broadcast-tv    — needs FCC-cancellation semantics we don't implement.
-#   - sales-catalog-driven  — needs conversion tracking + catalog we don't implement.
-#   - sales-social          — required_tools include sync_audiences, sync_catalogs,
-#       sync_event_sources, preview_creative (none implemented).
-#   - sales-proposal-mode   — a DEPRECATED enum value in the PINNED schema: the
-#       adcp 6.6.0 `enums/specialism.json` `x-deprecated-enum-values` lists it, with
-#       the schema's own note that "their corresponding storyboard has been relocated
-#       or removed". (The upstream spec-repo compliance `index.json` still lists it
-#       `stable` — an SDK-vs-spec divergence resolved toward the pin, which is the
-#       repo's grounding authority.) We do not declare a deprecated slot. Its
-#       `required_tools` are in fact empty in the bundle, so a tools-present argument
-#       never applied; the deprecation is the ground. A machine-readable check —
-#       `test_declared_specialisms_are_not_deprecated_in_pinned_schema` — reads the
-#       same `x-deprecated-enum-values` and reddens if a deprecated id is declared.
-#   - audience-sync         — needs sync_audiences (not implemented).
-#   - governance-aware-seller — needs the check_governance enforcement loop; we
-#       register bindings via sync_governance but deliberately do NOT enforce them.
-#
-#   NOT DECLARED (parent protocol not in supported_protocols):
-#   - collection-lists, content-standards, property-lists, governance-delivery-monitor,
-#       governance-spend-authority (parent: governance — not declared)
-#   - creative-ad-server, creative-generative, creative-template, creative-transformers
-#       (parent: creative — we CALL remote creative agents' build_creative; we don't
-#       EXPOSE it as our own tool, so the seller does not host the creative protocol)
-#   - brand-rights (parent: brand), signal-marketplace/signal-owned (parent: signals —
-#       signals tools were intentionally removed; they belong to dedicated signal
-#       agents), sponsored-intelligence (parent: sponsored-intelligence; PREVIEW/ungraded)
-#
-#   OTHER:
-#   - signed-requests — DEPRECATED in 3.1, no bundle; expressed via the
-#       `request_signing.supported` capability, not a specialism.
-_DECLARED_SPECIALISMS: list[AdcpSpecialism] = [AdcpSpecialism.sales_non_guaranteed]
+# The protocols this seller hosts (SSOT for both the emitted `supported_protocols` and the
+# specialism gate's parent-protocol rule — the two must agree, so they read one constant).
+_SUPPORTED_PROTOCOLS: list[SupportedProtocol] = [SupportedProtocol.media_buy]
+_SUPPORTED_PROTOCOL_IDS: frozenset[str] = frozenset(p.value for p in _SUPPORTED_PROTOCOLS)
+
+
+class _SpecialismDecision(StrEnum):
+    DECLARED = "declared"
+    DECLINED = "declined"
+
+
+class _SpecialismAudit(NamedTuple):
+    """One machine-checked row of the specialism audit (AdCP 3.1.1, #1329 gap 14).
+
+    The audit is DATA, not prose, so a wrong declaration reddens ``test_specialism_audit_gate``
+    (which walks this table) instead of only a human re-reading a comment — the recurrence
+    #1329 finding 1 names. Each specialism at /compliance/3.1.1/specialisms/{id}/ is gated by
+    its ``parent_protocol`` (must be in ``supported_protocols``), its ``required_tools`` (all
+    implemented), and its ``requires_scenarios`` (each backed by an executing in-repo mirror).
+
+    ``required_tools`` / ``requires_scenarios`` are DECLARED JUDGMENTS: the compliance
+    ``index.json`` is NOT shipped in the installed SDK (``adcp/_schemas/3.1/compliance/`` holds
+    only the comply-test-controller schemas), so these lists are transcribed here, not vendored.
+    The gate machine-checks what IS checkable — parent ∈ supported, tools ⊆ registry,
+    requires_scenarios ⊆ backed mirrors, id non-deprecated in the pinned enum.
+    """
+
+    decision: _SpecialismDecision
+    parent_protocol: str
+    required_tools: tuple[str, ...]
+    requires_scenarios: tuple[str, ...]
+    rationale: str
+
+
+_MEDIA_BUY = SupportedProtocol.media_buy.value
+
+# Storyboard scenario id -> the executing in-repo mirror (``module::test``) that grades it.
+# A DECLARED specialism's ``requires_scenarios`` must all appear here (the gate resolves each
+# symbol), so a declaration cannot outrun its end-to-end coverage. Empty today: this seller
+# declares NO specialism, and none has its full storyboard gate mirrored end-to-end.
+_BACKED_SPECIALISM_SCENARIOS: dict[str, str] = {}
+
+# Full audit of every pinned AdcpSpecialism. `sales-non-guaranteed` is DECLINED (#1329,
+# reversing the earlier declaration): its `required_tools` are all implemented now that
+# sync_governance exists, but its `requires_scenarios` gate is NOT backed end-to-end — the
+# validation-rejection envelope does not echo `context.correlation_id` (codebase-wide,
+# predates #1329, homed on #1934) and the `media_buy_seller/*` buy-flow storyboards are not
+# verified green. Per #1329's own rule ("declare only where the full contract is met
+# end-to-end; declare False until the adapter fulfills it") the honest call is to withdraw the
+# declaration until the gate is backed, not to declare it with the gap named in prose.
+_SPECIALISM_AUDIT: dict[AdcpSpecialism, _SpecialismAudit] = {
+    # --- media_buy parent, required_tools met, requires_scenarios gap ---
+    AdcpSpecialism.sales_non_guaranteed: _SpecialismAudit(
+        _SpecialismDecision.DECLINED,
+        _MEDIA_BUY,
+        ("get_products", "create_media_buy", "sync_governance"),
+        ("governance_aware_seller/governance_multi_agent_rejected", "media_buy_seller/non_guaranteed_purchase"),
+        "tools implemented; requires_scenarios gate unbacked (context echo on rejection #1934 + "
+        "media_buy_seller storyboards unverified) — declined until the gate is backed end-to-end.",
+    ),
+    AdcpSpecialism.sales_guaranteed: _SpecialismAudit(
+        _SpecialismDecision.DECLINED,
+        _MEDIA_BUY,
+        ("get_products", "create_media_buy", "sync_governance"),
+        ("media_buy_seller/guaranteed_io_approval",),
+        "tools implemented (submitted-task/IO-approval path exists); the guaranteed IO-approval "
+        "storyboard is not verified green end-to-end.",
+    ),
+    AdcpSpecialism.sales_broadcast_tv: _SpecialismAudit(
+        _SpecialismDecision.DECLINED,
+        _MEDIA_BUY,
+        ("get_products", "create_media_buy"),
+        ("media_buy_seller/broadcast_tv_cancellation",),
+        "needs FCC-cancellation semantics not implemented (requires_scenarios gap, not a tool gap).",
+    ),
+    AdcpSpecialism.sales_catalog_driven: _SpecialismAudit(
+        _SpecialismDecision.DECLINED,
+        _MEDIA_BUY,
+        ("get_products", "create_media_buy"),
+        ("media_buy_seller/catalog_conversion",),
+        "needs conversion tracking + catalog not implemented (requires_scenarios gap).",
+    ),
+    AdcpSpecialism.governance_aware_seller: _SpecialismAudit(
+        _SpecialismDecision.DECLINED,
+        _MEDIA_BUY,
+        ("sync_governance",),
+        ("governance_aware_seller/check_governance_enforced",),
+        "binding is registered via sync_governance (tool met) but check_governance enforcement "
+        "is deliberately NOT implemented — requires_scenarios gap.",
+    ),
+    # --- media_buy parent, required_tools NOT met (tool gap) ---
+    AdcpSpecialism.sales_social: _SpecialismAudit(
+        _SpecialismDecision.DECLINED,
+        _MEDIA_BUY,
+        ("sync_audiences", "sync_catalogs", "sync_event_sources", "preview_creative"),
+        (),
+        "required_tools (sync_audiences/sync_catalogs/sync_event_sources/preview_creative) none implemented.",
+    ),
+    AdcpSpecialism.audience_sync: _SpecialismAudit(
+        _SpecialismDecision.DECLINED,
+        _MEDIA_BUY,
+        ("sync_audiences",),
+        (),
+        "required tool sync_audiences not implemented.",
+    ),
+    # --- deprecated in the pinned enum (deprecation is the ground) ---
+    AdcpSpecialism.sales_proposal_mode: _SpecialismAudit(
+        _SpecialismDecision.DECLINED,
+        _MEDIA_BUY,
+        (),
+        (),
+        "DEPRECATED in the pinned adcp 6.6.0 enums/specialism.json x-deprecated-enum-values "
+        "(storyboard relocated/removed); a deprecated slot is never declared. "
+        "Enforced by test_declared_specialisms_are_valid_non_deprecated_pinned_enum_ids.",
+    ),
+    # --- parent protocol NOT in supported_protocols (declined on the parent rule alone) ---
+    AdcpSpecialism.collection_lists: _SpecialismAudit(
+        _SpecialismDecision.DECLINED, "governance", (), (), "parent: governance (not hosted)."
+    ),
+    AdcpSpecialism.content_standards: _SpecialismAudit(
+        _SpecialismDecision.DECLINED, "governance", (), (), "parent: governance (not hosted)."
+    ),
+    AdcpSpecialism.property_lists: _SpecialismAudit(
+        _SpecialismDecision.DECLINED, "governance", (), (), "parent: governance (not hosted)."
+    ),
+    AdcpSpecialism.governance_delivery_monitor: _SpecialismAudit(
+        _SpecialismDecision.DECLINED, "governance", (), (), "parent: governance (not hosted)."
+    ),
+    AdcpSpecialism.governance_spend_authority: _SpecialismAudit(
+        _SpecialismDecision.DECLINED, "governance", (), (), "parent: governance (not hosted)."
+    ),
+    AdcpSpecialism.creative_ad_server: _SpecialismAudit(
+        _SpecialismDecision.DECLINED,
+        "creative",
+        (),
+        (),
+        "parent: creative — we CALL remote creative agents, do not host the creative protocol.",
+    ),
+    AdcpSpecialism.creative_generative: _SpecialismAudit(
+        _SpecialismDecision.DECLINED, "creative", (), (), "parent: creative (not hosted)."
+    ),
+    AdcpSpecialism.creative_template: _SpecialismAudit(
+        _SpecialismDecision.DECLINED, "creative", (), (), "parent: creative (not hosted)."
+    ),
+    AdcpSpecialism.creative_transformers: _SpecialismAudit(
+        _SpecialismDecision.DECLINED, "creative", (), (), "parent: creative (not hosted)."
+    ),
+    AdcpSpecialism.brand_rights: _SpecialismAudit(
+        _SpecialismDecision.DECLINED, "brand", (), (), "parent: brand (not hosted)."
+    ),
+    AdcpSpecialism.signal_marketplace: _SpecialismAudit(
+        _SpecialismDecision.DECLINED,
+        "signals",
+        (),
+        (),
+        "parent: signals — signals tools intentionally removed (dedicated signal agents).",
+    ),
+    AdcpSpecialism.signal_owned: _SpecialismAudit(
+        _SpecialismDecision.DECLINED, "signals", (), (), "parent: signals (not hosted)."
+    ),
+    AdcpSpecialism.sponsored_intelligence: _SpecialismAudit(
+        _SpecialismDecision.DECLINED,
+        "sponsored-intelligence",
+        (),
+        (),
+        "parent: sponsored-intelligence (PREVIEW/ungraded, not hosted).",
+    ),
+    # --- other ---
+    AdcpSpecialism.signed_requests: _SpecialismAudit(
+        _SpecialismDecision.DECLINED,
+        "",
+        (),
+        (),
+        "DEPRECATED in 3.1, no compliance bundle; expressed via the request_signing.supported "
+        "capability, not a specialism.",
+    ),
+}
+
+# Derived view — the declared specialism ids the wire advertises. Derived from the audit table
+# so the two cannot drift; empty today (no specialism's full gate is backed — see the table).
+_DECLARED_SPECIALISMS: list[AdcpSpecialism] = [
+    sid for sid, row in _SPECIALISM_AUDIT.items() if row.decision is _SpecialismDecision.DECLARED
+]
 
 
 def _adcp_metadata() -> Adcp:
@@ -200,7 +324,7 @@ def _adcp_metadata() -> Adcp:
     without relying on server dedup) where OVERSTATING three uncovered tools is not.
     Implementing storyboard-graded replay (replay/CONFLICT/EXPIRED) for the remaining
     mutating tools — which would license flipping this to ``True`` — is the tracked
-    follow-up, NOT silently claimed done here.
+    follow-up (#1934), NOT silently claimed done here.
     """
     return Adcp(
         major_versions=[MajorVersion(root=3)],
@@ -223,7 +347,7 @@ def _build_capabilities_response(
     """
     return GetAdcpCapabilitiesResponse(
         adcp=_adcp_metadata(),
-        supported_protocols=[SupportedProtocol.media_buy],
+        supported_protocols=list(_SUPPORTED_PROTOCOLS),
         specialisms=list(_DECLARED_SPECIALISMS),
         account=_build_account_capability(tenant),
         media_buy=media_buy,

@@ -23,7 +23,8 @@ against a real DB in tests/integration/test_sync_governance.py (#1329).
 
 from __future__ import annotations
 
-from contextlib import ExitStack
+from collections.abc import Iterator
+from contextlib import contextmanager
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -87,15 +88,18 @@ def _make_request(
     return SyncGovernanceRequest(idempotency_key=idempotency_key, accounts=accounts)
 
 
-def _patch_deps(*, resolve_side_effect=None, repo: MagicMock | None = None) -> tuple[ExitStack, MagicMock]:
-    """Patch AccountUoW, resolve_account, and the audit logger.
+@contextmanager
+def _patch_deps(*, resolve_side_effect=None, repo: MagicMock | None = None) -> Iterator[MagicMock]:
+    """Patch AccountUoW, resolve_account, and the audit logger for the scope of a ``with``.
 
-    Returns (stack, repo_mock) — enter the stack in a `with` block. The repo's
-    ``set_governance_binding`` mirrors production: it projects agents to url-only and
-    returns the stored list (which the tool echoes). The strip itself is the repository's
-    guarantee (integration-tested); the mock reproduces it so the tool's echo is exercised.
+    A real context manager (``with _patch_deps(...) as repo:``) so the three patches are
+    entered AND exited within the block — an earlier ``ExitStack``-return form started the
+    patches the instant the helper returned, before the caller's ``with``, leaking them into
+    every later test if anything raised in between (#1329 finding 7). The repo's
+    ``set_governance_binding`` mirrors production: it projects agents to url-only and returns
+    the stored records (which the tool echoes). The strip itself is the repository's guarantee
+    (integration-tested); the mock reproduces it so the tool's echo is exercised.
     """
-    stack = ExitStack()
     repo = repo or MagicMock()
     repo.set_governance_binding.side_effect = governance_binding_stub()
 
@@ -103,10 +107,12 @@ def _patch_deps(*, resolve_side_effect=None, repo: MagicMock | None = None) -> t
     mock_uow.__enter__ = MagicMock(return_value=mock_uow)
     mock_uow.__exit__ = MagicMock(return_value=False)
     mock_uow.accounts = repo
-    stack.enter_context(patch("src.core.tools.governance.AccountUoW", return_value=mock_uow))
-    stack.enter_context(patch("src.core.tools.governance.get_audit_logger"))
-    stack.enter_context(patch("src.core.tools.governance.resolve_account", side_effect=resolve_side_effect))
-    return stack, repo
+    with (
+        patch("src.core.tools.governance.AccountUoW", return_value=mock_uow),
+        patch("src.core.tools.governance.get_audit_logger"),
+        patch("src.core.tools.governance.resolve_account", side_effect=resolve_side_effect),
+    ):
+        yield repo
 
 
 class TestSyncGovernanceSuccess:
@@ -116,8 +122,7 @@ class TestSyncGovernanceSuccess:
     async def test_synced_status_and_completed_envelope(self):
         from src.core.tools.governance import _sync_governance_impl
 
-        stack, repo = _patch_deps(resolve_side_effect=lambda ref, ident, r: "acc_1")
-        with stack:
+        with _patch_deps(resolve_side_effect=lambda ref, ident, r: "acc_1"):
             resp = await _sync_governance_impl(_make_request(), _make_identity())
 
         assert isinstance(resp, SyncGovernanceResponse)
@@ -131,8 +136,7 @@ class TestSyncGovernanceSuccess:
         from src.core.tools.governance import _sync_governance_impl
 
         req = _make_request(url=GOV_URL)
-        stack, repo = _patch_deps(resolve_side_effect=lambda ref, ident, r: "acc_1")
-        with stack:
+        with _patch_deps(resolve_side_effect=lambda ref, ident, r: "acc_1") as repo:
             await _sync_governance_impl(req, _make_identity())
 
         # The tool persists through the repository's single governance-write path, which
@@ -146,8 +150,7 @@ class TestSyncGovernanceSuccess:
     async def test_credentials_never_echoed(self):
         from src.core.tools.governance import _sync_governance_impl
 
-        stack, _repo = _patch_deps(resolve_side_effect=lambda ref, ident, r: "acc_1")
-        with stack:
+        with _patch_deps(resolve_side_effect=lambda ref, ident, r: "acc_1"):
             resp = await _sync_governance_impl(_make_request(), _make_identity())
 
         dumped = resp.model_dump(mode="json")
@@ -169,8 +172,7 @@ class TestSyncGovernanceAuthorityContract:
         def _raise(ref, ident, r):
             raise AdCPAccountNotFoundError("Account 'acc_x' not found.", suggestion="Use list_accounts.")
 
-        stack, repo = _patch_deps(resolve_side_effect=_raise)
-        with stack:
+        with _patch_deps(resolve_side_effect=_raise) as repo:
             resp = await _sync_governance_impl(_make_request(account_ref={"account_id": "acc_x"}), _make_identity())
 
         assert resp.accounts[0].status == "failed"
@@ -189,8 +191,7 @@ class TestSyncGovernanceAuthorityContract:
         def _raise(ref, ident, r):
             raise AdCPAuthorizationError("Agent lacks access to 'acc_1'.", suggestion="Use list_accounts.")
 
-        stack, repo = _patch_deps(resolve_side_effect=_raise)
-        with stack:
+        with _patch_deps(resolve_side_effect=_raise) as repo:
             resp = await _sync_governance_impl(_make_request(), _make_identity())
 
         assert resp.accounts[0].status == "failed"
@@ -220,8 +221,7 @@ class TestSyncGovernanceAuthorityContract:
             account_entry({"account_id": "acc_bad"}, agents=[governance_agent_dict(GOV_URL)]),
         ]
         req = _make_request(accounts=accounts)
-        stack, repo = _patch_deps(resolve_side_effect=_resolve)
-        with stack:
+        with _patch_deps(resolve_side_effect=_resolve) as repo:
             resp = await _sync_governance_impl(req, _make_identity())
 
         assert len(resp.accounts) == 2
@@ -238,8 +238,7 @@ class TestSyncGovernanceOperationLevel:
     async def test_missing_auth_raises_auth_required(self):
         from src.core.tools.governance import _sync_governance_impl
 
-        stack, _repo = _patch_deps(resolve_side_effect=lambda *a: "acc_1")
-        with stack, pytest.raises(AdCPAuthenticationError):
+        with _patch_deps(resolve_side_effect=lambda *a: "acc_1"), pytest.raises(AdCPAuthenticationError):
             await _sync_governance_impl(_make_request(), identity=None)
 
     def test_empty_accounts_rejected_at_schema(self):
@@ -427,11 +426,12 @@ class TestNonRestRequestBuilder:
 class TestSyncGovernanceBoundaryValues:
     """Construction-time schema asserts for the @bva boundary VALUES (#1329).
 
-    The UC-030 ``@bva`` outlines are xfailed (abstract verdict-step wiring is deferred),
-    and the old conftest reason claimed the boundary values are "covered concretely by the
-    T-UC-030-sync-* scenarios" — which they are NOT (those exercise one nominal value each).
-    These construction-time asserts are the honest coverage the corrected reason points at:
-    the request schema enforces every boundary structurally.
+    The UC-030 request-validation ``@bva`` outlines (cardinality, schemes, url) are now WIRED
+    on the wire (``when_bva_*`` + ``then_request_verdict``, graded via ``_BVA_GRADE`` across
+    a2a/mcp/rest). These construction-time asserts are the fast unit-level complement: they pin
+    the same boundaries at model construction (no transport round-trip), so a schema regression
+    reddens here in milliseconds before the slower wire suite runs. Not a substitute for the wire
+    grade — a construction-level check.
     """
 
     _KEY = "uuid-v4-unit-00000000000000001"

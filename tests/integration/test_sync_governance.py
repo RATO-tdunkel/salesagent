@@ -28,7 +28,6 @@ from tests.helpers.governance import (
     leaky_governance_agent,
     persisted_governance_agents_raw,
     persisted_governance_urls,
-    url_eq,
 )
 
 pytestmark = [pytest.mark.integration, pytest.mark.requires_db]
@@ -61,7 +60,9 @@ class TestSyncGovernancePersistence:
             resp = await env.call_impl_async(req=_request({"account_id": "acc_gov_1"}))
 
         assert resp.accounts[0].status == "synced"
-        assert resp.accounts[0].governance_agents[0].url == GOV_URL + "/"
+        # The echoed agent is the SDK CoreGovernanceAgent whose url is an AnyUrl (Pattern #1),
+        # so stringify for the exact normalized comparison (#1329 finding 8).
+        assert str(resp.accounts[0].governance_agents[0].url) == GOV_URL + "/"
         # Persisted url-only (credentials are never stored — column model is url-only).
         persisted = persisted_governance_urls("gov_t1", "acc_gov_1")
         assert len(persisted) == 1
@@ -224,7 +225,7 @@ class TestSyncGovernanceCrossTransportWire:
         acct = accounts[0]
         assert acct["status"] == "synced"
         agents = acct.get("governance_agents") or []
-        assert agents and url_eq(agents[0].get("url"), GOV_URL), f"{transport}: url not echoed: {agents}"
+        assert agents and agents[0].get("url") == GOV_URL + "/", f"{transport}: url not echoed: {agents}"
         # Credentials are write-only — the wire echo MUST NOT carry authentication.
         assert "authentication" not in agents[0], f"{transport}: credentials echoed on wire: {agents[0]}"
         assert BEARER_CREDS not in str(result.wire_response), f"{transport}: credentials leaked on wire"

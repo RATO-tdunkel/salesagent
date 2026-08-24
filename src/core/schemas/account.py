@@ -33,7 +33,6 @@ from pydantic_core import ValidationError as CoreValidationError
 
 from src.core.config import get_pydantic_extra_mode
 from src.core.schemas._base import NestedModelSerializerMixin, SalesAgentBaseModel
-from src.core.security.url_validator import check_url_ssrf
 from src.core.webhook_validator import webhook_url_for_log
 
 # ---------------------------------------------------------------------------
@@ -215,62 +214,31 @@ class SyncGovernanceRequest(LibrarySyncGovernanceRequest):
     model_config = ConfigDict(extra=get_pydantic_extra_mode())
 
     @model_validator(mode="after")
-    def _validate_governance_agent_urls(self) -> "SyncGovernanceRequest":
-        """Reject embedded credentials, enforce https, and SSRF-validate agent urls.
+    def _validate_governance_agent_url_shape(self) -> "SyncGovernanceRequest":
+        """Enforce the ``^https://`` url SHAPE the SDK codegen drops (uniform across transports).
 
-        Three construction-time gates, uniform across every transport (MCP/A2A/REST
-        all build this type), each raising a field-located error at
-        ``accounts[i].governance_agents[j].url`` (#1329):
+        The pinned 3.1.1 request schema marks the agent ``url`` ``pattern: ^https://``, but the
+        generated ``AnyUrl`` field does not carry that constraint (SDK codegen gap), so an
+        ``http://`` url would slip through. This is a pure schema-SHAPE check — env-independent —
+        so it stays on the type as a field-located ``VALIDATION_ERROR`` at construction. The
+        rendered message shows only the sanitized url (``webhook_url_for_log`` strips userinfo +
+        query + fragment), so it can never echo a credential.
 
-        1. **no userinfo** (checked FIRST) — ``https://user:pass@host/`` embeds a
-           credential in the url, which SSRF hostname checks skip (they read only the
-           host) and which would otherwise be persisted verbatim and echoed on the
-           wire. Ordering this gate before the https/SSRF gates guarantees a
-           credential-bearing url never reaches a gate whose message renders the url;
-           the https message additionally renders via ``webhook_url_for_log`` (userinfo
-           + query + fragment stripped) as defense in depth (#1329).
-        2. **https** — the pinned 3.1.1 request schema marks the agent ``url``
-           ``pattern: ^https://``, but the generated ``AnyUrl`` field does not carry
-           that constraint (SDK codegen gap), so an ``http://`` url would slip
-           through. The spec is authoritative; enforce it here.
-        3. **SSRF** — the persisted url is a future ``check_governance`` target;
-           reject private/internal/loopback/metadata hosts at bind time so a
-           poisoned binding is never stored (#1329). ``resolve_dns=False``
-           mirrors the webhook-registration convention (#1697): literal-IP + blocked
-           -hostname checks apply, but fixture hostnames are not NXDOMAIN-rejected;
-           a use-time DNS pin belongs with ``check_governance``.
+        The credential-in-args (userinfo) and SSRF-host policies are NOT here: they raise typed
+        AdCPErrors — ``CREDENTIAL_IN_ARGS`` (terminal) for embedded userinfo, and the repo-owned
+        webhook-registration SSRF gate for disallowed hosts — so they live in
+        ``governance.build_sync_governance_request`` AFTER construction, off the type layer, as the
+        ONE host-policy home shared with webhook registration (no forked policy in the model,
+        #1329). The schema layer must not depend on ``src/core/security``.
         """
         for a_idx, account in enumerate(self.accounts):
             for g_idx, agent in enumerate(account.governance_agents):
-                url = agent.url
-                url_str = str(url)
-                loc = ("accounts", a_idx, "governance_agents", g_idx, "url")
-                # A credential can ride in userinfo, the query string, the fragment, or the
-                # path. ``webhook_url_for_log`` (the repo-owned sanitizer, "never credentials
-                # or query") strips userinfo + query + fragment down to ``scheme://host/path``
-                # — strictly stronger than a userinfo-only strip. It is used for BOTH the
-                # rendered message AND the pydantic ``input`` value so no gate below and no
-                # ``str(ValidationError)`` / ``.json()`` consumer can echo a credential (#1329).
-                safe_url = webhook_url_for_log(url_str)
-                # 1. userinfo FIRST — a credential-bearing url must be rejected before any
-                #    gate below renders it. Operands read directly (not via ``getattr``
-                #    defaults): ``agent.url`` is an ``AnyUrl``, so a codegen type regression to
-                #    ``str`` must raise ``AttributeError`` loudly here, not silently no-op the
-                #    userinfo gate and let ``https://u:pw@host`` pass (#1329).
-                if url.username or url.password:
-                    _raise_governance_url_error(
-                        loc, "governance agent url must not embed userinfo credentials", safe_url
-                    )
-                # 2. https — show only the sanitized url (gate 1 already rejected userinfo).
+                url_str = str(agent.url)
                 if not url_str.startswith("https://"):
+                    loc = ("accounts", a_idx, "governance_agents", g_idx, "url")
+                    safe_url = webhook_url_for_log(url_str)
                     _raise_governance_url_error(
                         loc, f"governance agent url must use https:// (got '{safe_url}')", safe_url
-                    )
-                # 3. SSRF — reason names the host class, never the url userinfo.
-                ok, reason = check_url_ssrf(url_str, require_https=True, resolve_dns=False)
-                if not ok:
-                    _raise_governance_url_error(
-                        loc, f"governance agent url targets a disallowed host: {reason}", safe_url
                     )
         return self
 

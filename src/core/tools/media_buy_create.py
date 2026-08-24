@@ -157,7 +157,12 @@ from src.core.tools.financial_validation import (
 )
 
 # Import get_product_catalog from main (after refactor)
-from src.core.validation_helpers import adcp_validation_boundary, format_validation_error, package_field_path
+from src.core.validation_helpers import (
+    adcp_validation_boundary,
+    boundary_context,
+    format_validation_error,
+    package_field_path,
+)
 from src.core.webhook_validator import reject_unsafe_webhook_registration_url, webhook_url_for_log
 from src.services.activity_feed import activity_feed
 from src.services.gam_product_config_service import GAMProductConfigService
@@ -4357,7 +4362,10 @@ def _build_create_media_buy_request(
     # (#1537). The validation boundary (#1417) is the SINGLE translation point:
     # it turns a Pydantic ValidationError into a typed AdCPValidationError
     # carrying the field path + suggestion.
-    with adcp_validation_boundary(context="request"):
+    # Uniform boundary context via the shared accessor so this builder (A2A/REST/MCP-body) and the
+    # MCP TypeAdapter-rejection path both render "Invalid create_media_buy request: …" — the earlier
+    # bare "request" literal forked the message off the MCP TypeAdapter path (#1329).
+    with adcp_validation_boundary(context=boundary_context("create_media_buy")):
         return CreateMediaBuyRequest(
             brand=to_brand_reference(brand),
             packages=packages,

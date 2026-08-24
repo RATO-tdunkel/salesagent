@@ -227,10 +227,13 @@ class SyncGovernanceBody(SalesAgentBaseModel):
     # HTTP body so a REST buyer can send it — the route forwards it to the shared builder
     # (#1329). The A2A handler forwards it explicitly.
     ext: dict[str, Any] | None = None
-    # No `adcp_version`: there is no version-compat transform for sync_governance, so accepting
-    # a buyer version here only to discard it (the old apply_version_compat no-op) misrepresented
-    # the field as honored — dropped (#1329 finding 2). The seller's implemented version is
-    # echoed on the response by _impl (POST-S4).
+    # Version-envelope fields (core/version-envelope.json, composed by sync-governance-request.json):
+    # ACCEPTED-AND-IGNORED so a conformant buyer sending adcp_version is not rejected on one transport
+    # while accepted on another. Forwarded to the shared builder (which forwards them to the SDK model,
+    # which carries both as optional); the seller echoes its OWN implemented version on the response
+    # (POST-S4). SalesAgentBaseModel forbids extras, so these must be declared to be accepted (#1329).
+    adcp_version: str | None = None
+    adcp_major_version: int | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -516,16 +519,18 @@ async def sync_governance(body: SyncGovernanceBody, identity: ResolvedIdentity =
     """Bind a governance agent per account (auth required)."""
     from src.core.tools.governance import build_sync_governance_request
 
-    # REST routes through the SAME builder as MCP/A2A (#1329 finding 2) — the single
-    # constructor. It carries its own validation boundary (so no outer `with` is needed; the
-    # REST-request-boundary guard recognises self-bounding builders) and omits an absent
-    # idempotency_key so a missing key renders identically on every transport. There is no
-    # version-compat transform for sync_governance, so the request no longer accepts a
-    # buyer `adcp_version` (the field was dropped from SyncGovernanceBody) and the response
-    # is serialized directly — the previous `apply_version_compat` call was a no-op on the
-    # already-serialized dict.
+    # REST routes through the SAME builder as MCP/A2A (#1329) — the single constructor. It carries
+    # its own validation boundary (so no outer `with` is needed; the REST-request-boundary guard
+    # recognises self-bounding builders), omits an absent idempotency_key so a missing key renders
+    # identically on every transport, and forwards the version-envelope fields (accepted-and-ignored
+    # uniformly). The seller echoes its OWN implemented version on the response.
     req = build_sync_governance_request(
-        accounts=body.accounts, context=body.context, ext=body.ext, idempotency_key=body.idempotency_key
+        accounts=body.accounts,
+        context=body.context,
+        ext=body.ext,
+        idempotency_key=body.idempotency_key,
+        adcp_version=body.adcp_version,
+        adcp_major_version=body.adcp_major_version,
     )
     response = await governance_module.sync_governance_raw(req=req, identity=identity)
     return response.model_dump(mode="json")

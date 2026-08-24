@@ -3,6 +3,8 @@
 One builder / reader per production boundary the unit, integration, and BDD suites touch, so
 the governance test contract is expressed once rather than N times (#1329):
 
+- ``governance_request`` — the pinned ``SyncGovernanceRequest`` MODEL from a single-account
+  shape (the unit / integration request-builder twins delegate here).
 - ``account_entry`` — the pinned 3.1.1 request element ``{"account": <ref>, "governance_agents": [...]}``.
 - ``governance_agent_dict`` — one request-side agent (url + write-only authentication).
 - ``leaky_governance_agent`` — a request-side agent carrying ``LEAK_SECRET`` on a named
@@ -53,7 +55,7 @@ def normalize_url(url: str) -> str:
     echoed url is ALWAYS the normalized string (a bare host gains a trailing ``/``). Pinning an
     echoed url against ``normalize_url(expected)`` with EXACT ``==`` is strictly stronger than the
     old trailing-slash-tolerant comparator — a wire that is not AnyUrl-normalized now FAILS
-    instead of being tolerated (#1329 finding 8).
+    instead of being tolerated (#1329).
     """
     return str(AnyUrl(url))
 
@@ -71,7 +73,7 @@ def governance_agent_dict(
     Credentials default to ``cred_len`` ``x``s (>= the schema's minLength 32) so the
     only thing under test is the account/authority path, not request validation.
 
-    DEVIATION VOCABULARY (#1329 finding 6): a boundary/negative case is expressed as a DELTA
+    DEVIATION VOCABULARY (#1329): a boundary/negative case is expressed as a DELTA
     against the pinned shape, not a hand-rolled copy. Each ``**overrides`` key REPLACES a
     top-level agent key (e.g. ``authentication={...}`` for a schemes boundary), and the
     ``_UNSET`` sentinel (the repo's factory idiom) REMOVES one (``url=_UNSET`` for the
@@ -80,12 +82,60 @@ def governance_agent_dict(
     """
     creds = credentials if credentials is not None else "x" * cred_len
     agent: dict[str, Any] = {"url": url, "authentication": {"schemes": [scheme], "credentials": creds}}
+    if url is _UNSET:
+        # ``url=_UNSET`` REMOVES the url key (the url-absent boundary) — the docstring's promise,
+        # now honored for the ``url`` positional itself, not only for ``**overrides`` keys. Before
+        # this, ``url=_UNSET`` stored the sentinel object AS the url, so ``_bva_agent`` had to
+        # re-inline ``del agent["url"]`` to express the boundary (#1329).
+        agent.pop("url")
     for key, value in overrides.items():
         if value is _UNSET:
             agent.pop(key, None)
         else:
             agent[key] = value
     return agent
+
+
+def governance_request(
+    *,
+    account_ref: dict[str, Any] | None = None,
+    url: str = GOV_URL,
+    idempotency_key: str = "uuid-v4-shared-00000000000000001",
+    accounts: list[dict[str, Any]] | None = None,
+    **agent_kwargs: Any,
+) -> Any:
+    """Build a ``SyncGovernanceRequest`` from a single-account shape (or an explicit list).
+
+    The ONE home for the pinned request MODEL the unit and integration suites construct (the
+    ``_make_request`` / ``_request`` twins now delegate here), so a schema change to the
+    request wrapper propagates by construction instead of drifting across per-file builders
+    (#1329). ``url`` is a KEYWORD forwarded to the shared ``governance_agent_dict``
+    (which shares the ONE ``_UNSET`` sentinel — ``url=_UNSET`` removes it, extra ``agent_kwargs``
+    like ``credentials=`` shape the single agent); ``accounts`` overrides the single-account
+    default with an explicit multi-account list.
+    """
+    from src.core.schemas.account import SyncGovernanceRequest
+
+    if accounts is None:
+        accounts = [
+            account_entry(account_ref or {"account_id": "acc_1"}, agents=[governance_agent_dict(url, **agent_kwargs)])
+        ]
+    return SyncGovernanceRequest(idempotency_key=idempotency_key, accounts=accounts)
+
+
+def governance_agent(url: str, **kwargs: Any) -> Any:
+    """A request-side governance agent as the parsed MODEL (``SyncGovernanceRequestAgent``).
+
+    For callers that must pass the parsed model, not a dict — e.g. the repo write path
+    ``AccountRepository.set_governance_binding``, whose narrowed signature takes
+    ``list[SyncGovernanceRequestAgent]`` only (#1329). Delegates the shape to
+    ``governance_agent_dict`` so the pinned request contract has one home.
+    """
+    from adcp.types.generated_poc.account.sync_governance_request import (
+        GovernanceAgent as SyncGovernanceRequestAgent,
+    )
+
+    return SyncGovernanceRequestAgent(**governance_agent_dict(url, **kwargs))
 
 
 def leaky_governance_agent(channel: str, *, secret: str = LEAK_SECRET) -> dict[str, Any]:
@@ -95,7 +145,7 @@ def leaky_governance_agent(channel: str, *, secret: str = LEAK_SECRET) -> dict[s
     shapes and the exact mistyped-key name, so the BDD (transport-blind) and integration
     (A2A+REST) leak suites grade the same contract with the SAME secret — two hand-rolled
     copies with different-length secrets let a length-sensitive redaction regression redden
-    one suite and not the other (#1329 R9-K4). Channels:
+    one suite and not the other (#1329). Channels:
 
     * ``url-userinfo`` — credential embedded in the url userinfo; rejected by the userinfo
       gate, whose message sanitizes the url so the secret is never rendered.
@@ -149,7 +199,7 @@ def persisted_governance_agents_raw(tenant_id: str, account_id: str) -> list[dic
     against the url-only column model and would RAISE on a leaked credential — masking the
     exact leak the strip test grades, so this deliberately defeats the Layer-3 coercion
     boundary. TEST-ONLY: it lives here, not as a production repository method a future caller
-    could reach to read unvalidated on-disk bytes (#1329 R9-K3). Opens its own tenant-scoped
+    could reach to read unvalidated on-disk bytes (#1329). Opens its own tenant-scoped
     ``AccountUoW`` on the DB the dispatch committed to and reads INSIDE the block.
     """
     import warnings
@@ -178,7 +228,7 @@ def governance_binding_stub() -> Callable[[str, list[Any]], list[CoreGovernanceA
     Projects each request agent to the persisted url-only SDK record —
     ``CoreGovernanceAgent(url=<url>)`` with credentials stripped and the url ``AnyUrl``-normalized
     (trailing slash), which is the documented return type of
-    ``AccountRepository.set_governance_binding`` (#1329 finding 8: the repo returns the SDK
+    ``AccountRepository.set_governance_binding`` (#1329: the repo returns the SDK
     ``CoreGovernanceAgent``, not a bare dict). Constructing the SDK type directly — not the
     module-private ``_serialize_governance_agents`` projector — grades the tool's echo against the
     repository's public contract, not the internal the repo-owned design exists to hide.

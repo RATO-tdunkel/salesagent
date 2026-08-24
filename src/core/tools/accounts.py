@@ -19,6 +19,7 @@ from datetime import UTC
 from typing import Annotated, Any
 
 from adcp.types import ContextObject, PaginationRequest, PaginationResponse
+from adcp.types import Error as LibraryError
 from adcp.types.generated_poc.account.list_accounts_request import (
     Status as AccountStatus,
 )
@@ -294,7 +295,7 @@ def _build_sync_result(
     name: str | None = None,
     billing: str | None = None,
     sandbox: bool | None = None,
-    errors: list[Any] | None = None,
+    errors: list[LibraryError] | None = None,
     setup: Any | None = None,
 ) -> SyncResponseAccount:
     """Build an AdCP sync response Account object.
@@ -340,27 +341,30 @@ def _build_setup_for_approval(mode: str, tenant_id: str) -> Any:
     return None
 
 
-# Advisory per-account Error code + recovery, DERIVED from the canonical exception
-# class metadata via the PUBLIC advisory_defaults() accessor (the governance.py:
-# _UNRESOLVED_ACCOUNT_* pattern, not the private _default_* attrs — #1329 finding 9) so a
-# per-account advisory cannot drift from the code/recovery the rest of the codebase raises for
-# the same condition. VALIDATION_ERROR has a typed home (AdCPValidationError);
-# BILLING_NOT_SUPPORTED is a demoted spec code with no typed subclass (it maps to
-# UNSUPPORTED_FEATURE at the wire via ERROR_CODE_MAPPING), so its recovery cannot be read off a
-# class — the literal is instead pinned against the pinned error-code.json enumMetadata by
-# test_billing_not_supported_recovery_matches_pinned_enum, which reddens on drift.
-_VALIDATION_ERROR_CODE, _VALIDATION_ERROR_RECOVERY, _ = AdCPValidationError.advisory_defaults()
+# Advisory per-account Error code + recovery, DERIVED from the canonical exception class
+# metadata via the PUBLIC advisory_defaults() accessor (not the private _default_* attrs —
+# #1329) so a per-account advisory cannot drift from the code/recovery the rest of the codebase
+# raises for the same condition. VALIDATION_ERROR has a typed home (AdCPValidationError).
+# BILLING_NOT_SUPPORTED has no typed subclass (advisory-only), but it IS a WIRE_STANDARD_CODES
+# entry via _SPEC_SUPPLEMENT_CODES (pinned enum: correctable), so build_advisory_error routes it
+# through to_wire_error_code UNCHANGED — the buyer sees BILLING_NOT_SUPPORTED, not a translated
+# code (the earlier "maps to UNSUPPORTED_FEATURE via ERROR_CODE_MAPPING" was never true for an
+# advisory, which serializes verbatim). Its recovery literal is pinned against the pinned
+# error-code.json enumMetadata by test_billing_not_supported_recovery_matches_pinned_enum.
+_validation_error_defaults = AdCPValidationError.advisory_defaults()
+_VALIDATION_ERROR_CODE = _validation_error_defaults.error_code
+_VALIDATION_ERROR_RECOVERY = _validation_error_defaults.recovery
 _BILLING_NOT_SUPPORTED_CODE = "BILLING_NOT_SUPPORTED"
 _BILLING_NOT_SUPPORTED_RECOVERY: RecoveryHint = "correctable"
 
 
-def _check_domain_validity(brand_domain: str) -> list[Any] | None:
+def _check_domain_validity(brand_domain: str) -> list[LibraryError] | None:
     """Check if the brand domain is valid for account provisioning.
 
     Returns a list of Error objects if invalid, None if valid.
     Reserved TLDs (.test, .invalid, .example, .localhost) are rejected.
     The advisory Error is built by the single shared ``build_advisory_error`` builder
-    at the error boundary (#1329 finding 9).
+    at the error boundary (#1329).
     """
     reserved_tlds = {".test", ".invalid", ".example", ".localhost"}
     for tld in reserved_tlds:
@@ -381,7 +385,7 @@ def _check_domain_validity(brand_domain: str) -> list[Any] | None:
 def _check_billing_policy(
     billing_val: str | None,
     supported: list[BillingParty],
-) -> list[Any] | None:
+) -> list[LibraryError] | None:
     """Check a single account entry's billing model against the seller's accepted set.
 
     Returns a list of Error objects if rejected, None if accepted.
@@ -394,7 +398,7 @@ def _check_billing_policy(
     per-entry because the value depends only on ``identity.tenant`` (never on the
     entry), and a seller-misconfiguration raise must fire as a precondition before the
     UoW opens, not up to 100 times mid-loop after earlier entries have persisted
-    (#1329 finding 10). This function keeps its "returns errors, never raises" contract.
+    (#1329). This function keeps its "returns errors, never raises" contract.
     """
     if billing_val not in supported:
         return [
@@ -473,7 +477,7 @@ async def _sync_accounts_impl(
     tenant = require_tenant(identity, context=req.context)
     tenant_id = tenant["tenant_id"]
 
-    # Seller-config precondition, resolved ONCE before any DB work (#1329 finding 10):
+    # Seller-config precondition, resolved ONCE before any DB work (#1329):
     # the accepted billing set depends only on identity.tenant, and a misconfigured
     # tenant must raise AdCPConfigurationError (TERMINAL) here — beside the auth/tenant
     # preconditions — not per-entry inside the UoW where it could fire after earlier
@@ -517,7 +521,7 @@ async def _sync_accounts_impl(
                 continue
 
             # BR-RULE-059: check billing policy before processing (accepted set
-            # resolved once above, not per-entry — #1329 finding 10).
+            # resolved once above, not per-entry — #1329).
             billing_errors = _check_billing_policy(billing_val, supported_billing)
             if billing_errors is not None:
                 results.append(

@@ -25,6 +25,7 @@ from tests.helpers.governance import (
     LEAK_SECRET,
     account_entry,
     governance_agent_dict,
+    governance_request,
     leaky_governance_agent,
     persisted_governance_agents_raw,
     persisted_governance_urls,
@@ -42,10 +43,9 @@ _ACCOUNT_NOT_FOUND_RECOVERY = _pinned_error_metadata()["ACCOUNT_NOT_FOUND"]["rec
 def _request(
     account_ref: dict, url: str = GOV_URL, key: str = "uuid-v4-int-000000000000000001"
 ) -> SyncGovernanceRequest:
-    return SyncGovernanceRequest(
-        idempotency_key=key,
-        accounts=[account_entry(account_ref, agents=[governance_agent_dict(url)])],
-    )
+    # Delegates to the shared single-account request builder (#1329) so this suite and the
+    # unit/BDD suites construct the pinned request MODEL one way.
+    return governance_request(account_ref=account_ref, url=url, idempotency_key=key)
 
 
 class TestSyncGovernancePersistence:
@@ -61,7 +61,7 @@ class TestSyncGovernancePersistence:
 
         assert resp.accounts[0].status == "synced"
         # The echoed agent is the SDK CoreGovernanceAgent whose url is an AnyUrl (Pattern #1),
-        # so stringify for the exact normalized comparison (#1329 finding 8).
+        # so stringify for the exact normalized comparison (#1329).
         assert str(resp.accounts[0].governance_agents[0].url) == GOV_URL + "/"
         # Persisted url-only (credentials are never stored — column model is url-only).
         persisted = persisted_governance_urls("gov_t1", "acc_gov_1")
@@ -202,7 +202,7 @@ class TestSyncGovernanceCrossTransportWire:
     parametrize of the capabilities cross-transport sibling it mirrors
     (test_get_adcp_capabilities_wire). REST joins here (rather than a standalone test that
     asserted on a re-parsed model and skipped the whole-envelope credential scan) so the
-    same assertions hold identically on every transport (#1329 finding 5).
+    same assertions hold identically on every transport (#1329).
     """
 
     @pytest.mark.parametrize("transport", [Transport.MCP, Transport.A2A, Transport.REST])
@@ -254,34 +254,32 @@ class TestSyncGovernanceCrossTransportWire:
 
 
 class TestSyncGovernanceCredentialRedactionWire:
-    """A credential-bearing ``extra_forbidden`` rejection redacts the secret on the REAL wire.
+    """A credential-bearing ``extra_forbidden`` rejection emits CREDENTIAL_IN_ARGS + hides the secret.
 
-    The #1329 redaction (``format_validation_error`` withholds the ``Received value:`` echo under
-    a credential-bearing extra field) feeds ``errors[0].message``, which reaches the REST and A2A
-    buyer wire — but was otherwise graded only by in-process unit tests. This dispatches a
-    governance agent with a mistyped ``authentication.credential`` extra field carrying a 32+ char
-    secret and asserts the VALIDATION_ERROR envelope does NOT echo the secret — the error-path
-    mirror of the success-echo credential grade at ``test_happy_path_synced_on_mcp_and_a2a_wire``
-    (#1329).
+    A credential smuggled into a request arg (here a mistyped ``authentication.credential`` extra
+    field carrying a 32+ char secret) is rejected with the pinned ``CREDENTIAL_IN_ARGS`` code
+    (recovery=terminal — auto-retry re-logs the credential; @source authentication.mdx L2), and the
+    envelope MUST NOT echo the secret. This is the error-path mirror of the success-echo credential
+    grade at ``test_happy_path_synced_wire`` (#1329).
 
-    Parametrized over A2A + REST + MCP: the MCP compat middleware now routes a TypeAdapter
-    rejection through the SAME ``format_validation_error`` path as A2A/REST (#1329 finding 5),
-    so the credential-bearing value is redacted on the MCP wire for the right reason too —
-    disabling the redaction reddens all three (verified by mutation), no longer a vacuous cell.
+    Parametrized over A2A + REST + MCP: the MCP compat middleware routes a TypeAdapter rejection
+    through the SAME ``adcp_validation_error_from`` path as A2A/REST, so the credential-in-args
+    detection + redaction hold on the MCP wire for the right reason too — reverting the
+    CREDENTIAL_IN_ARGS routing reddens all three (verified by mutation).
     """
 
     @pytest.mark.parametrize("transport", [Transport.MCP, Transport.A2A, Transport.REST])
-    def test_credential_bearing_extra_field_redacted_on_wire(self, transport, integration_db):
+    def test_credential_bearing_extra_field_rejected_credential_in_args(self, transport, integration_db):
         tid = f"gov_redact_{transport.value}"
         with GovernanceSyncEnv(tenant_id=tid, principal_id=f"{tid}_agent") as env:
             tenant, principal = env.setup_default_data()
             seed_account_with_access(tenant, principal, account_id="acc_redact")
 
             # `credential` (singular) is not in the Authentication schema -> extra_forbidden; it
-            # carries a 32+ char secret, and the credential-bearing loc makes the boundary redact
-            # the echoed value so it never reaches the wire. The shared builder + LEAK_SECRET are
-            # the same the BDD leak scenario uses, so a length-sensitive redaction regression
-            # cannot redden one suite and not the other (#1329 R9-K4).
+            # carries a 32+ char secret. A credential-bearing extra field is a credential-in-args:
+            # the boundary rejects it with CREDENTIAL_IN_ARGS (terminal) AND redacts the echoed
+            # value. The shared builder + LEAK_SECRET are the same the BDD leak scenario uses, so a
+            # length-sensitive redaction regression cannot redden one suite and not the other (#1329).
             leaky_agent = leaky_governance_agent("extra-authentication-key")
             result = env.call_via(
                 transport,
@@ -289,13 +287,13 @@ class TestSyncGovernanceCredentialRedactionWire:
                 accounts=[account_entry({"account_id": "acc_redact"}, agents=[leaky_agent])],
             )
 
-        assert result.is_error, f"{transport}: expected a validation rejection, got {result.payload!r}"
-        result.assert_wire_error("VALIDATION_ERROR")
-        envelope = result.wire_error_envelope
-        assert LEAK_SECRET not in str(envelope), f"{transport}: redacted secret leaked on the wire: {envelope}"
+        assert result.is_error, f"{transport}: expected a credential-in-args rejection, got {result.payload!r}"
+        # recovery=terminal is pin-defaulted from the enum; field is the detection path only.
+        result.assert_wire_error("CREDENTIAL_IN_ARGS", field_substr="governance_agents[0]")
+        result.assert_secret_absent(LEAK_SECRET)
 
 
 # TestSyncGovernanceRestWire (REST happy-path roundtrip) was folded into
 # TestSyncGovernanceCrossTransportWire.test_happy_path_synced_wire, which now parametrizes
 # [MCP, A2A, REST] and asserts on the real serialized body + the whole-envelope credential
-# scan on every transport — a strict superset of the deleted test (#1329 finding 5).
+# scan on every transport — a strict superset of the deleted test (#1329).

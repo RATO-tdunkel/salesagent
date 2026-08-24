@@ -16,7 +16,6 @@ beads: salesagent-8n4
 from __future__ import annotations
 
 import logging
-from typing import Any
 
 from adcp.types import AccountReference, AccountReferenceById, AccountReferenceByNaturalKey
 from adcp.types.generated_poc.enums.billing_party import BillingParty
@@ -32,7 +31,7 @@ from src.core.exceptions import (
     AdCPConfigurationError,
 )
 from src.core.resolved_identity import ResolvedIdentity
-from src.core.tenant_context import TenantContext
+from src.core.tenant_context import TenantContext, TenantLike
 
 logger = logging.getLogger(__name__)
 
@@ -45,7 +44,7 @@ SELLER_ACCOUNT_BILLING: list[BillingParty] = [BillingParty.operator, BillingPart
 _PERMITTED_ACCOUNT_BILLING: frozenset[str] = frozenset(b.value for b in SELLER_ACCOUNT_BILLING)
 
 
-def resolve_supported_billing(tenant: TenantContext | dict[str, Any] | None) -> list[BillingParty]:
+def resolve_supported_billing(tenant: TenantLike | None) -> list[BillingParty]:
     """The account-billable parties this seller accepts — the SINGLE source of truth.
 
     Consumed by BOTH the get_adcp_capabilities ``account.supported_billing`` honesty
@@ -75,10 +74,12 @@ def resolve_supported_billing(tenant: TenantContext | dict[str, Any] | None) -> 
       list + the internal constraint) goes to the LOG; the buyer message stays generic and
       discloses neither the tenant config nor the constraint identifier (#1329).
     """
-    # Type-level SSOT (#1329 finding 10): the model arm reads the declared
-    # ``TenantContext.supported_billing`` attribute (mypy-checked), the legacy dict arm uses
-    # ``.get`` — so the field this SSOT enforces is typed on the side that actually flows in
-    # production (a ``TenantContext``), not hidden behind an ``Any`` dict shim.
+    # Read supported_billing through the one path each carrier supports (#1329): a TenantContext
+    # exposes the typed attribute; a LazyTenantContext (the proxy the MCP/A2A bridge actually
+    # builds — NOT a TenantContext subclass, so this is the arm that fires on the live path) and a
+    # legacy dict both expose ``.get``. The ``TenantLike`` union now NAMES the LazyTenantContext
+    # that crosses the seam, so the signature describes what flows in production instead of
+    # claiming a TenantContext does.
     if tenant is None:
         configured = None
     elif isinstance(tenant, TenantContext):

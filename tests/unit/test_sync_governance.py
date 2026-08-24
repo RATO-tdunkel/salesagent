@@ -38,7 +38,6 @@ from src.core.exceptions import (
 from src.core.schemas.account import SyncGovernanceRequest, SyncGovernanceResponse
 from tests.harness.transport import _pinned_error_metadata
 from tests.helpers.governance import (
-    BEARER_CREDS,
     GOV_URL,
     account_entry,
     governance_agent_dict,
@@ -88,6 +87,24 @@ def _make_request(
     return SyncGovernanceRequest(idempotency_key=idempotency_key, accounts=accounts)
 
 
+def _build_request(*, url: str = GOV_URL, idempotency_key: str = "uuid-v4-unit-00000000000000001"):
+    """Construct through the shared builder — where the url credential/SSRF policy now lives.
+
+    The model (``_make_request``) enforces only the ``^https://`` SHAPE; the userinfo
+    (CREDENTIAL_IN_ARGS) and SSRF-host gates were moved off the type layer into
+    ``build_sync_governance_request`` (the ONE host-policy home, #1329), so those are exercised
+    here, not by direct model construction.
+    """
+    from src.core.tools.governance import build_sync_governance_request
+
+    return build_sync_governance_request(
+        accounts=[account_entry({"account_id": "acc_1"}, agents=[governance_agent_dict(url)])],
+        context=None,
+        ext=None,
+        idempotency_key=idempotency_key,
+    )
+
+
 @contextmanager
 def _patch_deps(*, resolve_side_effect=None, repo: MagicMock | None = None) -> Iterator[MagicMock]:
     """Patch AccountUoW, resolve_account, and the audit logger for the scope of a ``with``.
@@ -95,7 +112,7 @@ def _patch_deps(*, resolve_side_effect=None, repo: MagicMock | None = None) -> I
     A real context manager (``with _patch_deps(...) as repo:``) so the three patches are
     entered AND exited within the block — an earlier ``ExitStack``-return form started the
     patches the instant the helper returned, before the caller's ``with``, leaking them into
-    every later test if anything raised in between (#1329 finding 7). The repo's
+    every later test if anything raised in between (#1329). The repo's
     ``set_governance_binding`` mirrors production: it projects agents to url-only and returns
     the stored records (which the tool echoes). The strip itself is the repository's guarantee
     (integration-tested); the mock reproduces it so the tool's echo is exercised.
@@ -154,12 +171,13 @@ class TestSyncGovernanceSuccess:
             resp = await _sync_governance_impl(_make_request(), _make_identity())
 
         dumped = resp.model_dump(mode="json")
-        serialized = str(dumped)
-        assert "authentication" not in serialized
-        assert BEARER_CREDS not in serialized
-        assert "credentials" not in serialized
-        # But the URL IS echoed (from the repo's stored url-only list).
-        assert dumped["accounts"][0]["governance_agents"][0]["url"] == GOV_URL + "/"
+        agent = dumped["accounts"][0]["governance_agents"][0]
+        # Credentials are write-only: the echoed agent carries only the url, never the
+        # authentication block (which holds the credentials). A structural check on the dumped
+        # agent, not a str() self-scan — the rejected-credential wire contract is graded on the
+        # real wire by TransportResult.assert_secret_absent (integration + BDD leak, #1329).
+        assert "authentication" not in agent, agent
+        assert agent["url"] == GOV_URL + "/"
 
 
 class TestSyncGovernanceAuthorityContract:
@@ -278,9 +296,10 @@ class TestSyncGovernanceRequestSchema:
     @pytest.mark.parametrize(
         ("url", "secret"),
         [
-            # userinfo — rejected by gate 1 (the userinfo gate fires first)
+            # userinfo on an http url — rejected by the ^https:// shape gate (non-https) on the
+            # model; the sanitized render must still not echo the userinfo secret
             ("http://svc:USERINFOSECRET01@governance.example.com/hook", "USERINFOSECRET01"),
-            # query string — passes gate 1, rejected by gate 2 (non-https), which renders the url
+            # query string — rejected by the ^https:// shape gate (non-https), which renders the url
             ("http://governance.example.com/hook?token=QUERYSECRET02", "QUERYSECRET02"),
             # fragment — same path as query
             ("http://governance.example.com/hook#access_token=FRAGSECRET03", "FRAGSECRET03"),
@@ -300,44 +319,59 @@ class TestSyncGovernanceRequestSchema:
         rendered = str(exc_info.value) + exc_info.value.json()
         assert secret not in rendered, rendered
 
-    def test_agent_url_with_userinfo_rejected(self):
-        # A credential embedded in the url (userinfo) must be rejected — it bypasses
-        # SSRF hostname checks and would be persisted/echoed (#1329). The
-        # rejection message must NOT echo the secret.
-        err = _first_schema_error(lambda: _make_request(url="https://svc:SuperSecret123@governance.example.com/hook"))
-        assert err["type"] == "value_error", err
-        assert "userinfo" in err["msg"], err
-        assert "SuperSecret123" not in err["msg"], err
-        assert err["loc"] == ("accounts", 0, "governance_agents", 0, "url"), err
+    def test_agent_url_with_userinfo_rejected_credential_in_args(self):
+        # A credential embedded in the url (userinfo) is a credential-in-args: the builder rejects
+        # it with the pinned CREDENTIAL_IN_ARGS code (terminal — auto-retry re-logs the credential).
+        # The message must NOT echo the secret; the field is the detection path only (#1329).
+        from src.core.exceptions import AdCPCredentialInArgsError
+
+        with pytest.raises(AdCPCredentialInArgsError) as exc_info:
+            _build_request(url="https://svc:SuperSecret123@governance.example.com/hook")
+        err = exc_info.value
+        assert err.error_code == "CREDENTIAL_IN_ARGS" and err.recovery == "terminal", err
+        assert err.field == "accounts[0].governance_agents[0].url", err
+        assert "SuperSecret123" not in str(err) and "SuperSecret123" not in (err.message or ""), err
 
     def test_agent_url_password_only_userinfo_rejected(self):
         # Password-only userinfo (username absent) must still be rejected — grades the
-        # second operand of the userinfo check, which a username-only test never exercises
-        # (#1329).
-        err = _first_schema_error(lambda: _make_request(url="https://:SuperSecret789@governance.example.com/hook"))
-        assert err["type"] == "value_error" and "userinfo" in err["msg"], err
-        assert "SuperSecret789" not in err["msg"], err
+        # second operand of the userinfo check, which a username-only test never exercises (#1329).
+        from src.core.exceptions import AdCPCredentialInArgsError
+
+        with pytest.raises(AdCPCredentialInArgsError) as exc_info:
+            _build_request(url="https://:SuperSecret789@governance.example.com/hook")
+        assert exc_info.value.error_code == "CREDENTIAL_IN_ARGS", exc_info.value
+        assert "SuperSecret789" not in str(exc_info.value), exc_info.value
 
     def test_agent_url_username_only_userinfo_rejected(self):
-        # Username-only userinfo (no password) must also be rejected — grades the first
-        # operand independently (#1329).
-        err = _first_schema_error(lambda: _make_request(url="https://serviceacct@governance.example.com/hook"))
-        assert err["type"] == "value_error" and "userinfo" in err["msg"], err
+        # Username-only userinfo (no password) must also be rejected — grades the first operand.
+        from src.core.exceptions import AdCPCredentialInArgsError
+
+        with pytest.raises(AdCPCredentialInArgsError) as exc_info:
+            _build_request(url="https://serviceacct@governance.example.com/hook")
+        assert exc_info.value.error_code == "CREDENTIAL_IN_ARGS", exc_info.value
 
     @pytest.mark.parametrize(
         "url",
         [
-            "https://localhost/hook",
-            "https://127.0.0.1:8000/hook",
+            # Blocked regardless of ADCP_TESTING: link-local metadata, RFC-1918 private, and a
+            # blocked-hostname metadata alias. (localhost / 127.0.0.1 are ALLOWED under
+            # ADCP_TESTING for capture servers — governance now shares the ONE
+            # webhook-registration host policy, unifying the previously-forked localhost
+            # allowance, #1329.)
             "https://169.254.169.254/latest/meta-data",
+            "https://10.0.0.1/hook",
+            "https://metadata.google.internal/hook",
         ],
     )
     def test_agent_url_ssrf_target_rejected(self, url):
-        # A persisted governance url is a future check_governance target; internal /
-        # loopback / metadata hosts are rejected at bind time (#1329).
-        err = _first_schema_error(lambda: _make_request(url=url))
-        assert err["type"] == "value_error", err
-        assert "disallowed host" in err["msg"], err
+        # A persisted governance url is a future check_governance target; internal / metadata hosts
+        # are rejected at bind time by the builder's SSRF gate (the repo-owned
+        # reject_unsafe_webhook_registration_url — VALIDATION_ERROR, field-located, #1329).
+        from src.core.exceptions import AdCPValidationError
+
+        with pytest.raises(AdCPValidationError) as exc_info:
+            _build_request(url=url)
+        assert exc_info.value.field == "accounts[0].governance_agents[0].url", exc_info.value
 
     def test_credentials_below_min_length_rejected(self):
         err = _first_schema_error(
@@ -423,62 +457,9 @@ class TestNonRestRequestBuilder:
         assert captured["ext"] == {"vendor_flag": True}
 
 
-class TestSyncGovernanceBoundaryValues:
-    """Construction-time schema asserts for the @bva boundary VALUES (#1329).
-
-    The UC-030 request-validation ``@bva`` outlines (cardinality, schemes, url) are now WIRED
-    on the wire (``when_bva_*`` + ``then_request_verdict``, graded via ``_BVA_GRADE`` across
-    a2a/mcp/rest). These construction-time asserts are the fast unit-level complement: they pin
-    the same boundaries at model construction (no transport round-trip), so a schema regression
-    reddens here in milliseconds before the slower wire suite runs. Not a substitute for the wire
-    grade — a construction-level check.
-    """
-
-    _KEY = "uuid-v4-unit-00000000000000001"
-
-    def _reject(self, agent: dict) -> dict:
-        return _first_schema_error(
-            lambda: SyncGovernanceRequest(
-                idempotency_key=self._KEY,
-                accounts=[account_entry({"account_id": "a"}, agents=[agent])],
-            )
-        )
-
-    @pytest.mark.parametrize(
-        ("authentication", "loc_token", "err_type"),
-        [
-            ({"schemes": [], "credentials": "x" * 40}, "schemes", "too_short"),
-            ({"schemes": ["Bearer", "Basic"], "credentials": "x" * 40}, "schemes", "too_long"),
-            ({"schemes": ["Nonsense"], "credentials": "x" * 40}, "schemes", "enum"),
-            ({"credentials": "x" * 40}, "schemes", "missing"),
-            ({"schemes": ["Bearer"]}, "credentials", "missing"),
-        ],
-        ids=["schemes-empty", "schemes-two", "schemes-outside-enum", "schemes-absent", "credentials-absent"],
-    )
-    def test_authentication_boundary_rejected(self, authentication: dict, loc_token: str, err_type: str):
-        err = self._reject({"url": "https://gov.example.com", "authentication": authentication})
-        assert err["type"] == err_type, err
-        assert loc_token in err["loc"], err
-
-    @pytest.mark.parametrize(
-        ("agent", "err_type"),
-        [
-            ({"url": "not a uri", "authentication": {"schemes": ["Bearer"], "credentials": "x" * 40}}, "url_parsing"),
-            ({"authentication": {"schemes": ["Bearer"], "credentials": "x" * 40}}, "missing"),
-        ],
-        ids=["url-non-uri", "url-absent"],
-    )
-    def test_url_boundary_rejected(self, agent: dict, err_type: str):
-        err = self._reject(agent)
-        assert err["type"] == err_type, err
-        assert "url" in err["loc"], err
-
-    def test_accounts_exactly_100_is_valid(self):
-        # maxItems 100 — the inclusive upper boundary is accepted (the @bva "valid" row).
-        req = SyncGovernanceRequest(
-            idempotency_key=self._KEY,
-            accounts=[
-                account_entry({"account_id": f"a{i}"}, agents=[governance_agent_dict(GOV_URL)]) for i in range(100)
-            ],
-        )
-        assert len(req.accounts) == 100
+# The @bva boundary VALUES (cardinality, schemes, url, accounts-max) are graded on the real
+# wire (``when_bva_*`` + ``then_request_verdict``, keyed on ``_BVA_GRADE`` across a2a/mcp/rest in
+# tests/bdd/steps/domain/uc030_governance.py). The former construction-time complement
+# (TestSyncGovernanceBoundaryValues) was a strict subset of that wire grade and was removed —
+# the wire suite pins field + message_substr + suggestion_substr per boundary, which the
+# model-construction asserts did not (#1329).

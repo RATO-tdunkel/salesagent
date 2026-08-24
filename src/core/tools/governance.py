@@ -50,12 +50,11 @@ idempotency posture this seller actually declares on the wire lives in ONE place
 ``capabilities._adcp_metadata`` (get_adcp_capabilities) — which declares
 ``idempotency.supported=false`` precisely because 3 of the 4 mutating tools (including
 this one) do NOT dedup; see that function's docstring for the full rationale. Do not
-restate the declared value here (it drifted from the code once — #1329 finding 1).
+restate the declared value here (it drifted from the code once — #1329).
 """
 
 from typing import Annotated, Any
 
-import adcp
 from adcp.types import AccountReference as LibraryAccountReference
 from adcp.types import ContextObject
 from adcp.types.aliases import SyncGovernanceAccount as SyncGovernanceAccountInput
@@ -71,6 +70,7 @@ from src.core.exceptions import (
     AdCPAccountAmbiguousError,
     AdCPAccountNotFoundError,
     AdCPAuthorizationError,
+    AdCPCredentialInArgsError,
     AdCPError,
     AdCPValidationError,
     RecoveryHint,
@@ -86,18 +86,9 @@ from src.core.schemas.account import (
 from src.core.tool_context import ToolContext
 from src.core.tools._mcp import mcp_result
 from src.core.transport_helpers import resolve_identity_from_context
-from src.core.validation_helpers import adcp_validation_boundary
-
-# The seller's implemented AdCP version echoed on every response (POST-S4), at
-# release precision (major.minor) derived from the pinned spec so it tracks a bump
-# automatically instead of drifting as a literal.
-_WIRE_ADCP_VERSION = ".".join(adcp.get_adcp_spec_version().split(".")[:2])
-
-# The validation-boundary context string for sync_governance, referenced ONCE (inside the
-# shared builder below). Every transport routes construction through the builder, so this is
-# the single source for the "Invalid sync_governance request: …" message prefix — MCP/A2A/REST
-# no longer each carry their own copy of the literal (#1329 finding 2).
-_SYNC_GOVERNANCE_CONTEXT = "sync_governance request"
+from src.core.validation_helpers import adcp_validation_boundary, boundary_context
+from src.core.version_compat import wire_adcp_version
+from src.core.webhook_validator import reject_unsafe_webhook_registration_url
 
 # Uniform per-account RESPONSE for an unresolved account. The *_NOT_FOUND
 # uniform-response MUST (pinned error-code.json: CREATIVE_NOT_FOUND /
@@ -113,19 +104,23 @@ _SYNC_GOVERNANCE_CONTEXT = "sync_governance request"
 # with create_media_buy/sync_creatives (_resolve_by_id) and tracked separately
 # on the open follow-up #1934; it is not introduced by this tool.
 _UNRESOLVED_ACCOUNT_MESSAGE = "Account does not exist or is not accessible to the authenticated agent."
-# The pinned enum's canonical ACCOUNT_NOT_FOUND suggestion (error-code.json enumMetadata),
-# not a bespoke string: the BDD wire grade (then_per_account_suggestion) pins this against
-# _pinned_error_metadata(), so production and the pin cannot drift. The canonical text is also
-# strictly MORE uniform than the prior "...accessible to this agent" phrasing — it does not
-# hint that the failure is an ACCESS issue, tightening the enumeration-oracle posture (#1329 R9-D5).
+# The pinned enum's canonical ACCOUNT_NOT_FOUND suggestion (@source enums/error-code.json @
+# v3.1.1 enumMetadata), not a bespoke string. Pinned to the spec by
+# test_architecture_error_suggestion_enum_conformance::_CANONICAL_SUGGESTION_CONSTANTS — the
+# MODULE-QUALIFIED suggestion registry that enrols this governance-module constant, so a
+# constant born outside src.core.exceptions no longer escapes the oracle (#1329). The canonical
+# text is also strictly MORE uniform than the prior "...accessible to this agent" phrasing — it
+# does not hint the failure is an ACCESS issue, tightening the enumeration-oracle posture.
 _UNRESOLVED_ACCOUNT_SUGGESTION = "verify account via list_accounts or contact seller"
 
-# Code + recovery for the uniform unresolved-account result are DERIVED from the
-# canonical AdCPAccountNotFoundError class metadata via the PUBLIC advisory_defaults()
-# accessor (not the private _default_* attrs — #1329 finding 9), so the per-account wire
-# code/recovery cannot drift from the exception the rest of the codebase raises for
-# ACCOUNT_NOT_FOUND. The class docstring pins recovery=terminal against the pinned enumMetadata.
-_UNRESOLVED_ACCOUNT_CODE, _UNRESOLVED_ACCOUNT_RECOVERY, _ = AdCPAccountNotFoundError.advisory_defaults()
+# Code + recovery for the uniform unresolved-account result are DERIVED from the canonical
+# AdCPAccountNotFoundError class metadata via the PUBLIC advisory_defaults() accessor (not the
+# private _default_* attrs — #1329), read by NAME off the AdvisoryDefaults NamedTuple, so the
+# per-account wire code/recovery cannot drift from the exception the rest of the codebase raises
+# for ACCOUNT_NOT_FOUND. The class docstring pins recovery=terminal against the pinned enumMetadata.
+_unresolved_account_defaults = AdCPAccountNotFoundError.advisory_defaults()
+_UNRESOLVED_ACCOUNT_CODE = _unresolved_account_defaults.error_code
+_UNRESOLVED_ACCOUNT_RECOVERY = _unresolved_account_defaults.recovery
 
 
 def _failed_account_result(
@@ -146,7 +141,7 @@ def _failed_account_result(
     spec-facing per-account code set explicitly, not read from the exception's wire
     code — the authority failure is relabeled to the uniform ``ACCOUNT_NOT_FOUND``
     (see ``_sync_one_account``). The advisory ``Error`` is built by the single shared
-    ``build_advisory_error`` builder at the error boundary (#1329 finding 9).
+    ``build_advisory_error`` builder at the error boundary (#1329).
     """
     return SyncGovernanceResponseAccount(
         account=account_ref,
@@ -267,17 +262,47 @@ async def _sync_governance_impl(
     audit_logger.log_info(f"sync_governance completed: {synced}/{len(results)} synced (principal={principal_id})")
 
     # Echo the seller's implemented protocol version on the response (POST-S4, graded by
-    # BR-UC-030). Derived release-precision (major.minor) from the pinned spec so it cannot
-    # drift on a bump — the wire carries release precision even though inputs may be
-    # patch-precise (#1329). This is the only tool that stamps adcp_version in _impl; folding
-    # the echo into a shared response base so every tool echoes it identically is a
-    # cross-cutting change deferred to #1934 (the echo must stay here until then — it is graded).
-    return SyncGovernanceResponse(accounts=results, context=req.context, adcp_version=_WIRE_ADCP_VERSION)
+    # BR-UC-030) via the shared ``wire_adcp_version()`` accessor (release precision, derived from
+    # the pinned spec) — the ONE wire-adcp_version normalizer, so this response and every other
+    # wire emitter render the same string instead of some emitting full semver (#1329). Folding
+    # the echo into a shared response base so every tool echoes it identically is a cross-cutting
+    # change deferred to #1934 (the echo must stay here until then — it is graded).
+    return SyncGovernanceResponse(accounts=results, context=req.context, adcp_version=wire_adcp_version())
 
 
 # ---------------------------------------------------------------------------
 # Shared request assembly (non-REST transports)
 # ---------------------------------------------------------------------------
+
+
+def _reject_credential_or_unsafe_agent_urls(req: SyncGovernanceRequest) -> None:
+    """Post-construction url policy for governance agents — the ONE home, off the type layer.
+
+    Two gates the pinned request schema does not express, applied uniformly on every transport
+    (the builder runs before dispatch) with a field-located ``accounts[i].governance_agents[j].url``:
+
+    1. **credential in args** — ``https://user:pass@host`` embeds a credential in a request arg, so
+       it is rejected with the pinned ``CREDENTIAL_IN_ARGS`` code (terminal — auto-retry re-logs the
+       credential; authentication.mdx L2). Operands are read directly off the ``AnyUrl`` so a codegen
+       regression to ``str`` raises loudly rather than silently no-opping the gate.
+    2. **SSRF host** — the persisted url is a future ``check_governance`` target; the repo-owned
+       ``reject_unsafe_webhook_registration_url`` is the SINGLE host-policy home (shared with webhook
+       registration — same ADCP_TESTING localhost allowance + SSRF suggestion, no fork into the type
+       layer). The ``^https://`` shape check stays on the model (a pure schema-shape check the SDK
+       codegen drops, env-independent); host policy lives here (#1329).
+    """
+    for a_idx, account in enumerate(req.accounts):
+        for g_idx, agent in enumerate(account.governance_agents):
+            url = agent.url
+            field = f"accounts[{a_idx}].governance_agents[{g_idx}].url"
+            if url.username or url.password:
+                raise AdCPCredentialInArgsError(
+                    "A credential was detected in a governance agent url (userinfo). Credentials must "
+                    "not be embedded in request args; provide the agent's credentials in the "
+                    "authentication field or on the transport authentication channel.",
+                    field=field,
+                )
+            reject_unsafe_webhook_registration_url(str(url), field=field, context=req.context)
 
 
 def build_sync_governance_request(
@@ -286,37 +311,51 @@ def build_sync_governance_request(
     context: ContextObject | dict[str, Any] | None,
     ext: dict[str, Any] | None,
     idempotency_key: str | None,
+    adcp_version: str | None = None,
+    adcp_major_version: int | None = None,
 ) -> SyncGovernanceRequest:
     """Assemble a ``SyncGovernanceRequest`` from loose params — the SINGLE constructor.
 
-    Owns the CONSTRUCTION SEMANTICS every transport shares — the validation boundary, the
-    omit-``None``-idempotency_key behaviour, and the boundary context string
-    (``_SYNC_GOVERNANCE_CONTEXT``, referenced once) — so those cannot drift between MCP, A2A,
-    and REST. All three transports call this builder (REST too, as of #1329 finding 2), so it
-    carries its own internal boundary and callers need not re-wrap it (the REST-request-boundary
-    guard recognises self-bounding builders — see ``self_bounding_builders``). It does NOT own
-    the field LIST: the field names are still enumerated at the call sites (these params, the MCP
-    signature below, ``SyncGovernanceBody`` in ``src/routes/api_v1.py``, and the A2A skill's
-    ``parameters.get(...)`` kwargs), and adding a spec field touches each.
-    ``tests/unit/test_boundary_field_forwarding.py::TestSyncGovernanceFieldForwarding``
-    is what actually prevents a field drift — it derives the spec-field set from the request
-    model and asserts the wrappers forward it here (#1329 R9-D1). Construction runs inside the
-    AdCP validation boundary so a schema violation (missing/short idempotency_key, non-https url,
-    short credentials, agent cardinality) surfaces as the VALIDATION_ERROR envelope — the same
-    wire shape on every transport (#1329).
+    Owns the CONSTRUCTION SEMANTICS every transport shares — the validation boundary (via the
+    shared ``boundary_context("sync_governance")`` accessor, not a per-tool literal), the
+    omit-``None``-idempotency_key behaviour, and the post-construction url policy — so those
+    cannot drift between MCP, A2A, and REST. All three transports call this builder (REST too),
+    so it carries its own internal boundary and callers need not re-wrap it (the
+    REST-request-boundary guard recognises self-bounding builders — see ``self_bounding_builders``).
+    It does NOT own the field LIST: the field names are still enumerated at the call sites (these
+    params, the MCP signature below, ``SyncGovernanceBody`` in ``src/routes/api_v1.py``, and the
+    A2A skill's ``parameters.get(...)`` kwargs), and adding a spec field touches each.
+    ``tests/unit/test_boundary_field_forwarding.py::TestSyncGovernanceFieldForwarding`` is what
+    prevents a field drift — it derives the spec-field set from the request model and asserts the
+    wrappers forward it here (#1329). Construction runs inside the AdCP validation boundary so a
+    schema violation (missing/short idempotency_key, non-https url, short credentials, agent
+    cardinality) surfaces as the VALIDATION_ERROR envelope — the same wire shape on every transport.
+
+    ``adcp_version`` / ``adcp_major_version`` are the version-envelope fields the pinned request
+    schema (``core/version-envelope.json``) composes; they are ACCEPTED-AND-IGNORED uniformly
+    (forwarded to the model, never rejected on one transport — version negotiation is unimplemented
+    and the seller echoes its OWN implemented version on the response, POST-S4, #1329).
 
     ``idempotency_key`` is OMITTED when None (not passed as None): REST drops it via
-    ``model_dump(exclude_none=True)``, so a missing key renders as "Required field is
-    missing" on all three transports rather than "Expected string, got NoneType"
-    (#1329 H1). ``ext`` (the AdCP extension carrier) is forwarded on both transports —
-    the MCP wrapper previously omitted it, forking a spec-valid field off one
-    transport under a comment claiming parity (#1329 I4).
+    ``model_dump(exclude_none=True)``, so a missing key renders as "Required field is missing" on
+    all three transports rather than "Expected string, got NoneType". ``ext`` (the AdCP extension
+    carrier) is forwarded on every transport.
     """
-    kwargs: dict[str, Any] = {"accounts": accounts or [], "context": context, "ext": ext}
+    kwargs: dict[str, Any] = {
+        "accounts": accounts or [],
+        "context": context,
+        "ext": ext,
+        "adcp_version": adcp_version,
+        "adcp_major_version": adcp_major_version,
+    }
     if idempotency_key is not None:
         kwargs["idempotency_key"] = idempotency_key
-    with adcp_validation_boundary(context=_SYNC_GOVERNANCE_CONTEXT):
-        return SyncGovernanceRequest(**kwargs)
+    with adcp_validation_boundary(context=boundary_context("sync_governance")):
+        req = SyncGovernanceRequest(**kwargs)
+    # url credential/SSRF policy runs AFTER construction (the model has passed the ^https:// shape
+    # check) and raises typed AdCPErrors directly, so it sits outside the ValidationError boundary.
+    _reject_credential_or_unsafe_agent_urls(req)
+    return req
 
 
 # ---------------------------------------------------------------------------
@@ -332,6 +371,16 @@ async def sync_governance(
     accounts: list[SyncGovernanceAccountInput] | None = None,
     context: ContextObject | None = None,
     ext: dict[str, Any] | None = None,
+    adcp_version: Annotated[
+        str | None,
+        Field(description="AdCP version-envelope field (accepted-and-ignored; the seller echoes its own version)"),
+    ] = None,
+    adcp_major_version: Annotated[
+        int | None,
+        Field(
+            description="AdCP major-version-envelope field (accepted-and-ignored; version negotiation is unimplemented)"
+        ),
+    ] = None,
     ctx: Context | ToolContext | None = None,
 ) -> ToolResult:
     """Bind a governance agent per account (MCP tool).
@@ -352,13 +401,22 @@ async def sync_governance(
         accounts: Per-account governance agent bindings.
         context: Application-level context per AdCP spec (echoed back).
         ext: AdCP extension carrier — forwarded through the shared builder so the
-            field is not dropped on this transport (#1329 I4).
+            field is not dropped on this transport (#1329).
+        adcp_version: AdCP version-envelope field — accepted-and-ignored uniformly (#1329).
+        adcp_major_version: AdCP major-version-envelope field — accepted-and-ignored uniformly.
         ctx: FastMCP context for authentication.
 
     Returns:
         ToolResult with human-readable text and structured data.
     """
-    req = build_sync_governance_request(accounts=accounts, context=context, ext=ext, idempotency_key=idempotency_key)
+    req = build_sync_governance_request(
+        accounts=accounts,
+        context=context,
+        ext=ext,
+        idempotency_key=idempotency_key,
+        adcp_version=adcp_version,
+        adcp_major_version=adcp_major_version,
+    )
     identity = (await ctx.get_state("identity")) if isinstance(ctx, Context) else None
     response = await _sync_governance_impl(req, identity)
     # mcp_result() is the single ToolResult builder (GH #1710): it serializes

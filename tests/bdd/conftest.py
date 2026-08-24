@@ -356,7 +356,7 @@ _XFAIL_TAGS: dict[str, str] = {
     "T-UC-002-nfr-001": "rate limiting + payload size validation not implemented — spec-production gap",
     # FIXME(#1934): UC-030 sync_governance production gaps — parked in the STRICT collection-time
     # registry (not an imperative pytest.xfail in _harness_env) so each XPASSes the day the gap
-    # closes and forces its own removal (#1329 finding 2). All homed on #1934 (open,
+    # closes and forces its own removal (#1329). All homed on #1934 (open,
     # author-assigned): idempotency replay/cache/conflict + granted-scope model are genuine
     # unbuilt capability, and check_governance enforcement is a deliberately UNDECLARED
     # capability (governance-aware-seller) out of scope for the sync_governance PR.
@@ -364,15 +364,14 @@ _XFAIL_TAGS: dict[str, str] = {
     "T-UC-030-sync-idempotency-conflict": "IDEMPOTENCY_CONFLICT (same key / different payload) not implemented — spec-production gap (#1934)",
     "T-UC-030-sync-permission-denied": "per-operation granted-scope model (PERMISSION_DENIED) not implemented — spec-production gap (#1934)",
     "T-UC-030-storyboard-binding-used-during-create-media-buy": "requires check_governance invocation during create_media_buy — undeclared capability (#1934)",
-    "T-UC-030-bva-idempotency-key": "idempotency replay/conflict (same key + identical/divergent payload) not implemented — spec-production gap (#1934)",
-    # These two @bva outlines grade RESPONSE shapes but their generated Then reuses the
-    # request-verdict phrasing, and one row each is schema-unexpressible ("status value
-    # outside the two-member enum"; "credentials present on response" is not a request
-    # rejection). Full wiring (seed + response-shape Then) needs the generated outline
-    # reconciled first, tracked on #1934 — parked here in the STRICT registry (ratcheted)
-    # rather than as an imperative _harness_env xfail (#1329 finding 2).
-    "T-UC-030-bva-sync-account-status": "per-account status response-shape grade needs outline reconciliation — #1934",
-    "T-UC-030-bva-credentials": "credentials response-shape grade needs outline reconciliation — #1934",
+    # The @bva outlines for governance_agents/accounts cardinality, schemes, url, credentials,
+    # idempotency_key, and per-account status are now WIRED in uc030_governance.py (when_bva_* +
+    # then_request_verdict / then_response_verdict). Their request-validation + valid-enum rows run
+    # and grade on the real wire; the schema-unexpressible rows (a per-account status outside the
+    # two-member enum, a credential echoed on the response) and the unbuilt idempotency
+    # replay/conflict rows auto-xfail at the when-step (NotImplementedError, #1934) — so no per-tag
+    # _XFAIL_TAGS entry remains for bva-credentials / bva-sync-account-status / bva-idempotency-key
+    # (registry shrank, #1329 item 5).
     # FIXME(#1934): UC-010 idempotency-supported discriminated-union SHAPE outline. This honesty
     # seller declares the supported=false Idempotency3 variant unconditionally (capabilities.
     # _adcp_metadata); three of the four rows describe a supported=true posture (with
@@ -380,15 +379,13 @@ _XFAIL_TAGS: dict[str, str] = {
     # (#1934). Parked STRICT (ratcheted) rather than per-row xfailed. The withdrawal VALUE itself
     # (supported=false, no replay_ttl) is graded on the wire by assert_declared_capabilities via
     # the sandbox scenario + the integration wire test; @T-UC-010-v31-idempotency-required also
-    # grades presence + boolean discriminator (#1329 finding 1).
+    # grades presence + boolean discriminator (#1329).
     "T-UC-010-v31-idempotency-supported": "seller emits only the supported=false variant; supported=true shapes need idempotency dedup — #1934",
-    # FIXME(#1934): pre-existing BR-UC-010 no-tenant minimal-degradation scenario, tagged @mcp
-    # (single transport) rather than the transport-agnostic dispatch this PR's honesty graders
-    # use, and its "response should NOT include ..." minimal-response assertions are not stepped.
-    # Deleting the UC-010 complement gate (finding 2) un-dormanted it; parked STRICT here rather
-    # than restoring a complement gate. Full wiring (transport-specific dispatch + minimal-
-    # response Thens) is out of scope for the sync_governance/capabilities-honesty PR — #1934.
-    "T-UC-010-ext-a-mcp": "no-tenant minimal-degradation scenario not wired (transport-tagged + unstepped Thens) — #1934",
+    # T-UC-010-ext-a-mcp (no-tenant minimal-degradation) is now WIRED (#1329 item 5): the @mcp
+    # single-transport tag was dropped so it dispatches transport-agnostically with a tenant=None
+    # identity (CapabilitiesEnv.no_tenant_identity), and its Thens were corrected to the SHIPPED
+    # shape (account section present with sandbox=false, media_buy omitted) graded via
+    # assert_declared_capabilities. No _XFAIL_TAGS entry remains.
 }
 
 # FIXME(beads-dul): Selective xfail for parametrized scenarios where only
@@ -3499,7 +3496,7 @@ def _harness_env(request: pytest.FixtureRequest, ctx: dict) -> Generator[None, N
             pytest.xfail(f"UC-011 harness not yet wired for markers: {marker_names}")
 
     elif uc == "UC-030":
-        # No imperative pytest.xfail parks here (#1329 finding 2): production-gap scenarios
+        # No imperative pytest.xfail parks here (#1329): production-gap scenarios
         # (idempotency replay/conflict, permission-denied, storyboard-binding-during-create,
         # the idempotency/credentials/sync-account-status @bva outlines) are parked in the
         # STRICT collection-time registry (_XFAIL_TAGS, keyed on their T-UC-030 tags, homed on
@@ -3515,7 +3512,7 @@ def _harness_env(request: pytest.FixtureRequest, ctx: dict) -> Generator[None, N
             yield
 
     elif uc == "UC-010":
-        # No complement-shaped gate here (#1329 finding 2): the honesty graders this PR steps
+        # No complement-shaped gate here (#1329): the honesty graders this PR steps
         # (@T-UC-010-v31-account-sandbox, @T-UC-010-v31-specialisms, @T-UC-010-v31-idempotency-
         # required) run and grade on the real wire; every other BR-UC-010 scenario has no step
         # definitions and auto-xfails on the undefined-step path — the same dormancy signal an

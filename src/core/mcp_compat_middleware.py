@@ -121,16 +121,17 @@ class RequestCompatMiddleware(Middleware):
             # Build the SAME rich validation envelope the A2A/REST request-body
             # boundary produces (format_validation_error message + suggest_validation_fix
             # + buyer field path), so MCP no longer forks off a leaf-only Pydantic
-            # message for a TypeAdapter rejection (#1329 finding 5 / R9-G1). exc here is
+            # message for a TypeAdapter rejection (#1329 / R9-G1). exc here is
             # always a FastMCP TypeAdapter ValidationError (the guard above re-raised
             # everything else), so the shared builder applies uniformly.
-            from src.core.validation_helpers import adcp_validation_error_from
+            from src.core.validation_helpers import adcp_validation_error_from, boundary_context
 
             # ``exc`` is narrowed to ValidationError by the ``TypeIs`` guard above (the
             # ``if not self._is_typeadapter_validation_error(exc): raise`` re-raised everything
-            # else), so no runtime assert is needed — pass the tool name so MCP renders the same
-            # ``Invalid <tool> request: …`` context A2A/REST produce (#1329 finding 2).
-            typed = adcp_validation_error_from(exc, context=f"{tool_name} request")
+            # else), so no runtime assert is needed — route the tool name through the shared
+            # ``boundary_context`` accessor so MCP renders the SAME ``Invalid <tool> request: …``
+            # context A2A/REST produce (one accessor, no per-site literal — #1329).
+            typed = adcp_validation_error_from(exc, context=boundary_context(tool_name))
             tenant_id = None
             principal_id = None
             if context.fastmcp_context is not None:

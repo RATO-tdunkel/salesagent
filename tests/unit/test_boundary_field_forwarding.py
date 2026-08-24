@@ -317,22 +317,22 @@ class TestUpdateMediaBuyFieldForwarding:
 
 
 # ---------------------------------------------------------------------------
-# Tests — sync_governance (#1329 R9-D1/D2)
+# Tests — sync_governance (#1329/D2)
 # ---------------------------------------------------------------------------
 
 GOVERNANCE_FILE = Path("src/core/tools/governance.py")
 A2A_FILE = Path("src/a2a_server/adcp_a2a_server.py")
 
-# AdCP spec fields that must reach SyncGovernanceRequest via build_sync_governance_request.
-# Derived from the request model minus the version markers (see the parity test below),
-# so a new spec field is auto-enrolled rather than hand-copied (#1329 R9-D1).
-_GOVERNANCE_VERSION_FIELDS = {"adcp_version", "adcp_major_version"}
 
-
+# ALL AdCP spec fields (INCLUDING the version-envelope markers) that must reach
+# SyncGovernanceRequest via build_sync_governance_request. Derived from the request model — no
+# hand-copied subtraction of version markers: the version-envelope fields (adcp_version,
+# adcp_major_version) are ACCEPTED-AND-IGNORED, not rejected, so they must be declared + forwarded
+# on every transport, and the REST body must EQUAL this set in both directions (#1329).
 def _sync_governance_spec_fields() -> set[str]:
     from src.core.schemas import SyncGovernanceRequest
 
-    return set(SyncGovernanceRequest.model_fields) - _GOVERNANCE_VERSION_FIELDS
+    return set(SyncGovernanceRequest.model_fields)
 
 
 class TestSyncGovernanceFieldForwarding:
@@ -342,24 +342,29 @@ class TestSyncGovernanceFieldForwarding:
     test_sync_governance.py crossed the MCP wrapper); the drift it prevents — ``ext``
     forwarded on A2A, dropped on MCP, or vice-versa — is exactly what this two-sided
     static check catches, the same shape ``_extract_call_kwargs`` already expresses for
-    update_media_buy (#1329 R9-D2).
+    update_media_buy (#1329).
     """
 
     def test_spec_fields_derive_from_request_model(self):
-        # The forwarded set is the request model minus version markers — a subset of both
-        # the MCP wrapper signature and the REST Body, so declared == accepted (#1329 R9-D1).
+        # The forwarded set is the FULL request model (version-envelope fields included, since they
+        # are accepted-and-ignored, not rejected). declared == accepted is checked BOTH ways: the
+        # REST body must EQUAL the spec (so a transport can neither drop nor forbid a spec field),
+        # and the MCP wrapper params must be a superset (#1329).
         import inspect
 
         from src.core.tools.governance import sync_governance
 
         spec = _sync_governance_spec_fields()
-        assert spec == {"accounts", "context", "ext", "idempotency_key"}
+        assert spec == {"accounts", "context", "ext", "idempotency_key", "adcp_version", "adcp_major_version"}
         mcp_params = set(inspect.signature(sync_governance).parameters) - {"ctx"}
         assert spec <= mcp_params, f"MCP wrapper missing spec params: {sorted(spec - mcp_params)}"
         from src.routes.api_v1 import SyncGovernanceBody
 
         body_fields = set(SyncGovernanceBody.model_fields)
-        assert spec <= body_fields, f"SyncGovernanceBody missing spec fields: {sorted(spec - body_fields)}"
+        assert body_fields == spec, (
+            f"SyncGovernanceBody must EQUAL the spec fields (declared == accepted, both directions): "
+            f"missing={sorted(spec - body_fields)} extra={sorted(body_fields - spec)}"
+        )
 
     def test_mcp_wrapper_forwards_all_spec_fields_to_builder(self):
         kwargs = _extract_call_kwargs(GOVERNANCE_FILE, "sync_governance", "build_sync_governance_request")

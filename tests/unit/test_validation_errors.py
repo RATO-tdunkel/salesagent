@@ -6,6 +6,7 @@ from pydantic import BaseModel, ValidationError
 from src.core.exceptions import AdCPValidationError
 from src.core.schemas import CreateMediaBuyRequest
 from src.core.validation_helpers import first_validation_error_field, format_validation_error
+from tests.helpers import assert_redacted, extra_forbidden_error
 
 
 def test_first_validation_error_field_uses_bracket_notation():
@@ -39,27 +40,15 @@ def test_first_validation_error_field_strips_generated_union_variant_segments():
 
     Pydantic inserts the matched union member class name (e.g. AccountReference1) as a loc
     segment; the buyer's payload has no such path. The field must be the real dotted path
-    (account.account_id), not account.AccountReference1.account_id (#1329 R9-G3).
+    (account.account_id), not account.AccountReference1.account_id (#1329).
     """
-    from src.core.schemas import SyncGovernanceRequest
+    from tests.helpers.governance import governance_request
 
     with pytest.raises(ValidationError) as exc_info:
         # A non-string account_id fails the AccountReferenceById arm; the loc carries the
-        # generated variant tag AccountReference1 between `account` and `account_id`.
-        SyncGovernanceRequest(
-            idempotency_key="k" * 32,
-            accounts=[
-                {
-                    "account": {"account_id": 123},
-                    "governance_agents": [
-                        {
-                            "url": "https://agent.example.com/hook",
-                            "authentication": {"schemes": ["Bearer"], "credentials": "c" * 32},
-                        }
-                    ],
-                }
-            ],
-        )
+        # generated variant tag AccountReference1 between `account` and `account_id`. Built via
+        # the shared request/agent builders (#1329) — the only deviation is the int account_id.
+        governance_request(account_ref={"account_id": 123}, url="https://agent.example.com/hook", credentials="c" * 32)
 
     field = first_validation_error_field(exc_info.value)
     assert field is not None
@@ -75,30 +64,18 @@ def test_extra_forbidden_header_style_key_survives_in_field():
     which also matches a buyer's own header-style key (Authorization, X-Api-Key, Token)
     when it is the TERMINAL loc segment of an extra_forbidden rejection. That key is the
     one actionable pointer the buyer has (the echoed value is always [redacted]), so the
-    strip must never drop the terminal segment (#1329 finding 4).
+    strip must never drop the terminal segment (#1329).
     """
-    from src.core.schemas import SyncGovernanceRequest
+    from tests.helpers.governance import account_entry, governance_agent_dict, governance_request
 
+    # Header-style extra key: capitalized, no underscore, terminal. Built via the shared
+    # agent/request builders (#1329); the authentication override carries the extra key.
+    agent = governance_agent_dict(
+        "https://agent.example.com/hook",
+        authentication={"schemes": ["Bearer"], "credentials": "c" * 32, "Authorization": "Bearer secret-value"},
+    )
     with pytest.raises(ValidationError) as exc_info:
-        SyncGovernanceRequest(
-            idempotency_key="k" * 32,
-            accounts=[
-                {
-                    "account": {"account_id": "acct_1"},
-                    "governance_agents": [
-                        {
-                            "url": "https://agent.example.com/hook",
-                            "authentication": {
-                                "schemes": ["Bearer"],
-                                "credentials": "c" * 32,
-                                # Header-style extra key: capitalized, no underscore, terminal.
-                                "Authorization": "Bearer secret-value",
-                            },
-                        }
-                    ],
-                }
-            ],
-        )
+        governance_request(accounts=[account_entry({"account_id": "acct_1"}, agents=[agent])])
 
     field = first_validation_error_field(exc_info.value)
     assert field is not None
@@ -189,7 +166,7 @@ def test_validation_error_formatting():
 
         # Check that we got a helpful error message. The codegen union-variant tag
         # (BrandManifest) is stripped from the message path too — the message reports
-        # the same buyer path as `field`/`details.loc` (#1329 finding 4).
+        # the same buyer path as `field`/`details.loc` (#1329).
         assert "Invalid test request:" in error_msg
         assert "brand_manifest.target_audience" in error_msg
         assert "brand_manifest.BrandManifest" not in error_msg
@@ -220,25 +197,10 @@ def test_validation_error_formatting_extra_field_redacts_innocuous_scalar():
     only safe policy is to never echo (#1329). The actionable field PATH
     always survives.
     """
-    try:
-        raise ValidationError.from_exception_data(
-            "CreateMediaBuyRequest",
-            [
-                {
-                    "type": "extra_forbidden",
-                    "loc": ("unknown_field",),
-                    "msg": "Extra inputs are not permitted",
-                    "input": "some_value",
-                }
-            ],
-        )
-    except ValidationError as e:
-        error_msg = format_validation_error(e)
-
-        assert "unknown_field: Extra field not allowed by AdCP spec" in error_msg
-        # The value is NEVER echoed — even an innocuous one.
-        assert "some_value" not in error_msg
-        assert "Received value: [redacted]" in error_msg
+    err = extra_forbidden_error("CreateMediaBuyRequest", ("unknown_field",), "some_value")
+    # Grade BOTH halves off the one helper: the value is withheld ([redacted], secret absent)
+    # AND the actionable field path survives — even for an innocuous scalar.
+    assert_redacted(format_validation_error(err), field_path="unknown_field", secret="some_value")
 
 
 def test_validation_error_formatting_extra_field_with_dict_redacted():
@@ -247,26 +209,18 @@ def test_validation_error_formatting_extra_field_with_dict_redacted():
     A value scan cannot prove a dict is credential-free (a list-of-pairs or a
     buyer-invented key escapes it), so the whole value is withheld (#1329).
     """
-    try:
-        raise ValidationError.from_exception_data(
-            "Package",
-            [
-                {
-                    "type": "extra_forbidden",
-                    "loc": ("format_ids", "agent_url"),
-                    "msg": "Extra inputs are not permitted",
-                    "input": {"agent_url": "https://creative.adcontextprotocol.org/", "id": "display_300x250"},
-                }
-            ],
-        )
-    except ValidationError as e:
-        error_msg = format_validation_error(e)
-
-        assert "format_ids.agent_url: Extra field not allowed by AdCP spec" in error_msg
-        assert "Received value: [redacted]" in error_msg
-        # The value (even innocuous) is withheld — not echoed.
-        assert "https://creative.adcontextprotocol.org/" not in error_msg
-        assert "display_300x250" not in error_msg
+    err = extra_forbidden_error(
+        "Package",
+        ("format_ids", "agent_url"),
+        {"agent_url": "https://creative.adcontextprotocol.org/", "id": "display_300x250"},
+    )
+    # Both halves off the one helper: the whole dict value is withheld (each fragment absent)
+    # AND the field path survives.
+    assert_redacted(
+        format_validation_error(err),
+        field_path="format_ids.agent_url",
+        secret=["https://creative.adcontextprotocol.org/", "display_300x250"],
+    )
 
 
 def test_validation_error_redacts_declared_field_name_misplaced():
@@ -277,24 +231,8 @@ def test_validation_error_redacts_declared_field_name_misplaced():
     longer get special treatment — every extra_forbidden value is withheld the same way
     (#1329).
     """
-    try:
-        raise ValidationError.from_exception_data(
-            "SyncAccountsRequest",
-            [
-                {
-                    "type": "extra_forbidden",
-                    "loc": ("keywords",),
-                    "msg": "Extra inputs are not permitted",
-                    "input": ["news", "sports"],
-                }
-            ],
-        )
-    except ValidationError as e:
-        error_msg = format_validation_error(e)
-
-        assert "keywords: Extra field not allowed by AdCP spec" in error_msg
-        assert "Received value: [redacted]" in error_msg
-        assert "news" not in error_msg and "sports" not in error_msg
+    err = extra_forbidden_error("SyncAccountsRequest", ("keywords",), ["news", "sports"])
+    assert_redacted(format_validation_error(err), field_path="keywords", secret=["news", "sports"])
 
 
 def test_validation_error_redacts_credential_under_authentication():
@@ -306,25 +244,12 @@ def test_validation_error_redacts_credential_under_authentication():
     the actionable field PATH is preserved (#1329, was BLOCKER A).
     """
     secret = "SUPERSECRETcredential00000000000000"
-    try:
-        raise ValidationError.from_exception_data(
-            "SyncGovernanceRequest",
-            [
-                {
-                    "type": "extra_forbidden",
-                    "loc": ("accounts", 0, "governance_agents", 0, "authentication", "credential"),
-                    "msg": "Extra inputs are not permitted",
-                    "input": secret,
-                }
-            ],
-        )
-    except ValidationError as e:
-        error_msg = format_validation_error(e)
-
-        assert secret not in error_msg, f"credential leaked into validation message: {error_msg!r}"
-        assert "[redacted]" in error_msg
-        # The field path is still actionable.
-        assert "authentication.credential: Extra field not allowed by AdCP spec" in error_msg
+    err = extra_forbidden_error(
+        "SyncGovernanceRequest",
+        ("accounts", 0, "governance_agents", 0, "authentication", "credential"),
+        secret,
+    )
+    assert_redacted(format_validation_error(err), field_path="authentication.credential", secret=secret)
 
 
 def test_validation_error_redacts_nested_secret_under_unknown_field():
@@ -335,23 +260,10 @@ def test_validation_error_redacts_nested_secret_under_unknown_field():
     (#1329).
     """
     secret = "NESTEDbearerSECRET00000000000000000"
-    try:
-        raise ValidationError.from_exception_data(
-            "SyncGovernanceRequest",
-            [
-                {
-                    "type": "extra_forbidden",
-                    "loc": ("extra_config",),
-                    "msg": "Extra inputs are not permitted",
-                    "input": {"authentication": {"credentials": secret}},
-                }
-            ],
-        )
-    except ValidationError as e:
-        error_msg = format_validation_error(e)
-
-        assert secret not in error_msg, f"nested credential leaked: {error_msg!r}"
-        assert "[redacted]" in error_msg
+    err = extra_forbidden_error("SyncGovernanceRequest", ("extra_config",), {"authentication": {"credentials": secret}})
+    # Routing through assert_redacted also grades that the innocuous top-level field path
+    # (extra_config) survives — a strengthening over the prior [redacted]-only check.
+    assert_redacted(format_validation_error(err), field_path="extra_config", secret=secret)
 
 
 @pytest.mark.parametrize(
@@ -378,22 +290,9 @@ def test_validation_error_redacts_credential_shaped_sibling_of_url(field_name):
     set, which is why the policy redacts every value (#1329).
     """
     secret = "sk-live-" + "z" * 40
-    try:
-        raise ValidationError.from_exception_data(
-            "SyncGovernanceRequest",
-            [
-                {
-                    "type": "extra_forbidden",
-                    "loc": ("accounts", 0, "governance_agents", 0, field_name),
-                    "msg": "Extra inputs are not permitted",
-                    "input": secret,
-                }
-            ],
-        )
-    except ValidationError as e:
-        error_msg = format_validation_error(e)
-
-        assert secret not in error_msg, f"{field_name} value must be withheld from the echo"
-        assert "[redacted]" in error_msg
-        # The field path stays actionable.
-        assert f"{field_name}: Extra field not allowed by AdCP spec" in error_msg
+    err = extra_forbidden_error(
+        "SyncGovernanceRequest",
+        ("accounts", 0, "governance_agents", 0, field_name),
+        secret,
+    )
+    assert_redacted(format_validation_error(err), field_path=field_name, secret=secret)

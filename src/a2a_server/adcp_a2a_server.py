@@ -512,10 +512,10 @@ class AdCPRequestHandler(RequestHandler):
         # Log only the message id, never the raw params: a sync_governance DataPart
         # carries write-only credentials (authentication.credentials) that must not
         # reach the application log (#1329).
-        logger.info(
-            "Handling message/send request (message_id=%s)",
-            getattr(getattr(params, "message", None), "message_id", None),
-        )
+        # Read the attributes directly (not getattr-with-default): :521 and :549 below already read
+        # ``params.message`` / ``.message_id`` directly, so an SDK rename must fail loudly HERE too
+        # rather than logging ``None`` forever while the sibling reads raise (#1329).
+        logger.info("Handling message/send request (message_id=%s)", params.message.message_id)
 
         # Parse message for both text and structured data parts
         message = params.message
@@ -635,7 +635,7 @@ class AdCPRequestHandler(RequestHandler):
                     # Keys only, never values: parameters may carry write-only
                     # credentials (sync_governance authentication.credentials). Same
                     # ``list(parameters.keys())`` spelling as the keys-only siblings at
-                    # _handle_explicit_skill and the sync_creatives handler (#1329 finding 12).
+                    # _handle_explicit_skill and the sync_creatives handler (#1329).
                     logger.info(
                         "Processing explicit skill: %s with parameters: %s", skill_name, list(parameters.keys())
                     )
@@ -1959,6 +1959,8 @@ class AdCPRequestHandler(RequestHandler):
             context=parameters.get("context"),
             ext=parameters.get("ext"),
             idempotency_key=parameters.get("idempotency_key"),
+            adcp_version=parameters.get("adcp_version"),
+            adcp_major_version=parameters.get("adcp_major_version"),
         )
         return await core_sync_governance_tool(req=request, identity=identity)
 

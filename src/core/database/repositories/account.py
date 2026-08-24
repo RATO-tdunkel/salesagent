@@ -8,13 +8,14 @@ beads: salesagent-m44
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING
 
 from adcp.types import CoreGovernanceAgent  # url-only SDK agent — the DB column + response record type
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from src.core.database.models import Account, AgentAccountAccess
+from src.core.exceptions import AdCPAccountNotFoundError
 
 if TYPE_CHECKING:
     # Request-side agent (carries write-only authentication) — distinct from the
@@ -24,30 +25,25 @@ if TYPE_CHECKING:
     )
 
 
-def _serialize_governance_agents(
-    agents: list[SyncGovernanceRequestAgent] | list[dict[str, Any]] | None,
-) -> list[CoreGovernanceAgent] | None:
-    """Project governance agents to the url-only ``accounts.governance_agents`` records.
+def _serialize_governance_agents(agents: list[SyncGovernanceRequestAgent]) -> list[CoreGovernanceAgent]:
+    """Project request governance agents to the url-only ``accounts.governance_agents`` records.
 
-    Lives beside its sole consumer, ``AccountRepository.set_governance_binding`` — the
-    single write path for ``accounts.governance_agents`` — which uses it to strip
-    credentials before persisting. The SDK ``CoreGovernanceAgent`` is url-only BY DESIGN:
-    credentials are write-only and MUST NEVER be persisted or echoed (sync_governance.mdx;
-    sync-governance-response.json ``governance_agents.items`` = url only). The request-side
-    ``GovernanceAgent`` carries ``authentication`` (schemes + credentials); this projects to
-    the url-only SDK type for *both* dict and model inputs (the caller's precise union, not
-    ``Any``).
+    Lives beside its sole consumer, ``AccountRepository.set_governance_binding`` — the single
+    write path for ``accounts.governance_agents`` — which uses it to strip credentials before
+    persisting. The SDK ``CoreGovernanceAgent`` is url-only BY DESIGN: credentials are write-only
+    and MUST NEVER be persisted or echoed (sync_governance.mdx; sync-governance-response.json
+    ``governance_agents.items`` = url only). The request-side ``GovernanceAgent`` carries
+    ``authentication`` (schemes + credentials); this reads only ``.url``, dropping it.
 
-    Only the ``url`` is read (never re-validating the full request model, which would
-    ``extra="forbid"``-reject ``authentication`` in dev/CI). Constructing
-    ``CoreGovernanceAgent(url=...)`` normalizes the ``AnyUrl`` and drops the write-only
-    ``authentication``; the ``JSONType(model=CoreGovernanceAgent)`` column serializes each
-    record on write and re-coerces on read, so persisted and returned shapes agree by
-    construction. Returns ``None`` for ``None`` input (unset field).
+    The input is the request model list ONLY (``list[SyncGovernanceRequestAgent]``): the pinned
+    request schema makes ``governance_agents`` required with ``minItems: 1``, so a ``None`` /
+    empty arm is unreachable, and the sole production caller passes parsed request models — no
+    dict arm (the earlier ``| list[dict] | None`` union advertised shapes nothing in production
+    produced, #1329). Constructing ``CoreGovernanceAgent(url=...)`` normalizes the ``AnyUrl`` and
+    drops the write-only ``authentication``; the ``JSONType(model=CoreGovernanceAgent)`` column
+    serializes each record on write and re-coerces on read, so persisted and returned shapes agree.
     """
-    if agents is None:
-        return None
-    return [CoreGovernanceAgent(url=(agent["url"] if isinstance(agent, dict) else agent.url)) for agent in agents]
+    return [CoreGovernanceAgent(url=agent.url) for agent in agents]
 
 
 class AccountRepository:
@@ -309,7 +305,7 @@ class AccountRepository:
         return account
 
     def set_governance_binding(
-        self, account_id: str, agents: list[SyncGovernanceRequestAgent] | list[dict[str, Any]] | None
+        self, account_id: str, agents: list[SyncGovernanceRequestAgent]
     ) -> list[CoreGovernanceAgent]:
         """Replace an account's governance-agent binding; return the persisted url-only list.
 
@@ -325,12 +321,20 @@ class AccountRepository:
         Account carrying a pre-populated ``governance_agents`` blob, or a raw ``setattr``,
         would bypass this strip; no live caller does so, there is no admin surface for
         governance, and reads are fail-closed — a strip at the persistence boundary is
-        tracked as a separate hardening, #1934.) Returns the stored records so the
-        caller echoes exactly what was persisted (the two can never disagree). Replaces
-        the prior binding (per-account replace semantics).
+        tracked as a separate hardening, #1934.)
+
+        Returns the stored records so the caller echoes exactly what was persisted (the two can
+        NEVER disagree — the docstring invariant is now enforced): ``_apply_fields`` returns
+        ``None`` when no row matches ``account_id``, which would otherwise return a "synced" list
+        for an account that was never written. That path is unreachable in production (the caller
+        resolves ``account_id`` via ``resolve_account`` in the SAME unit of work), but a computed
+        failure signal must not be discarded — raise the same ``ACCOUNT_NOT_FOUND`` the tool
+        already renders as the per-account ``failed`` result, so "returned ⇒ persisted" holds by
+        construction (#1329). Replaces the prior binding (per-account replace semantics).
         """
-        records = _serialize_governance_agents(agents) or []
-        self._apply_fields(account_id, {"governance_agents": records})
+        records = _serialize_governance_agents(agents)
+        if self._apply_fields(account_id, {"governance_agents": records}) is None:
+            raise AdCPAccountNotFoundError(f"Account {account_id!r} not found while binding governance agents.")
         return records
 
     # ------------------------------------------------------------------

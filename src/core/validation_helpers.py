@@ -14,6 +14,8 @@ from contextlib import contextmanager
 from pydantic import ValidationError
 
 from src.core.exceptions import (
+    AdCPCredentialInArgsError,
+    AdCPError,
     AdCPValidationError,
     build_validation_error_details,
     format_buyer_field_path,
@@ -23,6 +25,61 @@ from src.core.exceptions import (
 )
 
 logger = logging.getLogger(__name__)
+
+# Best-effort NAME terms that mark a rejected extra field as credential-bearing, so it is
+# rejected with the pinned CREDENTIAL_IN_ARGS code (terminal) rather than VALIDATION_ERROR
+# (correctable). Detection is name-based over the loc segments (normalized: `_`/`-` stripped);
+# a credential smuggled under a buyer-invented, non-credential-shaped name falls through to
+# VALIDATION_ERROR — still rejected, still value-redacted by format_validation_error. The value
+# is never inspected or echoed. @source dist/docs/3.1.1/building/by-layer/L2/authentication.mdx.
+_CREDENTIAL_NAME_TERMS = frozenset(
+    {
+        "credential",
+        "credentials",
+        "secret",
+        "password",
+        "passwd",
+        "passphrase",
+        "token",
+        "bearer",
+        "apikey",
+        "authorization",
+        "accesskey",
+        "privatekey",
+        "clientsecret",
+        "refreshtoken",
+        "accesstoken",
+        "sessionkey",
+        "cookie",
+        "signature",
+    }
+)
+
+
+def _segment_is_credential(segment: str | int) -> bool:
+    """True if a Pydantic loc segment names a credential-bearing field (best-effort)."""
+    if not isinstance(segment, str):
+        return False
+    normalized = segment.lower().replace("_", "").replace("-", "")
+    return any(term in normalized for term in _CREDENTIAL_NAME_TERMS)
+
+
+def _credential_in_args_field(validation_error: ValidationError) -> str | None:
+    """Buyer field PATH of the first credential-bearing ``extra_forbidden`` error, else None.
+
+    A buyer-principal credential placed in request args (a credential-named extra field) must be
+    rejected with the pinned ``CREDENTIAL_IN_ARGS`` code (terminal), not ``VALIDATION_ERROR``
+    (correctable) — auto-retrying re-logs the credential. Returns only the detection PATH (via the
+    single bracket renderer), never the value.
+    """
+    for error in validation_error.errors():
+        error_type = str(error.get("type", ""))
+        if "extra_forbidden" not in error_type:
+            continue
+        loc = error.get("loc", ())
+        if any(_segment_is_credential(seg) for seg in loc):
+            return format_buyer_field_path(loc, error_type=error_type)
+    return None
 
 
 @contextmanager
@@ -54,10 +111,24 @@ def adcp_validation_boundary(context: str = "parameters", field: str | None = No
         raise adcp_validation_error_from(e, context=context, field=field) from e
 
 
+def boundary_context(tool_name: str) -> str:
+    """The uniform validation-boundary context for a tool — renders ``Invalid <tool> request: …``.
+
+    ONE accessor so a tool's rejection message reads identically on every transport: the MCP
+    TypeAdapter-rejection path (RequestCompatMiddleware) and the MCP-body / A2A / REST request-body
+    boundary. Previously each site spelled its own context literal (``"sync_governance request"``,
+    ``f"{tool} request"``, ``"request"``), which forked ``create_media_buy`` into ``Invalid
+    create_media_buy request:`` on MCP's TypeAdapter stage vs ``Invalid request:`` on A2A/REST
+    (#1329). Route every ``adcp_validation_boundary`` / ``adcp_validation_error_from`` context for a
+    named tool through here.
+    """
+    return f"{tool_name} request"
+
+
 def adcp_validation_error_from(
     validation_error: ValidationError, *, context: str = "parameters", field: str | None = None
-) -> AdCPValidationError:
-    """Build the typed ``AdCPValidationError`` for a caught Pydantic ``ValidationError``.
+) -> AdCPError:
+    """Build the typed ``AdCPError`` for a caught Pydantic ``ValidationError``.
 
     The SINGLE construction shared by the two places a Pydantic ``ValidationError``
     is turned into the buyer-facing validation envelope:
@@ -66,14 +137,28 @@ def adcp_validation_error_from(
       MCP wrapper body, when the params clear FastMCP's own TypeAdapter first);
     * ``RequestCompatMiddleware`` — the MCP path for a rejection FastMCP's TypeAdapter
       raises BEFORE the wrapper body, which previously produced only the leaf Pydantic
-      message and so forked MCP's wire message/suggestion off A2A/REST (#1329 finding 5).
+      message and so forked MCP's wire message/suggestion off A2A/REST (#1329).
 
     Routing both through here means a validation rejection carries the same rich
     ``format_validation_error`` message, the same ``suggest_validation_fix``
     suggestion, the same ``buyer_loc_segments`` field path, and the same structured
     ``details`` on every transport — so a transport-blind scenario can assert the
     same strings everywhere.
+
+    A credential-bearing ``extra_forbidden`` field is rejected with the pinned
+    ``CREDENTIAL_IN_ARGS`` code (terminal) instead — the buyer-principal-credential-in-args
+    contract (authentication.mdx L2). The message stays generic and never echoes the value; the
+    ``field`` is the detection path only, and the terminal recovery + pinned suggestion come from
+    the typed class (a single owner for the code, not a call-site literal).
     """
+    credential_field = _credential_in_args_field(validation_error)
+    if credential_field is not None:
+        return AdCPCredentialInArgsError(
+            "A credential was detected in the request arguments. Credentials must be sent on the "
+            "transport authentication channel (e.g. Authorization: Bearer), never inside the request "
+            "payload.",
+            field=field if field is not None else credential_field,
+        )
     return AdCPValidationError(
         format_validation_error(validation_error, context=context),
         field=field if field is not None else first_validation_error_field(validation_error),
@@ -206,7 +291,7 @@ def format_validation_error(validation_error: ValidationError, context: str = "r
         error_type = error["type"]
         # Buyer field path via the SINGLE bracket renderer, forwarding the error type so the
         # message reports the exact same path as ``field``, the suggestion, and ``details.loc``
-        # (one spelling, brackets: ``accounts[0].governance_agents[0]...``) — #1329 finding 3.
+        # (one spelling, brackets: ``accounts[0].governance_agents[0]...``) — #1329.
         field_path = format_buyer_field_path(error["loc"], error_type=str(error_type))
         msg = error["msg"]
         input_val = error.get("input")
@@ -270,7 +355,7 @@ def suggest_validation_fix(validation_error: ValidationError) -> str:
 
     first = errors[0]
     error_type = first.get("type", "")
-    # Same SINGLE bracket renderer as the field + message (#1329 finding 3).
+    # Same SINGLE bracket renderer as the field + message (#1329).
     field_path = format_buyer_field_path(first.get("loc", ()), error_type=str(error_type)) or "request"
 
     if "missing" in error_type:

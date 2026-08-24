@@ -196,12 +196,11 @@ class TestSyncGovernanceSuggestionParity:
 
     def _invalid_kwargs(self) -> dict:
         # Well-formed account/agent; the ONLY defect is the missing idempotency_key,
-        # so the rejection is a request-validation error (not a per-account failure).
-        from tests.helpers.governance import GOV_URL, governance_agent_dict
+        # so the rejection is a request-validation error (not a per-account failure). Built via
+        # the shared request-element builders (#1329) rather than an inline account dict.
+        from tests.helpers.governance import GOV_URL, account_entry, governance_agent_dict
 
-        return {
-            "accounts": [{"account": {"account_id": "acc_p"}, "governance_agents": [governance_agent_dict(GOV_URL)]}]
-        }
+        return {"accounts": [account_entry({"account_id": "acc_p"}, agents=[governance_agent_dict(GOV_URL)])]}
 
     @pytest.mark.parametrize("transport", ["A2A", "MCP", "REST"])
     def test_missing_idempotency_key_envelope_carries_suggestion(self, transport, integration_db):

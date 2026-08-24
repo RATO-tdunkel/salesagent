@@ -38,6 +38,25 @@ class CapabilitiesEnv(IntegrationEnv):
     REST_ENDPOINT = CAPABILITIES_REST_ENDPOINT
     REST_METHOD = "get"  # GET discovery endpoint; both REST legs read this (#1329)
 
+    def no_tenant_identity(self, protocol: str = "mcp") -> Any:
+        """A ResolvedIdentity whose ``tenant`` is None — the 'no tenant resolvable' discovery path.
+
+        Carries the env's real ``tenant_id`` so the A2A handler's request-audit write has a valid FK,
+        but ``tenant=None`` so ``_get_adcp_capabilities_impl`` takes the minimal no-tenant branch (it
+        keys on ``identity.tenant``, not ``tenant_id``). ``auth_token=None`` routes the harness through
+        identity-injection (not the real token→DB auth chain), so the injected tenant=None identity is
+        what each transport wrapper hands the impl — the minimal response holds on a2a/mcp/rest (#1329).
+        """
+        from tests.factories import PrincipalFactory
+
+        return PrincipalFactory.make_identity(
+            principal_id=None,
+            tenant_id=self._tenant_id,
+            tenant=None,
+            auth_token=None,
+            protocol=protocol,
+        )
+
     def call_impl(self, **kwargs: Any) -> GetAdcpCapabilitiesResponse:
         from src.core.tools.capabilities import _get_adcp_capabilities_impl
 

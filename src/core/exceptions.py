@@ -11,7 +11,7 @@ to help buyer agents decide whether to retry, fix, or abandon a request.
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING, Any, ClassVar, Literal
+from typing import TYPE_CHECKING, Any, ClassVar, Literal, NamedTuple
 
 from adcp.server.helpers import STANDARD_ERROR_CODES, adcp_error
 from pydantic import BaseModel, ValidationError
@@ -25,6 +25,16 @@ logger = logging.getLogger(__name__)
 
 RecoveryHint = Literal["transient", "correctable", "terminal"]
 
+
+class AdvisoryDefaults(NamedTuple):
+    """Named return of :meth:`AdCPError.advisory_defaults` — the pinned wire metadata a
+    per-item advisory ``Error`` needs as literals (it cannot raise to inherit them)."""
+
+    error_code: str
+    recovery: RecoveryHint
+    suggestion: str | None
+
+
 # ---------------------------------------------------------------------------
 # Error-code compliance: mapping non-standard codes to SDK equivalents
 # ---------------------------------------------------------------------------
@@ -32,19 +42,27 @@ RecoveryHint = Literal["transient", "correctable", "terminal"]
 # WIRE_STANDARD_CODES.  Codes in ERROR_CODE_MAPPING are translated at the
 # transport boundary; codes in INTERNAL_CODES never leave the server.
 
-# Spec codes the SDK helper table has not caught up to. The pinned 3.1 enum
-# (enums/error-code.json @ adcp 04f59d2d5) defines these as real wire codes;
-# adcp 5.7's ``STANDARD_ERROR_CODES`` predates them, and the SDK is a
+# Spec codes the SDK helper table has not caught up to. The pinned enum
+# (@source enums/error-code.json @ v3.1.1, adcp==6.6.0) defines these as real wire
+# codes; the SDK's ``STANDARD_ERROR_CODES`` predates them, and the SDK is a
 # cross-check, not the authority. CREATIVE_NOT_FOUND per the enum: correctable,
 # and "Sellers MUST return this code uniformly for any creative_id not owned by
-# the calling account" (#1430 review). CONFIGURATION_ERROR per the enum:
-# terminal — "the buyer cannot resolve a seller-side deployment
-# misconfiguration and MUST NOT auto-retry" (#1430 review). The remaining
-# demoted spec code (BILLING_NOT_SUPPORTED) is tracked for the same treatment
-# in #1602.
+# the calling account". CONFIGURATION_ERROR per the enum: terminal — "the buyer
+# cannot resolve a seller-side deployment misconfiguration and MUST NOT
+# auto-retry". BILLING_NOT_SUPPORTED (correctable) and CREDENTIAL_IN_ARGS
+# (terminal) are likewise pinned wire codes absent from the SDK table; promoting
+# them here means the buyer sees the spec code untranslated. BILLING_NOT_SUPPORTED
+# was previously demoted to UNSUPPORTED_FEATURE via ERROR_CODE_MAPPING, but the
+# only emitter is the advisory ``errors[]`` path (build_advisory_error), which
+# serializes verbatim and never hit that mapping — so the wire code was already
+# BILLING_NOT_SUPPORTED; promoting it + dropping the mapping makes that honest
+# (resolves the #1602 demotion). CREDENTIAL_IN_ARGS is the code for a
+# buyer-principal credential detected in request args (authentication.mdx L2).
 _SPEC_SUPPLEMENT_CODES: dict[str, dict[str, str]] = {
     "CREATIVE_NOT_FOUND": {"recovery": "correctable", "message": "Creative not found"},
     "CONFIGURATION_ERROR": {"recovery": "terminal", "message": "Configuration error"},
+    "BILLING_NOT_SUPPORTED": {"recovery": "correctable", "message": "Billing model not supported"},
+    "CREDENTIAL_IN_ARGS": {"recovery": "terminal", "message": "Credential detected in request args"},
 }
 
 # The authoritative wire-code table: SDK baseline + pinned-spec supplement.
@@ -92,7 +110,9 @@ ERROR_CODE_MAPPING: dict[str, str] = {
     "UNSUPPORTED_TARGETING": "UNSUPPORTED_FEATURE",
     "PLACEMENT_TARGETING_NOT_SUPPORTED": "UNSUPPORTED_FEATURE",
     "UNSUPPORTED_ACTION": "UNSUPPORTED_FEATURE",
-    "BILLING_NOT_SUPPORTED": "UNSUPPORTED_FEATURE",
+    # BILLING_NOT_SUPPORTED is no longer demoted here — it is a WIRE_STANDARD_CODES
+    # entry via _SPEC_SUPPLEMENT_CODES (pinned enum, correctable), so it reaches the
+    # buyer untranslated.
     # Resource lookup
     "NO_PACKAGES_FOUND": "PACKAGE_NOT_FOUND",
     # Resource state
@@ -280,17 +300,19 @@ class AdCPError(Exception):
         self.recovery = recovery if recovery is not None else type(self)._default_recovery
 
     @classmethod
-    def advisory_defaults(cls) -> tuple[str, RecoveryHint, str | None]:
+    def advisory_defaults(cls) -> AdvisoryDefaults:
         """Public ``(error_code, recovery, suggestion)`` for building a per-item advisory.
 
         A per-account/per-item advisory ``Error`` in a SUCCESS envelope's ``errors[]`` cannot
         raise, so it needs this class's pinned wire metadata as literals. This is the SANCTIONED
         public read of the class ``_default_*`` attributes — callers outside this module (the
         ``build_advisory_error`` builder and the tool derivation constants) MUST use it rather
-        than reaching into the private ``_default_error_code`` / ``_default_recovery`` (#1329
-        finding 9), so a codegen/refactor rename of those attributes breaks in one place.
+        than reaching into the private ``_default_error_code`` / ``_default_recovery``, so a
+        codegen/refactor rename of those attributes breaks in one place. Returns a NAMED tuple
+        (``AdvisoryDefaults``) so callers read ``.error_code`` / ``.recovery`` / ``.suggestion``
+        by name rather than unpacking an anonymous 3-tuple positionally with a discard.
         """
-        return cls._default_error_code, cls._default_recovery, cls._default_suggestion
+        return AdvisoryDefaults(cls._default_error_code, cls._default_recovery, cls._default_suggestion)
 
     @property
     def wire_error_code(self) -> str:
@@ -449,6 +471,37 @@ class AdCPInvalidRequestError(AdCPValidationError):
     """
 
     _default_error_code: ClassVar[str] = "INVALID_REQUEST"
+
+
+# Canonical buyer-facing suggestion for CREDENTIAL_IN_ARGS, verbatim from the pinned
+# enums/error-code.json enumMetadata (@source enums/error-code.json @ v3.1.1, adcp==6.6.0);
+# pinned by test_architecture_error_suggestion_enum_conformance so it cannot drift from the spec.
+CREDENTIAL_IN_ARGS_SUGGESTION = (
+    "do NOT auto-retry — auto-retry re-logs the credential on each attempt. Move the credential "
+    "out of request args (top-level, `context`, `ext`, any nested location) onto the transport "
+    "authentication channel (Authorization: Bearer, RFC 9421 signature, MCP/A2A authentication "
+    "framing); rotate the leaked credential, then resubmit on the transport channel only"
+)
+
+
+class AdCPCredentialInArgsError(AdCPError):
+    """A buyer-principal credential was detected in request args (400, CREDENTIAL_IN_ARGS).
+
+    Per pinned AdCP 3.1.1 (@source dist/docs/3.1.1/building/by-layer/L2/authentication.mdx and
+    enums/error-code.json): a seller that detects a credential placed in the task payload
+    (top-level, ``context``, ``ext``, or any nested location — e.g. userinfo embedded in a url,
+    or a credential-bearing extra field) SHOULD reject with ``CREDENTIAL_IN_ARGS`` (upgrades to
+    MUST 90 days after 3.1 publication). Recovery is ``terminal`` — the agent MUST NOT auto-retry,
+    since auto-retry re-logs the credential on each attempt. The message MUST stay generic and the
+    ``field`` MUST be the detection PATH, never the credential value (enforced by the callers).
+    Distinct from ``AUTH_REQUIRED`` (transport-channel auth) and from the receiver-side
+    ``push_notification_config.authentication.credentials`` carve-out, which is a legitimate field.
+    """
+
+    _default_status_code: ClassVar[int] = 400
+    _default_error_code: ClassVar[str] = "CREDENTIAL_IN_ARGS"
+    _default_recovery: ClassVar[RecoveryHint] = "terminal"
+    _default_suggestion: ClassVar[str | None] = CREDENTIAL_IN_ARGS_SUGGESTION
 
 
 AUTH_REQUIRED_SUGGESTION = "Provide valid credentials (x-adcp-auth token)."
@@ -1055,12 +1108,18 @@ def build_advisory_error(
     every tool hand-built the ``Error(code=...)`` and carried its own ``# structural-guard:``
     marker; centralizing it here — beside ``build_two_layer_error_envelope`` at the error
     boundary, OUTSIDE ``src/core/tools/`` — means the wire-shape decision has one home and the
-    per-tool markers disappear (#1329 finding 9). Derive ``code`` / ``recovery`` /
-    ``suggestion`` from a typed class via :meth:`AdCPError.advisory_defaults` at the call site.
+    per-tool markers disappear (#1329). Derive ``code`` / ``recovery`` / ``suggestion`` from a
+    typed class via :meth:`AdCPError.advisory_defaults` at the call site.
+
+    ``code`` is normalized through :func:`to_wire_error_code`, so an advisory can never leak an
+    internal-only code: unlike a raised ``AdCPError`` (whose code passes through the boundary
+    translator), an ``errors[]`` advisory serializes verbatim, so the normalization has to happen
+    here. Codes already in ``WIRE_STANDARD_CODES`` (e.g. ``BILLING_NOT_SUPPORTED``,
+    ``VALIDATION_ERROR``) pass through unchanged.
     """
     from adcp.types import Error
 
-    return Error(code=code, message=message, suggestion=suggestion, recovery=recovery, field=field)
+    return Error(code=to_wire_error_code(code), message=message, suggestion=suggestion, recovery=recovery, field=field)
 
 
 # Canonical buyer-facing suggestions from error-code.json enumMetadata (AdCP 3.1.1):
@@ -1080,7 +1139,7 @@ def _is_generated_union_variant_segment(loc: str) -> bool:
     never ``account.AccountReference1.account_id``), so it must not reach the buyer-facing
     ``field``. AdCP request field names are snake_case (lowercase, underscores), so a
     segment beginning with an uppercase letter and containing no underscore is a generated
-    artifact, not a real field (#1329 R9-G3).
+    artifact, not a real field (#1329).
     """
     return bool(loc) and loc[0].isupper() and "_" not in loc
 
@@ -1094,7 +1153,7 @@ def buyer_loc_segments(
     (``first_validation_error_field`` for ``field``, ``format_validation_error`` for the
     message, ``suggest_validation_fix`` for the suggestion, ``build_validation_error_details``
     for ``details.loc``) MUST route through here so one envelope cannot report two different
-    paths for one error (#1329 finding 3). The projection needs the error TYPE, not only the
+    paths for one error (#1329). The projection needs the error TYPE, not only the
     ``loc``, because the correct rule depends on it:
 
     * ``extra_forbidden`` — the loc is kept VERBATIM. Its terminal segment is the buyer's OWN
@@ -1124,7 +1183,7 @@ def format_buyer_field_path(loc: tuple[str | int, ...] | Sequence[str | int], *,
     List indices render as ``[i]`` so boundary-derived paths such as ``packages[0].budget``
     align with the ``packages[].budget`` field strings the implementation layer raises. This is
     the SINGLE renderer for ``field``, the message bullet, AND the suggestion, so all three
-    carry one identical string (#1329 finding 3). Routes through :func:`buyer_loc_segments`,
+    carry one identical string (#1329). Routes through :func:`buyer_loc_segments`,
     forwarding ``error_type`` so the codegen union-variant strip and the ``extra_forbidden``
     carve-out are applied consistently.
     """
@@ -1146,7 +1205,7 @@ def first_validation_error_field(validation_error: ValidationError) -> str | Non
     ``AdCPValidationError`` it raises, so the wire envelope carries the offending
     field path instead of only the rendered message. Delegates the ``loc`` →
     buyer-path projection to :func:`format_buyer_field_path`, forwarding the error type so the
-    codegen-variant strip / ``extra_forbidden`` carve-out apply (#1329 finding 3).
+    codegen-variant strip / ``extra_forbidden`` carve-out apply (#1329).
     """
     errors = validation_error.errors()
     if not errors:
@@ -1160,7 +1219,7 @@ def build_validation_error_details(errors: Sequence[Mapping[str, Any]]) -> dict[
 
     ``loc`` is projected through :func:`buyer_loc_segments` (forwarding the error type) so the
     structured detail reports the same buyer path as ``field``, the message, and the suggestion —
-    no codegen union tag leaks into one renderer while the others strip it (#1329 finding 3).
+    no codegen union tag leaks into one renderer while the others strip it (#1329).
     """
     return {
         "validation_errors": [

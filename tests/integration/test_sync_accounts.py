@@ -14,7 +14,7 @@ from src.core.schemas.account import SyncAccountsRequest
 from tests.harness import Transport
 from tests.harness.account_sync import AccountSyncEnv
 from tests.helpers import assert_envelope_shape
-from tests.helpers.governance import persisted_governance_urls
+from tests.helpers.governance import governance_agent, persisted_governance_urls
 
 pytestmark = [pytest.mark.integration, pytest.mark.requires_db]
 
@@ -174,7 +174,9 @@ class TestSyncAccountsPreservesGovernanceBinding:
             #    owns the url-only projection — #1329).
             with AccountUoW("sync_gov") as uow:
                 repo: AccountRepository = uow.accounts
-                repo.set_governance_binding(account_id, [{"url": gov_url}])
+                # set_governance_binding takes parsed request models (not dicts) — build one via
+                # the shared helper so the pinned request shape has one home (#1329).
+                repo.set_governance_binding(account_id, [governance_agent(gov_url)])
 
             # 3. Re-sync the SAME natural key with a metadata change (billing) and NO
             #    governance_agents — this fires the update path (changes non-empty), the

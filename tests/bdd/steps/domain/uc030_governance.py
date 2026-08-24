@@ -11,10 +11,13 @@ Out of scope (routed to the conftest ``_XFAIL_TAGS`` registry, not stepped here)
   agent deliberately does not declare (``governance-aware-seller``).
 - Idempotency replay / IDEMPOTENCY_CONFLICT and per-operation scope
   (PERMISSION_DENIED) grade behavior this PR defers.
-- ``@sync @bva`` request-validation boundary outlines (cardinality, schemes, url) ARE
-  wired here (``when_bva_*`` + ``then_request_verdict``); the ``@bva`` outlines that need
-  account seeding (response-shape rows) or an unimplemented feature (idempotency replay)
-  stay deferred in the conftest UC-030 branch.
+- ``@sync @bva`` boundary outlines (cardinality, schemes, url, credentials, idempotency_key,
+  per-account status) ARE wired here (``when_bva_*`` + ``then_request_verdict`` /
+  ``then_response_verdict``). Their request-validation + valid-enum rows run and grade on the
+  wire; the schema-unexpressible rows (a per-account status outside the {synced, failed} enum, a
+  credential echoed on the response) and the unbuilt idempotency replay/conflict rows auto-xfail
+  at the when-step (``NotImplementedError`` — #1934), so the conftest ``_XFAIL_TAGS`` registry no
+  longer carries a per-tag entry for these three outlines (#1329 item 5).
 
 Reuses the shared auth Givens ("the Buyer Agent has an authenticated/unauthenticated
 connection") and the generic ``the error code is "X"`` step (uc011_accounts), which
@@ -96,7 +99,7 @@ def _account_entry(account_id: str, agents: list[dict[str, Any]]) -> dict[str, A
 # The credential-channel scenarios' leak secret + agent builder are the SHARED
 # tests.helpers.governance.LEAK_SECRET / leaky_governance_agent — one home for the leak
 # contract so this transport-blind BDD grade and the A2A+REST integration grade cannot drift
-# on the secret value or the mistyped-key shape (#1329 R9-K4).
+# on the secret value or the mistyped-key shape (#1329).
 
 
 def _dispatch(ctx: dict, transport: str, *, identity: Any = _UNSET, **kwargs: Any) -> None:
@@ -110,7 +113,7 @@ def _dispatch(ctx: dict, transport: str, *, identity: Any = _UNSET, **kwargs: An
     boundary and produces a real AdCP wire envelope.
 
     ``identity`` defaults to the repo's ``_UNSET`` sentinel (not a bespoke "__keep__"
-    magic string — #1329 finding 6): unset → dispatch under the scenario's own identity;
+    magic string — #1329): unset → dispatch under the scenario's own identity;
     an explicit value overrides it (the no-auth / wrong-principal scenarios).
     """
     if identity is _UNSET:
@@ -378,7 +381,7 @@ def when_sync_key_boundary(ctx: dict, transport: str, key: str, account_id: str)
 
 
 # ═══════════════════════════════════════════════════════════════════════
-# When — @bva request-validation boundary outlines (#1329 R9-F1 / Konstantin item 1)
+# When — @bva request-validation boundary outlines (#1329 / Konstantin item 1)
 # ═══════════════════════════════════════════════════════════════════════
 #
 # These wire the @sync @bva boundary outlines whose rows are all REQUEST-VALIDATION cases (no
@@ -393,15 +396,13 @@ def when_sync_key_boundary(ctx: dict, transport: str, key: str, account_id: str)
 def _bva_agent(url: Any = DEFAULT_URL, **overrides: Any) -> dict[str, Any]:
     """A well-formed request agent; only the boundary-under-test deviates from it.
 
-    Delegates to the shared ``governance_agent_dict`` deviation vocabulary (#1329 finding 6) —
+    Delegates to the shared ``governance_agent_dict`` deviation vocabulary (#1329) —
     a different ``url`` overrides it, ``url=_UNSET`` REMOVES it (the url-absent boundary), and
     ``**overrides`` (e.g. ``authentication={...}``) replaces another key — instead of re-inlining
-    the pinned shape and a second credentials literal.
+    the pinned shape and a second credentials literal. The url-absent boundary now flows through
+    the sentinel too (``governance_agent_dict`` honors ``url=_UNSET``), so this no longer
+    re-inlines a ``del agent["url"]``.
     """
-    if url is _UNSET:
-        agent = governance_agent_dict(DEFAULT_URL, **overrides)
-        del agent["url"]
-        return agent
     return governance_agent_dict(url, **overrides)
 
 
@@ -452,7 +453,7 @@ def when_bva_auth_schemes(ctx: dict, boundary: str) -> None:
 @when(parsers.parse('the Buyer Agent sends a sync_governance request exercising the url boundary case "{boundary}"'))
 def when_bva_url(ctx: dict, boundary: str) -> None:
     # Each case is a DELTA against the well-formed agent via the shared deviation vocabulary
-    # (#1329 finding 6): override the url, or REMOVE it with the _UNSET sentinel.
+    # (#1329): override the url, or REMOVE it with the _UNSET sentinel.
     if boundary == "https:// URL":
         agent = _bva_agent()
     elif boundary == "http:// URL (plaintext)":
@@ -467,6 +468,117 @@ def when_bva_url(ctx: dict, boundary: str) -> None:
     _dispatch(ctx, "", idempotency_key=_VALID_KEY, accounts=[_account_entry("acct-bva", [agent])])
 
 
+@when(
+    parsers.parse(
+        'the Buyer Agent sends a sync_governance request exercising the credentials boundary case "{boundary}"'
+    )
+)
+def when_bva_credentials(ctx: dict, boundary: str) -> None:
+    """Wire the @T-UC-030-bva-credentials outline (#1329 item 5).
+
+    ``credentials absent`` is a request-validation row (graded invalid via ``_BVA_GRADE``).
+    ``credentials present on response`` is a malformed-RESPONSE shape, not a request the buyer can
+    send — this seller never echoes authentication (write-only), so it is NotImplementedError-
+    xfailed here; the no-echo contract is graded on the happy-path wire (``then_account_status`` /
+    ``test_happy_path_synced_wire``) and the rejection path (``assert_secret_absent``).
+    """
+    if boundary == "credentials absent":
+        ctx["bva_grade"] = _BVA_GRADE.get(boundary)
+        ctx["bva_boundary"] = boundary
+        # authentication with schemes but NO credentials — credentials is required (minLength 32).
+        agent = _bva_agent(authentication={"schemes": ["Bearer"]})
+        _dispatch(ctx, "", idempotency_key=_VALID_KEY, accounts=[_account_entry("acct-bva", [agent])])
+    elif boundary == "credentials present on response":
+        raise NotImplementedError(
+            "credentials-present-on-response is a malformed-RESPONSE shape, not a request rejection; "
+            "the write-only no-echo contract is graded on the happy-path + rejection wire instead"
+        )
+    else:
+        raise AssertionError(f"unknown credentials boundary {boundary!r}")
+
+
+@when(
+    parsers.parse(
+        'the Buyer Agent sends a sync_governance request exercising the idempotency_key boundary case "{boundary}"'
+    )
+)
+def when_bva_idempotency_key(ctx: dict, boundary: str) -> None:
+    """Wire the @T-UC-030-bva-idempotency-key outline (#1329 item 5).
+
+    The two request-validation rows (absent / disallowed character) run and grade invalid via
+    ``_BVA_GRADE``. The two replay rows (identical / divergent payload) need idempotency replay
+    dedup + IDEMPOTENCY_CONFLICT — unbuilt capability homed on #1934, not request validation — so
+    they are NotImplementedError-xfailed here (the registry no longer blanket-xfails the whole tag).
+    """
+    account = [_account_entry("acct-bva", [_bva_agent()])]
+    if boundary == "absent (field not provided)":
+        ctx["bva_grade"] = _BVA_GRADE.get(boundary)
+        ctx["bva_boundary"] = boundary
+        _dispatch(ctx, "", accounts=account)  # idempotency_key omitted
+    elif boundary == "valid length, disallowed character (e.g. space)":
+        ctx["bva_grade"] = _BVA_GRADE.get(boundary)
+        ctx["bva_boundary"] = boundary
+        _dispatch(ctx, "", idempotency_key="abcdef 1234567890", accounts=account)
+    elif boundary in ("replay: same key + identical payload", "replay: same key + divergent payload"):
+        raise NotImplementedError(
+            "idempotency replay dedup / IDEMPOTENCY_CONFLICT not implemented (#1934) — "
+            f"boundary {boundary!r} needs the replay feature, not just request validation"
+        )
+    else:
+        raise AssertionError(f"unknown idempotency_key boundary {boundary!r}")
+
+
+@when(parsers.parse('a sync_governance response exercises the per-account status boundary case "{boundary}"'))
+def when_bva_sync_account_status(ctx: dict, boundary: str) -> None:
+    """Wire the @T-UC-030-bva-sync-account-status outline (#1329 item 5).
+
+    The two valid rows are dispatched as real syncs: an OWNED account resolves to per-account
+    ``synced`` (echoing its url), and an unresolvable account resolves to per-account ``failed``
+    (carrying a per-account errors[]) — the two members of the {synced, failed} enum. The third
+    row ("status value outside the two-member enum") is a malformed-RESPONSE shape the server
+    cannot be made to emit via a request, so it is NotImplementedError-xfailed here (#1329).
+    """
+    if boundary == "status=synced with echoed governance_agents URL":
+        account_id = "acct-bva-synced"
+        _owned_account(ctx, account_id)
+        ctx["bva_status"] = ("synced", account_id)
+        _dispatch(ctx, "", idempotency_key=_VALID_KEY, accounts=[_account_entry(account_id, [_bva_agent()])])
+    elif boundary == "status=failed with per-account errors[]":
+        # An unseeded account is unresolvable → per-account failed (ACCOUNT_NOT_FOUND).
+        account_id = "acct-bva-nonexistent"
+        ctx["bva_status"] = ("failed", account_id)
+        _dispatch(ctx, "", idempotency_key=_VALID_KEY, accounts=[_account_entry(account_id, [_bva_agent()])])
+    elif boundary == "status value outside the two-member enum":
+        raise NotImplementedError(
+            "a per-account status outside the {synced, failed} two-member enum is not a response the "
+            "server can be made to emit via a request; the two valid enum members are graded above"
+        )
+    else:
+        raise AssertionError(f"unknown per-account status boundary {boundary!r}")
+
+
+@then(parsers.parse('the response verdict is "{verdict}"'))
+def then_response_verdict(ctx: dict, verdict: str) -> None:
+    """Grade a @bva per-account status RESPONSE-shape boundary on the real wire.
+
+    ``valid`` → the seeded account's per-account status is exactly the expected two-member enum
+    value (synced / failed) AND carries its discriminator-required shape (a synced entry echoes a
+    governance_agents url; a failed entry carries a per-account errors[]). The single unbuildable
+    row ("status outside the enum") is NotImplementedError-xfailed at the when-step (#1329).
+    """
+    if verdict != "valid":
+        raise AssertionError(f"unknown response verdict {verdict!r} for the per-account status outline")
+    expected_status, account_id = ctx["bva_status"]
+    acct = _wire_account(ctx, account_id)
+    assert acct["status"] == expected_status, f"account {account_id}: expected {expected_status}, got {acct['status']}"
+    assert acct["status"] in {"synced", "failed"}, f"per-account status must be a two-member enum value: {acct}"
+    if expected_status == "synced":
+        agents = acct.get("governance_agents") or []
+        assert agents and agents[0].get("url"), f"synced entry must echo a governance_agents url: {acct}"
+    else:
+        assert acct.get("errors"), f"failed entry must carry a per-account errors array: {acct}"
+
+
 @then(parsers.parse('the request verdict is "{verdict}"'))
 def then_request_verdict(ctx: dict, verdict: str) -> None:
     """Grade a @bva request-validation boundary on the real wire.
@@ -474,19 +586,19 @@ def then_request_verdict(ctx: dict, verdict: str) -> None:
     ``invalid`` → a top-level VALIDATION_ERROR envelope (mutation: relax the boundary check and
     this reddens). ``valid`` → the request is ACCEPTED at the validation boundary; the response is
     the success variant (an unseeded account then fails per-account resolution, which is NOT a
-    top-level error), so assert the dispatch did not error (#1329 R9-F1).
+    top-level error), so assert the dispatch did not error (#1329).
     """
     result = ctx["result"]
     if verdict == "invalid":
         # Every invalid @bva row MUST carry a _BVA_GRADE entry (recorded by its when-step), so
         # the field + exact message_substr + suggestion_substr are pinned — a min-vs-max, wrong-
         # field, or missing-suggestion regression reddens, and two different boundaries can no
-        # longer pass on one byte-identical assertion (#1329 finding 6). A missing entry is a
+        # longer pass on one byte-identical assertion (#1329). A missing entry is a
         # loud failure, not a silent degrade to a bare code check.
         grade = ctx.get("bva_grade")
         assert grade is not None, (
             f"invalid @bva boundary has no _BVA_GRADE entry — every invalid row must pin "
-            f"field + message_substr + suggestion_substr (#1329 finding 6); ctx={ctx.get('bva_boundary')!r}"
+            f"field + message_substr + suggestion_substr (#1329); ctx={ctx.get('bva_boundary')!r}"
         )
         result.assert_wire_error("VALIDATION_ERROR", require_suggestion=True, **grade)
     elif verdict == "valid":
@@ -525,16 +637,12 @@ def then_accounts_count(ctx: dict, n: int) -> None:
 def then_variant_error(ctx: dict) -> None:
     result = ctx["result"]
     assert result.is_error, f"expected error variant, got response {ctx.get('response')!r}"
-    envelope = result.wire_error_envelope
-    assert envelope is not None, "error variant must carry a two-layer wire error envelope"
-    # Guard the envelope STRUCTURE (the specific code is pinned by the scenario's following
-    # step — `the error code is "X"` / a `then_error_*`): both layers present, their codes
-    # non-empty and AGREEING, and a recovery hint set. A single-layer or code-less envelope
-    # ("flip the code to garbage and this stays green" no longer holds) now fails here.
-    top = (envelope.get("adcp_error") or {}).get("code")
-    leaf = (envelope.get("errors") or [{}])[0].get("code")
-    assert top and leaf and top == leaf, f"malformed/disagreeing two-layer error codes: {envelope}"
-    assert (envelope.get("errors") or [{}])[0].get("recovery"), f"error missing recovery hint: {envelope}"
+    # Route the code-agnostic two-layer structural grade through the single harness accessor
+    # (both layers present, codes non-empty AND agreeing, recovery set) instead of hand-digging
+    # adcp_error.code/errors[0].code/recovery out of the dict. The SPECIFIC code is pinned by
+    # the scenario's following step (`the error code is "X"` / a `then_error_*`). A single-layer
+    # or code-less envelope ("flip the code to garbage and this stays green") fails here (#1329).
+    result.assert_wire_error_shape()
 
 
 @then("the response does NOT carry an operation-level errors array")
@@ -598,41 +706,42 @@ def then_adcp_version(ctx: dict) -> None:
     body = wire_dict(ctx)
     # POST-S4: sync_governance now echoes the seller's implemented adcp_version at release
     # precision (_sync_governance_impl -> _WIRE_ADCP_VERSION). Graded on the real wire — the
-    # prior in-step xfail is gone; the field IS emitted now (#1329 finding 2).
+    # prior in-step xfail is gone; the field IS emitted now (#1329).
     version = body.get("adcp_version")
     assert version, f"expected an echoed adcp_version envelope field, got keys {list(body)}"
     # Release-precision (major.minor) per the wire contract, not patch-precise.
     assert re.fullmatch(r"\d+\.\d+", version), f"adcp_version must be release-precision (major.minor), got {version!r}"
 
 
+def _failed_wire_account_ids(ctx: dict) -> list[str]:
+    """Return the echoed account_ids of the failed per-account entries on the wire.
+
+    Uses status MEMBERSHIP (not a count/bare-truthiness check — the no_count_only guard) to
+    assert at least one entry failed, then returns their ids so the per-account graders route
+    the errors[] + recovery read through the ONE harness accessor (``assert_account_error``)
+    instead of each hand-rolling ``(acct.get("errors") or [{}])[0]`` (#1329).
+    """
+    accounts = _wire_accounts(ctx)
+    statuses = {a.get("status") for a in accounts}
+    assert "failed" in statuses, f"expected a failed per-account entry, got statuses {statuses}"
+    return [(a.get("account") or {}).get("account_id") for a in accounts if a.get("status") == "failed"]
+
+
 @then("the per-account errors include an ACCOUNT_NOT_FOUND code")
 def then_per_account_authority_code(ctx: dict) -> None:
     """Assert a failed per-account entry carries ACCOUNT_NOT_FOUND on the wire.
 
-    Graduates BR-UC-030 ``sync-no-authority`` (feature line 179) from dormant (its
-    ``Then`` was undefined → auto-xfail) to executing across a2a/mcp/rest, and makes
-    the error-code choice wire-graded. Production emits the SINGLE uniform
-    ``ACCOUNT_NOT_FOUND`` code — an existing-but-unowned account is indistinguishable
-    from a nonexistent one (the ``*_NOT_FOUND`` uniform-response MUST). ``SCOPE_INSUFFICIENT``
-    is deliberately NOT accepted here: ``governance.py`` emits it nowhere and admitting
-    it on the wire would let the exact value the fix removed pass (#1329).
+    Graduates BR-UC-030 ``sync-no-authority`` from dormant to executing across a2a/mcp/rest, and
+    makes the error-code choice wire-graded. Production emits the SINGLE uniform
+    ``ACCOUNT_NOT_FOUND`` code — an existing-but-unowned account is indistinguishable from a
+    nonexistent one (the ``*_NOT_FOUND`` uniform-response MUST). Routed through the single
+    harness per-account accessor, which pins the code + the pinned-enum recovery off the
+    accounts[] wire: ``SCOPE_INSUFFICIENT`` (the value the fix removed) fails the code pin, and a
+    terminal->transient recovery drift reddens — no hand-rolled scan or literal (#1329).
     """
-    allowed = {"ACCOUNT_NOT_FOUND"}
-    failed_errors = [(acct.get("errors") or [{}])[0] for acct in _wire_accounts(ctx) if acct.get("status") == "failed"]
-    failed_codes = {e.get("code") for e in failed_errors}
-    # Set comparisons (not count checks): a failed per-account entry must exist
-    # (non-empty set) AND every failed code must be an allowed authority code — an
-    # absent errors[] surfaces as None, which is not a subset of `allowed`.
-    assert failed_codes != set(), f"expected a failed per-account entry, got {_wire_accounts(ctx)}"
-    assert failed_codes <= allowed, f"per-account authority code(s) {failed_codes} not all in {allowed}"
-    # Recovery is wire-graded against the pinned enum (not a literal): flipping
-    # governance.py's per-account recovery terminal->transient reddens HERE, not just
-    # off-wire unit/integration (#1329).
-    expected_recovery = _pinned_error_metadata()["ACCOUNT_NOT_FOUND"]["recovery"]
-    recoveries = {e.get("recovery") for e in failed_errors}
-    assert recoveries == {expected_recovery}, (
-        f"per-account ACCOUNT_NOT_FOUND recovery {recoveries} must equal the pinned enum {expected_recovery!r}"
-    )
+    result = ctx["result"]
+    for account_id in _failed_wire_account_ids(ctx):
+        result.assert_account_error(account_id, "ACCOUNT_NOT_FOUND")
 
 
 @then("the per-account error message does not reveal whether the account exists")
@@ -640,12 +749,12 @@ def then_per_account_message_uniform(ctx: dict) -> None:
     """Grade the uniform-response MUST on the wire: the failed per-account message MUST
     NOT carry the authorization-specific ``does not have access to account 'X'`` phrasing
     (which would distinguish exists-but-unowned from not-found — a cross-principal
-    enumeration oracle). Restoring the leaky message now reddens a WIRE test, not just
-    off-wire unit/integration (#1329)."""
-    accounts = _wire_accounts(ctx)
-    statuses = {a.get("status") for a in accounts}
-    assert "failed" in statuses, f"expected a failed per-account entry, got statuses {statuses}"
-    for acct in accounts:
+    enumeration oracle). The failed+code read routes through the single harness accessor;
+    the message check is the specific grade this step adds (#1329)."""
+    result = ctx["result"]
+    for account_id in _failed_wire_account_ids(ctx):
+        result.assert_account_error(account_id, "ACCOUNT_NOT_FOUND")
+    for acct in _wire_accounts(ctx):
         if acct.get("status") != "failed":
             continue
         for err in acct.get("errors") or []:
@@ -655,17 +764,18 @@ def then_per_account_message_uniform(ctx: dict) -> None:
 
 @then(parsers.parse('each per-account error should include a "{field}" field guiding remediation'))
 def then_per_account_suggestion(ctx: dict, field: str) -> None:
-    accounts = _wire_accounts(ctx)
-    statuses = {a["status"] for a in accounts}
-    assert "failed" in statuses, f"expected a failed per-account entry to carry {field!r}, got statuses {statuses}"
-    # Grade the field CONTENT against the pinned enum (the authority) when the enum defines it —
+    # The failed+code+recovery read routes through the single harness accessor; then grade the
+    # requested field CONTENT against the pinned enum (the authority) when the enum defines it —
     # presence-only (`e.get(field)`) is a serializer tautology that stays green if production ships
     # any non-empty value, so it would not surface a drift from the canonical ACCOUNT_NOT_FOUND
     # suggestion/recovery. This step is generic over the requested field ("suggestion", "recovery"),
     # so grade each against its own pinned value; a field the enum does not carry falls back to
-    # presence (#1329 R9-D5).
+    # presence (#1329).
+    result = ctx["result"]
+    for account_id in _failed_wire_account_ids(ctx):
+        result.assert_account_error(account_id, "ACCOUNT_NOT_FOUND")
     expected = _pinned_error_metadata().get("ACCOUNT_NOT_FOUND", {}).get(field)
-    for acct in accounts:
+    for acct in _wire_accounts(ctx):
         if acct["status"] != "failed":
             continue
         errs = acct.get("errors") or []
@@ -748,7 +858,7 @@ _URL_FIELD = "accounts[0].governance_agents[0].url"
 # leak channel's exact field, transport-stable across a2a/mcp/rest.
 _CREDENTIAL_EXTRA_FIELD = "accounts[0].governance_agents[0].authentication.credential"
 # Exact field per credential leak channel — pinned so a leaf wrong for the scenario reddens
-# (a shared ...governance_agents[0] prefix would stay green on either leaf) (#1329 R9-D4).
+# (a shared ...governance_agents[0] prefix would stay green on either leaf) (#1329).
 _LEAK_CHANNEL_FIELD = {
     "url-userinfo": _URL_FIELD,
     "extra-authentication-key": _CREDENTIAL_EXTRA_FIELD,
@@ -763,7 +873,7 @@ _SCHEMES_ITEM_FIELD = "accounts[0].governance_agents[0].authentication.schemes[0
 # governance_agents when-step recorded an exact grade and the other three when-steps recorded
 # nothing, so `then_request_verdict` degraded to a bare `assert_wire_error("VALIDATION_ERROR")`
 # for 8 rows × 3 transports — e.g. `url absent` and `non-uri string` graded by a byte-identical
-# assertion (#1329 finding 6). Every invalid row now pins field + message_substr +
+# assertion (#1329). Every invalid row now pins field + message_substr +
 # suggestion_substr; then_request_verdict fails loudly if an invalid row has no entry. Values
 # verified against the real per-transport envelope (message_substr distinguishes minItems from
 # maxItems on a shared field; suggestion_substr pins the corrective verb).
@@ -819,6 +929,26 @@ _BVA_GRADE: dict[str, dict[str, str]] = {
         "message_substr": "Required field is missing",
         "suggestion_substr": "Provide the required",
     },
+    # credentials boundary (@T-UC-030-bva-credentials): the request-validation row. The
+    # response-shape row ("credentials present on response") is NotImplementedError-xfailed at
+    # the when-step — it is not a request the buyer can send (#1329).
+    "credentials absent": {
+        "field": _CREDENTIALS_FIELD,
+        "message_substr": "Required field is missing",
+        "suggestion_substr": "Provide the required",
+    },
+    # idempotency_key boundary (@T-UC-030-bva-idempotency-key): the two request-validation rows.
+    # The replay rows are NotImplementedError-xfailed at the when-step (#1934 unbuilt).
+    "absent (field not provided)": {
+        "field": "idempotency_key",
+        "message_substr": "Required field is missing",
+        "suggestion_substr": "Provide the required",
+    },
+    "valid length, disallowed character (e.g. space)": {
+        "field": "idempotency_key",
+        "message_substr": "String should match pattern",
+        "suggestion_substr": "Provide a valid",
+    },
 }
 
 
@@ -834,33 +964,25 @@ def then_error_credentials(ctx: dict) -> None:
     ctx["result"].assert_wire_error("VALIDATION_ERROR", field=_CREDENTIALS_FIELD, require_suggestion=True)
 
 
-@then("the response is a VALIDATION_ERROR on the wire naming the governance agent field")
+@then("the response is a CREDENTIAL_IN_ARGS error on the wire naming the governance agent field")
 def then_secret_channel_wire_error(ctx: dict) -> None:
-    # Wire-graded: a field-located VALIDATION_ERROR on the governance agent. Pin the EXACT
-    # field per leak channel (transport-stable across a2a/mcp/rest) rather than a shared
-    # ...governance_agents[0] prefix — a substring stays green even if the leaf is wrong for
-    # the scenario, so dropping the trailing `url`/`credential` from the reported loc would
-    # slip past it. require_suggestion=True matches every other request-validation grade in
-    # this file (#1329 R9-D4).
+    # Wire-graded: a credential placed in request args (userinfo in the url, or a
+    # credential-bearing extra field) is rejected with the pinned CREDENTIAL_IN_ARGS code
+    # (recovery=terminal, pin-defaulted; @source authentication.mdx L2) — NOT VALIDATION_ERROR.
+    # Pin the EXACT field per leak channel (transport-stable across a2a/mcp/rest) rather than a
+    # shared ...governance_agents[0] prefix — a substring stays green even if the leaf is wrong.
+    # require_suggestion=True: CREDENTIAL_IN_ARGS carries the pinned "do NOT auto-retry" hint.
     expected_field = _LEAK_CHANNEL_FIELD[ctx["leak_channel"]]
-    ctx["result"].assert_wire_error("VALIDATION_ERROR", field=expected_field, require_suggestion=True)
+    ctx["result"].assert_wire_error("CREDENTIAL_IN_ARGS", field=expected_field, require_suggestion=True)
 
 
 @then("the wire envelope does NOT contain the leaked secret")
 def then_wire_envelope_omits_secret(ctx: dict) -> None:
-    # The security invariant: a rejected credential must never be echoed. Assert on the REAL
-    # wire envelope (not a reconstruction) so disabling the strip/redaction reddens the wire.
-    #
-    # Graded on ALL transports including MCP + extra_forbidden. That cell was previously xfailed
-    # because MCP surfaced only FastMCP's leaf pydantic message ("Extra inputs are not
-    # permitted"), so the secret's absence was structural (vacuous), not a proof the redaction
-    # ran. The MCP compat middleware now routes a TypeAdapter rejection through the SAME
-    # format_validation_error path A2A/REST use (#1329 finding 5), so the extra_forbidden value
-    # is redacted on the MCP wire for the RIGHT reason. Mutation-confirmed: disabling
-    # format_validation_error's redaction now reddens a2a/mcp/rest for the extra channel.
-    secret = ctx["leaked_secret"]
-    envelope = ctx["result"].wire_error_envelope
-    assert secret not in str(envelope), f"leaked secret reached the wire envelope: {envelope!r}"
+    # The security invariant: a rejected credential must never be echoed. Routed through the one
+    # harness accessor (assert_secret_absent) which scans the REAL wire (both success body and
+    # error envelope) and raises loudly if neither was captured — so disabling the strip/redaction
+    # reddens the wire, and the check can't pass vacuously on an empty capture (#1329).
+    ctx["result"].assert_secret_absent(ctx["leaked_secret"])
 
 
 @then("the error references the governance_agents maximum cardinality")

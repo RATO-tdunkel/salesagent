@@ -78,6 +78,7 @@ from tests.helpers.adcp_factories import (
 )
 from tests.helpers.capabilities import assert_declared_capabilities
 from tests.helpers.envelope_assertions import assert_envelope_shape, assert_no_raw_validation_leak
+from tests.helpers.error_metadata import pinned_error_metadata
 from tests.helpers.idempotency_seeds import (
     make_active_cached_success,
     seed_cached_success,
@@ -85,6 +86,7 @@ from tests.helpers.idempotency_seeds import (
     seed_principal,
 )
 from tests.helpers.log_assertions import rendered_log_calls
+from tests.helpers.validation_redaction import assert_redacted, extra_forbidden_error
 
 __all__ = [
     # Auth helpers
@@ -92,6 +94,11 @@ __all__ = [
     # Envelope assertions
     "assert_envelope_shape",
     "assert_no_raw_validation_leak",
+    # Pinned error-code enum metadata (recovery/suggestion)
+    "pinned_error_metadata",
+    # extra_forbidden redaction grading
+    "extra_forbidden_error",
+    "assert_redacted",
     # Capabilities wire assertion
     "assert_declared_capabilities",
     # Log-call assertions

@@ -66,6 +66,11 @@ def _call_via(
 
     try:
         result = env.call_via(t, **kwargs)
+        # Stash the typed TransportResult so Then steps read the wire through the
+        # single guarded accessor (``wire_dict``/``wire_field`` -> result.require_wire()),
+        # exactly like the canonical ``dispatch_request``. Kept alongside the flat
+        # ctx["response"]/ctx["wire_response"] stashes for existing consumers.
+        ctx["result"] = result
         if result.is_error:
             ctx["error"] = result.error
         else:

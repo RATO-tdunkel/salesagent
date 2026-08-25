@@ -3423,12 +3423,30 @@ def _harness_env(request: pytest.FixtureRequest, ctx: dict) -> Generator[None, N
         # BR-RULE-034 scenarios routed elsewhere.
         marker_names = {m.name for m in request.node.iter_markers()}
         # @BR-RULE-146 explicit-statuses success invariants wired for #1502 (statuses
-        # match-any). Admitted by exact scenario id, NOT the shared @BR-RULE-146 tag:
-        # inv-146-1-holds (no-filter archival DEFAULT exclusion) is a separate,
-        # unimplemented production feature (#1738; named xfail below), and the boundary
-        # validation-error rows — the @creative-status outline's ["deleted"] row and the
-        # @boundary-default-query outline's [] (empty-array) row — are wiring tracked in
-        # #1652. All stay xfailed here rather than routed into a failing run.
+        # match-any). Admitted by exact scenario id, NOT the shared @BR-RULE-146 tag,
+        # because the tag also covers rows that are still dormant. Full dormancy account
+        # for the statuses family (all stay xfailed here, none routed into a failing run):
+        #
+        #   Genuinely blocked (need unimplemented work):
+        #     - inv-146-1-holds + the @default-query `empty_request` / `filters_no_status`
+        #       rows + the @creative-status `Not provided` / @boundary-default-query
+        #       `Empty request` / `filters={}` rows: all depend on the no-filter
+        #       archival-DEFAULT exclusion, a separate unimplemented production feature
+        #       (#1738; inv-146-1-holds has its own named xfail below).
+        #     - the validation-error rows — @creative-status `["deleted"]`, and the
+        #       `[]` (empty-array) / `["unknown"]` rows across @default-query,
+        #       @boundary-default-query and @ext-c: need dict-passthrough validation-error
+        #       wiring so the malformed filter reaches the wire instead of raising
+        #       client-side in the CreativeFilters build (#1652).
+        #
+        #   Implementable but not yet wired (same match-any behavior the wired invariants
+        #   grade, different phrasings — tracked in #2067): the @creative-status
+        #   `processing` / `archived` / `["approved","rejected"] (multi-status)` rows and
+        #   the @default-query `explicit_non_archived_status` / `explicit_archived_status`
+        #   / `mixed_statuses` / `all_statuses_explicit` rows. They sit in Scenario Outlines
+        #   mixed with the #1738/#1652 rows above, so admitting them means splitting those
+        #   generated outlines by tag first (#2067) — until then they stay dormant rather
+        #   than admitted-and-failing on the blocked siblings.
         _wired_statuses_scenarios = {
             "T-UC-018-inv-146-2-holds",
             "T-UC-018-inv-146-2-violated",

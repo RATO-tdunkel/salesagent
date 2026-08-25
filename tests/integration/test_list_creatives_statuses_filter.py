@@ -39,79 +39,66 @@ def _returned_creative_ids(result: TransportResult) -> set[str]:
     return {c["creative_id"] for c in result.require_wire()["creatives"]}
 
 
-class TestStatusesFilterApplied:
-    """filters.statuses actually scopes the result set — not merely reported as applied.
+class TestStatusesFilterScopesAndReportsTruthfully:
+    """filters.statuses scopes the result set AND filters_applied reports the scoped set
+    truthfully — one scaffold, two arities.
 
-    The single-value scoping clause is pinned by ``test_multi_value_statuses_matches_any``'s
-    ``.in_(...)`` redden (below) and by ``test_filters_applied_matches_scoped_results``'s
-    ``== {keep}`` scoped-set assertion (which also seeds an approved keep + rejected decoy
-    with filter ``["approved"]``), so a dedicated single-value scoping test would add no
-    coverage those two don't already provide.
+    Both arms seed a known status mix, dispatch a ``statuses`` filter, and assert the
+    scoped set equals exactly the seeded creatives whose status is in the filter, plus the
+    ``filters_applied`` report matches. They differ ONLY in array arity, so they are one
+    parametrized test rather than two copy-pasted classes (CLAUDE.md DRY):
+
+    - Multi-value ``["approved","rejected"]`` grades BOTH halves of the #1502 regression.
+      Scoping: pre-fix the array was narrowed to its first element (``["approved"]``),
+      dropping the rejected row → the scoped-set assertion reddens. Reporting:
+      ``filters_applied`` echoed the whole array while the query used one status → the
+      full-list ``filters_applied`` assertion reddens on a regression that emits only the
+      first status. Reverting the full-list threading (back to ``statuses[0]``) reddens both.
+    - Single-value ``["approved"]`` guards the report-is-truthful property (report == scoped
+      set); it cannot catch the regression (report and result already agree at arity 1).
+
+    Parametrized over every wire transport (a2a/mcp/rest): the three paths are not
+    interchangeable — input coercion differs (``coerce_creative_filters`` for REST/A2A vs the
+    FastMCP TypeAdapter), each wrapper forwards a different subset of ``list_creatives_raw``'s
+    params, and a future ``model_dump()`` override on QuerySummary/ListCreativesResponse would
+    be honored on REST/A2A yet bypassed by MCP's ``structured_content`` path. A per-transport
+    regression in any of those would slip an asserted-on-REST-only test.
     """
 
     @pytest.mark.parametrize("transport", ALL_WIRE)
-    def test_multi_value_statuses_matches_any(self, integration_db, transport):
-        """statuses=["approved","rejected"] returns both; a third-status creative is excluded.
-
-        This is the multi-value case that grades BOTH halves of the #1502 bug:
-
-        1. Scoping — pre-fix the array was narrowed to its first element (``["approved"]``),
-           so the rejected creative was dropped. The returned-id assertion reddens on that.
-        2. Reporting — ``filters_applied`` echoed the whole array while the query used only
-           the first status, so the report over-claimed relative to the result set. The
-           ``filters_applied`` assertion pins the FULL applied list on the wire, so a
-           regression that emits only ``statuses=approved`` (first element) into the report
-           while leaving the query correct reddens here too. (The single-value
-           ``test_filters_applied_matches_scoped_results`` cannot catch that — report and
-           result already agree when the array has one element.)
-
-        Reverting the full-list threading (back to ``statuses[0]``) reddens both.
-        """
+    @pytest.mark.parametrize(
+        ("filter_statuses", "seed_statuses", "expected_report"),
+        [
+            # Multi-value match-any: both requested returned, a third status excluded.
+            (["approved", "rejected"], ("approved", "rejected", "pending_review"), "statuses=approved,rejected"),
+            # Single-value: report and result already agree; guards report-is-truthful.
+            (["approved"], ("approved", "rejected"), "statuses=approved"),
+        ],
+    )
+    def test_statuses_filter_scopes_and_reports(
+        self, integration_db, transport, filter_statuses, seed_statuses, expected_report
+    ):
         with CreativeListEnv() as env:
             tenant, principal = env.setup_default_data()
-            approved = seed_creative_in_status(tenant, principal, "approved")
-            rejected = seed_creative_in_status(tenant, principal, "rejected")
-            seed_creative_in_status(tenant, principal, "pending_review")  # third status — excluded
+            # (status, creative_id) per seeded row; the kept set is exactly those whose
+            # status is in the requested filter (match-any) — derived, never hardcoded.
+            seeded = [(status, seed_creative_in_status(tenant, principal, status)) for status in seed_statuses]
+            expected_kept = {cid for status, cid in seeded if status in filter_statuses}
 
-            result = env.call_via(transport, filters={"statuses": ["approved", "rejected"]})
-
-            assert not result.is_error, f"{transport}: {result.error!r}"
-            assert _returned_creative_ids(result) == {approved, rejected}, (
-                f"{transport}: expected only the two matching statuses"
-            )
-            # Reporting half: filters_applied must echo the FULL applied list, not just the
-            # first status — this is the oracle for the report-over-claims-result regression.
-            filters_applied = result.require_wire()["query_summary"]["filters_applied"]
-            assert "statuses=approved,rejected" in filters_applied, (
-                f"{transport}: filters_applied must report the full applied statuses list, got {filters_applied}"
-            )
-
-
-class TestStatusesFilterReportedTruthfully:
-    """filters_applied reports statuses AND that report is now truthful — it matches the
-    actually-scoped result set. query_summary.filters_applied is an ordinary success-envelope
-    field, parametrized over every wire transport (a2a/mcp/rest) because the three paths are
-    not interchangeable: input coercion differs (``coerce_creative_filters`` for REST/A2A vs
-    the FastMCP TypeAdapter), each wrapper forwards a different subset of ``list_creatives_raw``'s
-    params, and a future ``model_dump()`` override on QuerySummary/ListCreativesResponse would
-    be honored on REST/A2A yet bypassed by MCP's ``structured_content`` path. A per-transport
-    regression in any of those would slip an asserted-on-REST-only test."""
-
-    @pytest.mark.parametrize("transport", ALL_WIRE)
-    def test_filters_applied_matches_scoped_results(self, integration_db, transport):
-        with CreativeListEnv() as env:
-            tenant, principal = env.setup_default_data()
-            keep = seed_creative_in_status(tenant, principal, "approved")
-            seed_creative_in_status(tenant, principal, "rejected")
-
-            result = env.call_via(transport, filters={"statuses": ["approved"]})
+            result = env.call_via(transport, filters={"statuses": filter_statuses})
 
             assert not result.is_error, f"{transport}: {result.error!r}"
+            # Scoping half: the scoped set is exactly the creatives whose status matches.
+            assert _returned_creative_ids(result) == expected_kept, (
+                f"{transport}: scoped set must equal the creatives whose status is in {filter_statuses}"
+            )
+            # Reporting half: filters_applied echoes the FULL applied list on the wire, so a
+            # regression that emits only the first status (or over-claims) reddens here.
             filters_applied = result.require_wire()["query_summary"]["filters_applied"]
-            # Reported as the enum value ("approved") — the coerced list the query used.
-            assert "statuses=approved" in filters_applied, f"{transport}: {filters_applied}"
-            # ...and the report is truthful: the scoped set matches what was claimed.
-            assert _returned_creative_ids(result) == {keep}, f"{transport}: scoped set != reported filters_applied"
+            assert expected_report in filters_applied, (
+                f"{transport}: filters_applied must report the full applied statuses list "
+                f"({expected_report!r}), got {filters_applied}"
+            )
 
 
 class TestStatusesFilterValidation:

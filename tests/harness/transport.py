@@ -113,6 +113,13 @@ class TransportResult:
 
     Attributes:
         payload: Pydantic response model (shared assertions target this).
+        transport: The Transport this result was dispatched through, stamped
+            once by ``BaseTestEnv.call_via`` (the single dispatch funnel) so
+            every result carries it — including the error-path results whose
+            dispatcher passed no ``envelope`` (impl/a2a/rest/mcp error branches).
+            ``require_wire`` and ``assert_wire_error`` name the transport from
+            this field. ``None`` only on a ``TransportResult`` constructed
+            directly in a test rather than via ``call_via``.
         envelope: Transport-specific metadata (HTTP status, ToolResult, etc.).
         error: Exception raised during dispatch, if any.
         raw_response: Unprocessed transport response (httpx.Response, ToolResult, etc.).
@@ -138,6 +145,7 @@ class TransportResult:
     """
 
     payload: BaseModel | None = None
+    transport: Transport | None = None
     envelope: dict[str, Any] = field(default_factory=dict)
     error: Exception | None = None
     raw_response: Any = None
@@ -162,11 +170,13 @@ class TransportResult:
         opaque ``TypeError: 'NoneType' object is not subscriptable`` with no transport
         context. This narrows the optional in one place, failing with the transport name
         so a wire-absent regression is legible — the success-path analogue of the
-        ``wire_error_envelope`` check inside ``assert_wire_error``. Every dispatcher
-        records its transport in ``envelope["transport"]``, so the message names it.
+        ``wire_error_envelope`` check inside ``assert_wire_error``. The transport name
+        comes from the ``transport`` field ``call_via`` stamps on every result (the
+        error-path dispatchers pass no ``envelope``, so the old ``envelope["transport"]``
+        lookup printed "unknown transport" on exactly the wire-absent paths this guards).
         """
         if self.wire_response is None:
-            transport = self.envelope.get("transport", "unknown transport")
+            transport = self.transport or self.envelope.get("transport", "unknown transport")
             raise AssertionError(
                 f"{transport}: no success-path wire_response captured "
                 f"(is_error={self.is_error}, payload={self.payload!r}). The env did not "
@@ -181,8 +191,8 @@ class TransportResult:
         recovery: str | None = None,
         require_suggestion: bool = False,
         message_substr: str | None = None,
-    ) -> None:
-        """Assert this result carries the AdCP two-layer wire error ``code``.
+    ) -> dict[str, Any]:
+        """Assert this result carries the AdCP two-layer wire error ``code``; return the envelope.
 
         Transport-independent: reads the normalized ``wire_error_envelope`` the
         dispatcher captured for whatever transport produced this result, so the
@@ -190,9 +200,17 @@ class TransportResult:
         enum's classification for ``code`` (pin-wins), making the assertion
         non-vacuous without per-scenario duplication. This is the single
         harness-provided way to verify an error on the wire — step definitions
-        must not hand-roll envelope parsing.
+        and helpers must not hand-roll envelope parsing.
+
+        Returns the validated envelope so callers that need to make one more
+        wire assertion (e.g. ``errors[0]["field"]``) read the already-narrowed,
+        already-validated dict rather than re-fetching ``wire_error_envelope``
+        and re-narrowing it with a bare ``assert``. The buyer-facing
+        no-raw-Pydantic-leak invariant runs here too (on ``errors[0].message``),
+        so every wire-error assertion inherits it without a second call.
         """
         from tests.helpers import assert_envelope_shape
+        from tests.helpers.envelope_assertions import assert_no_raw_validation_leak
 
         meta = _pinned_error_metadata()
         spec = meta.get(code)
@@ -204,11 +222,13 @@ class TransportResult:
 
         envelope = self.wire_error_envelope
         assert envelope is not None, (
-            f"Expected a wire rejection with {code}, but no wire_error_envelope was captured "
-            f"(is_error={self.is_error}, payload={self.payload!r}). The operation either "
+            f"Expected a wire rejection with {code} on {self.transport}, but no wire_error_envelope "
+            f"was captured (is_error={self.is_error}, payload={self.payload!r}). The operation either "
             "succeeded or errored before reaching a transport."
         )
         assert_envelope_shape(envelope, code, recovery=expected_recovery, message_substr=message_substr)
         if require_suggestion:
             suggestion = extract_wire_suggestion(envelope)
             assert suggestion, f"Expected a non-empty suggestion in the {code} wire envelope: {envelope}"
+        assert_no_raw_validation_leak((envelope.get("errors") or [{}])[0].get("message") or "")
+        return envelope

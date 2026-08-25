@@ -10,12 +10,11 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 from datetime import UTC, datetime
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Literal
 from unittest.mock import MagicMock, Mock, patch
 
 from tests.factories.creative_asset import AssetSpec, assert_assets, build_assets, image_spec
 from tests.harness import make_mock_uow
-from tests.helpers.envelope_assertions import assert_no_raw_validation_leak
 
 if TYPE_CHECKING:
     from src.core.database.models import Principal, Tenant
@@ -46,35 +45,39 @@ def seed_creative_in_status(
     return CreativeFactory(tenant=tenant, principal=principal, status=status, **extra).creative_id
 
 
-def assert_empty_array_filter_rejected(env: BaseTestEnv, transport: Transport, field: str) -> None:
+def assert_empty_array_filter_rejected(
+    env: BaseTestEnv, transport: Transport, field: Literal["concept_ids", "statuses"]
+) -> None:
     """Assert ``filters={field: []}`` (a minItems:1 violation) is rejected with a two-layer
-    VALIDATION_ERROR envelope carrying a recovery suggestion, on the given wire transport.
+    VALIDATION_ERROR envelope that NAMES the rejected field and carries a recovery suggestion,
+    on the given wire transport.
 
     Shared by the concept_ids and statuses empty-array validation tests: structurally the
     same operation with only the filter field substituted, so it lives here once rather than
     copy-pasted per filter (DRY). POST-F3 requires the buyer be told how to recover.
 
-    Routes through the harness-provided ``TransportResult.assert_wire_error`` rather than
-    hand-rolling the envelope: ``recovery`` defaults to the pinned AdCP enum's classification
-    for VALIDATION_ERROR (pin-wins — no hardcoded ``"correctable"`` to drift if the pin
-    reclassifies), and ``require_suggestion`` owns the POST-F3 suggestion check. ``message_substr``
-    pins the minItems Pydantic message so the envelope names WHICH constraint failed (matching
-    the floor of the MCP-only sibling ``test_mcp_typeadapter_validation_envelope.py``), and the
-    raw-leak guard runs on the A2A/REST arms that sibling never exercised. Deliberately does NOT
-    assert ``field == f"filters.{field}"`` — that field position holds on MCP only.
+    Routes through the harness ``TransportResult.assert_wire_error`` (the single wire-error
+    oracle), which returns the validated envelope and runs the no-raw-Pydantic-leak check
+    itself — no re-fetch, no hand-rolled re-narrowing. ``recovery`` defaults to the pinned
+    AdCP enum's VALIDATION_ERROR classification (pin-wins — no hardcoded ``"correctable"`` to
+    drift if the pin reclassifies), and ``require_suggestion`` owns the POST-F3 check.
 
-    Coupling note (catalog P40): ``message_substr`` pins Pydantic's minItems phrasing, which is
-    framework-internal — a Pydantic/adcp-SDK reword would redden all wire arms at once. It is
-    kept because MCP is leaf-only and carries no AdCP-authored text naming the constraint, so
-    this fragment is the only cross-transport signal for WHICH constraint failed; the code +
-    suggestion + raw-leak assertions are pinned independently and hold without it. Removable
-    once the validation boundary emits a stable in-house constraint fragment on every transport.
+    PRIMARY cross-transport signal — ``errors[0]["field"] == f"filters.{field}"``: since
+    ``coerce_creative_filters`` now reports the request-relative pointer (``filters.statuses`` /
+    ``filters.concept_ids``) on REST/A2A to match what MCP already emits (AdCP 3.1.1
+    ``core/error.json`` field pointer), the field pins WHICH filter was rejected — swap the
+    ``field`` argument and the oracle moves. ``message_substr="List should have"`` is now a
+    SECONDARY check that the violated constraint is minItems; it pins Pydantic's
+    framework-internal phrasing (a reword reddens all wire arms at once), tracked for removal
+    in #2066 now that ``field`` carries the cross-transport WHICH-field signal it was once the
+    only source of.
     """
     result = env.call_via(transport, filters={field: []})
-    result.assert_wire_error("VALIDATION_ERROR", require_suggestion=True, message_substr="List should have")
-    envelope = result.wire_error_envelope
-    assert envelope is not None  # narrowed by assert_wire_error above; re-pinned for the reader below
-    assert_no_raw_validation_leak(envelope["errors"][0]["message"])
+    envelope = result.assert_wire_error("VALIDATION_ERROR", require_suggestion=True, message_substr="List should have")
+    assert envelope["errors"][0].get("field") == f"filters.{field}", (
+        f"{transport}: VALIDATION_ERROR must name the rejected filter field 'filters.{field}', "
+        f"got {envelope['errors'][0].get('field')!r}"
+    )
 
 
 def make_creative_dict(creative_id: str = "c1", name: str = "Test Banner") -> dict:

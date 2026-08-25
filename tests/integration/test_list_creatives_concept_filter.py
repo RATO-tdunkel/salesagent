@@ -122,20 +122,15 @@ def _list_single_creative_with_data(data: dict, transport: Transport) -> ListedB
 
 
 class TestConceptIdsFilterValidation:
-    """Malformed concept_ids filter is rejected, with a spec envelope on every wire transport."""
+    """Malformed concept_ids filter is rejected with a spec envelope on every wire transport.
 
-    @pytest.mark.parametrize("transport", ALL_WIRE)
-    def test_empty_concept_ids_array_is_rejected(self, integration_db, transport):
-        """filters={'concept_ids': []} violates minItems:1 → rejected on every transport."""
-        with CreativeListEnv() as env:
-            env.setup_default_data()
-
-            result = env.call_via(transport, filters={"concept_ids": []})
-
-            assert result.is_error, (
-                f"{transport}: empty concept_ids must be rejected, not silently return the library; "
-                f"got payload {result.payload!r}"
-            )
+    A single test: ``assert_empty_array_filter_rejected`` already asserts the strict superset
+    of a bare ``is_error`` check (a two-layer VALIDATION_ERROR wire envelope with the right
+    code, pinned recovery, a suggestion, the constraint-naming message, and a raw-leak guard —
+    so "rejected, not silently returning the library" is subsumed). A separate weaker
+    ``assert result.is_error`` test would only re-run the identical three wire dispatches to
+    assert less, so it was folded away (the "must not silently return the library" contract
+    now lives in the shared helper, inherited by the statuses sibling too)."""
 
     @pytest.mark.parametrize("transport", ALL_WIRE)
     def test_empty_concept_ids_emits_validation_envelope(self, integration_db, transport):
@@ -155,7 +150,7 @@ class TestNumericConceptCoercion:
         result, warnings, *_ = _list_single_creative_with_data(
             {"assets": {}, "concept_id": 12345, "concept_name": 678}, transport
         )
-        creative = result.wire_response["creatives"][0]
+        creative = result.require_wire()["creatives"][0]
         assert creative["concept_id"] == "12345"
         assert creative["concept_name"] == "678"
         # Clean scalar input coerces silently — a coercer that logged a drop on a good row
@@ -175,7 +170,7 @@ class TestNonScalarConceptValueDropped:
         result, warnings, *_ = _list_single_creative_with_data(
             {"assets": {}, "concept_id": ["x"], "concept_name": {"k": "v"}}, transport
         )
-        creative = result.wire_response["creatives"][0]
+        creative = result.require_wire()["creatives"][0]
         # Dropped to None → exclude_none omits the keys from the wire entirely.
         assert "concept_id" not in creative
         assert "concept_name" not in creative
@@ -236,7 +231,7 @@ class TestSellerConceptEnrichmentIsFilterable:
             result = env.call_via(Transport.REST, filters={"concept_ids": ["gam-order-789"]})
 
             assert not result.is_error, f"concept filter errored: {result.error!r}"
-            creatives = result.wire_response["creatives"]
+            creatives = result.require_wire()["creatives"]
             assert len(creatives) == 1, f"expected only the order-789 creative, got {creatives!r}"
             assert creatives[0]["concept_id"] == "gam-order-789"
             assert creatives[0]["concept_name"] == "GAM Order 789"
@@ -263,7 +258,7 @@ class TestMalformedTagsBlobCoerced:
     def test_non_list_tags_value_is_dropped(self, integration_db, transport):
         """A non-list tags blob (a bare string) is dropped to absent, not crashed on."""
         result, warnings, *_ = _list_single_creative_with_data({"assets": {}, "tags": "premium"}, transport)
-        creative = result.wire_response["creatives"][0]
+        creative = result.require_wire()["creatives"][0]
         # Dropped to None → exclude_none omits the key from the wire entirely.
         assert "tags" not in creative
         # Observability (No Quiet Failures): the drop is surfaced in logs, not silent.
@@ -276,7 +271,7 @@ class TestMalformedTagsBlobCoerced:
         result, warnings, *_ = _list_single_creative_with_data(
             {"assets": {}, "tags": [1, "keep", {"k": "v"}, True]}, transport
         )
-        creative = result.wire_response["creatives"][0]
+        creative = result.require_wire()["creatives"][0]
         # 1 -> "1", "keep" kept, {"k": "v"} dropped, True -> "True" (bool is an int
         # subclass); order preserved.
         assert creative["tags"] == ["1", "keep", "True"]
@@ -290,7 +285,7 @@ class TestMalformedTagsBlobCoerced:
         silently discarded (``["keep", null] -> ["keep"]`` with no log), reddening the log
         assertion."""
         result, warnings, *_ = _list_single_creative_with_data({"assets": {}, "tags": ["keep", None]}, transport)
-        creative = result.wire_response["creatives"][0]
+        creative = result.require_wire()["creatives"][0]
         assert creative["tags"] == ["keep"]
         assert "Dropping null tags element" in warnings
 
@@ -305,7 +300,7 @@ class TestMalformedTagsBlobCoerced:
         reddens this test). The collapse is a valid-input serialization choice, not a
         corruption drop, so it must NOT emit a drop-warning — it logs at debug instead."""
         result, warnings, *_ = _list_single_creative_with_data({"assets": {}, "tags": []}, transport)
-        creative = result.wire_response["creatives"][0]
+        creative = result.require_wire()["creatives"][0]
         assert "tags" not in creative
         assert warnings == "", f"{transport}: empty-tags collapse must not warn: {warnings!r}"
 
@@ -325,7 +320,7 @@ class TestMalformedAssetsBlobCoerced:
     @pytest.mark.parametrize("transport", ALL_WIRE)
     def test_non_dict_assets_value_is_dropped(self, integration_db, transport):
         result, warnings, *_ = _list_single_creative_with_data({"assets": ["not", "a", "dict"]}, transport)
-        creative = result.wire_response["creatives"][0]
+        creative = result.require_wire()["creatives"][0]
         # Dropped to None → exclude_none omits the key from the wire entirely.
         assert "assets" not in creative
         # Observability (No Quiet Failures): the drop is surfaced in logs, not silent.
@@ -342,7 +337,7 @@ class TestMalformedAssetsBlobCoerced:
         oracle but no wire oracle before this. Collapsing ``{}`` to absent (mutating
         ``_coerce_blob_dict`` to return ``None`` on an empty dict) reddens this."""
         result, warnings, *_ = _list_single_creative_with_data({"assets": {}}, transport)
-        creative = result.wire_response["creatives"][0]
+        creative = result.require_wire()["creatives"][0]
         assert creative["assets"] == {}
         assert warnings == "", f"{transport}: empty-assets preservation must not warn: {warnings!r}"
 

@@ -1039,8 +1039,11 @@ class TestMissingFormatFails:
             )
 
         if result.is_error:
-            # MCP: TypeAdapter rejected missing format_id — correct behavior
-            assert_rejected(result, field="format_id", reason="Field required")
+            # MCP: TypeAdapter rejected missing format_id — correct behavior.
+            # The MCP boundary renders the shared rich validation message ("Required
+            # field is missing"), identical to A2A/REST, not the leaf Pydantic
+            # "Field required" (#1329).
+            assert_rejected(result, field="format_id", reason="Required field is missing")
         else:
             # impl/a2a/rest: _impl handled it, returned action=failed
             assert_envelope(result, transport)
@@ -1095,10 +1098,12 @@ class TestStaticPreviewFailed:
             )
 
         if result.is_error:
-            # MCP: TypeAdapter rejects missing assets field — correct schema rejection
+            # MCP: TypeAdapter rejects missing assets field — correct schema rejection.
+            # Shared rich validation message ("Required field is missing"), identical to
+            # A2A/REST, not the leaf Pydantic "Field required" (#1329).
             from tests.harness.assertions import assert_rejected
 
-            assert_rejected(result, field="assets", reason="Field required")
+            assert_rejected(result, field="assets", reason="Required field is missing")
         else:
             # impl/a2a/rest: _impl handles it, returns action=failed
             assert_envelope(result, transport)

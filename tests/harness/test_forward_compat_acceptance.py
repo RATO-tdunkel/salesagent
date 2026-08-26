@@ -440,7 +440,11 @@ class TestDeepStripRetryE2E:
                 with pytest.raises(AdCPToolError) as exc_info:
                     await middleware.on_call_tool(ctx, call_next)
                 assert_envelope_shape(exc_info.value, "VALIDATION_ERROR", recovery="correctable")
-                assert exc_info.value.__cause__ is error
+                # AdCPToolError → typed AdCPValidationError → original TypeAdapter
+                # ValidationError: MCP now builds the rich validation envelope through a
+                # typed intermediate, chaining the raw error one level deeper for
+                # traceback fidelity (#1329 / R9-G1).
+                assert exc_info.value.__cause__.__cause__ is error
                 assert call_next.call_count == 1
 
         asyncio.run(_call())
@@ -814,7 +818,10 @@ class TestErrorPropagation:
                 with pytest.raises(AdCPToolError) as exc_info:
                     await middleware.on_call_tool(ctx, call_next_with_different_errors)
                 assert_envelope_shape(exc_info.value, "VALIDATION_ERROR", recovery="correctable")
-                assert exc_info.value.__cause__ is retry_error
+                # The raw TypeAdapter error is chained under the typed AdCPValidationError
+                # intermediate (#1329 / R9-G1); it must be the RETRY error, not the
+                # original — the buyer sees the post-strip failure.
+                assert exc_info.value.__cause__.__cause__ is retry_error
 
         asyncio.run(_call())
 
@@ -848,7 +855,9 @@ class TestMiddlewareAdversarial:
                 with pytest.raises(AdCPToolError) as exc_info:
                     await middleware.on_call_tool(ctx, call_next)
                 assert_envelope_shape(exc_info.value, "VALIDATION_ERROR", recovery="correctable")
-                assert exc_info.value.__cause__ is error
+                # Raw TypeAdapter error chained under the typed AdCPValidationError
+                # intermediate (#1329 / R9-G1).
+                assert exc_info.value.__cause__.__cause__ is error
                 # Only called once — no retry when schema unavailable
                 assert call_next.call_count == 1
 

@@ -550,7 +550,7 @@ Bug fix = root cause, not symptom: a report names a symptom. Grep every caller o
 
 Rules:
 
-No abstractions that weren't explicitly requested.
+No abstractions that weren't explicitly requested. Caveat: allow shared helpers and existing architecture abstractions.
 No new dependency if it can be avoided.
 No boilerplate nobody asked for.
 Deletion over addition. Boring over clever. Fewest files possible.

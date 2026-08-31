@@ -10,7 +10,6 @@ Two responsibilities, both keyed off the seller's account model:
   get_adcp_capabilities ``account.supported_billing`` honesty declaration and the
   sync_accounts billing gate, so declared == accepted (#1329).
 
-beads: salesagent-8n4
 """
 
 from __future__ import annotations

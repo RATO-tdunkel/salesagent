@@ -35,6 +35,13 @@ class GovernanceSyncEnv(IntegrationEnv):
         "audit_logger": "src.core.tools.governance.get_audit_logger",
     }
 
+    # Dispatch declaration: the base owns call_mcp/call_a2a via the client core.
+    # sync_governance is a single tool registered on every transport, so it
+    # delegates to the base rather than overriding deliver_* (single-dispatch guard).
+    MCP_TOOL = "sync_governance"
+    A2A_SKILL = "sync_governance"
+    RESPONSE_MODEL = SyncGovernanceResponse
+
     REST_ENDPOINT = "/api/v1/accounts/governance/sync"
 
     def _configure_mocks(self) -> None:
@@ -52,14 +59,6 @@ class GovernanceSyncEnv(IntegrationEnv):
     def call_impl(self, **kwargs: Any) -> SyncGovernanceResponse:
         """Call _sync_governance_impl with real DB (sync wrapper for BDD steps)."""
         return asyncio.run(self.call_impl_async(**kwargs))
-
-    def call_a2a(self, **kwargs: Any) -> SyncGovernanceResponse:
-        """Call sync_governance via real AdCPRequestHandler — full A2A pipeline."""
-        return self._run_a2a_handler("sync_governance", SyncGovernanceResponse, **kwargs)
-
-    def call_mcp(self, **kwargs: Any) -> SyncGovernanceResponse:
-        """Call sync_governance via Client(mcp) — full pipeline dispatch."""
-        return self._run_mcp_client("sync_governance", SyncGovernanceResponse, **kwargs)
 
     def build_rest_body(self, **kwargs: Any) -> dict[str, Any]:
         """Build the POST body from a ``req`` object OR flat kwargs.

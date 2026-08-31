@@ -22,7 +22,6 @@ Usage::
 Available mocks via env.mock:
     "audit_logger" -- get_audit_logger (module-level import)
 
-beads: salesagent-7do
 """
 
 from __future__ import annotations
@@ -42,6 +41,11 @@ class AccountListEnv(IntegrationEnv):
     - Real AccountRepository -> real DB reads
     - Real query building, filtering, pagination
     """
+
+    # Dispatch declaration: the base owns call_mcp/call_a2a.
+    MCP_TOOL = "list_accounts"
+    A2A_SKILL = "list_accounts"
+    RESPONSE_MODEL = ListAccountsResponse
 
     EXTERNAL_PATCHES = {
         "audit_logger": "src.core.tools.accounts.get_audit_logger",
@@ -63,14 +67,6 @@ class AccountListEnv(IntegrationEnv):
         self._commit_factory_data()
         kwargs.setdefault("identity", self.identity)
         return _list_accounts_impl(**kwargs)
-
-    def call_a2a(self, **kwargs: Any) -> ListAccountsResponse:
-        """Call list_accounts via real AdCPRequestHandler — full A2A pipeline."""
-        return self._run_a2a_handler("list_accounts", ListAccountsResponse, **kwargs)
-
-    def call_mcp(self, **kwargs: Any) -> ListAccountsResponse:
-        """Call list_accounts via Client(mcp) — full pipeline dispatch."""
-        return self._run_mcp_client("list_accounts", ListAccountsResponse, **kwargs)
 
     REST_ENDPOINT = "/api/v1/accounts"
 

@@ -44,22 +44,83 @@ COMPOSE_FILE="docker-compose.e2e.yml"
 # concurrent runs never contend; the suffix just keeps container names distinct.
 # Compose rejects uppercase project names — lowercase whatever we're given.
 export COMPOSE_PROJECT_NAME="$(printf '%s' "${COMPOSE_PROJECT_NAME:-adcp-innet-$$}" | tr '[:upper:]' '[:lower:]')"
-# The tests container runs as THIS user (docker-compose.e2e.yml `tests.user`), so
-# everything it writes into the bind-mounted repo -- test-results/, .tox/,
-# schemas/, logs -- is owned by whoever launched the run, on any host. Derived
-# here rather than written into compose: a literal uid is correct on exactly one
-# machine, and pinning the CI box's turned GitHub Actions red on `.tox`.
-#
-# Both are overridable. A host whose artifacts must stay writable by SEVERAL
-# identities (the CI box shares group `ci` across sacirunner and claudeuser)
-# exports TEST_GID to that shared group instead of taking the primary one.
-export TEST_UID="${TEST_UID:-$(id -u)}"
-export TEST_GID="${TEST_GID:-$(id -g)}"
+# No TEST_UID/TEST_GID export, deliberately. docker-compose.e2e.yml sets no
+# `user:` on the tests service: under the rootless daemon the run boxes use,
+# container root already maps to the invoking user, so everything written into
+# the bind-mounted repo is owned by whoever launched the run, with no uid
+# plumbing at all. Exporting `id -u` here actively broke that -- rootless maps a
+# non-zero container uid to a host SUBUID, which is what left /app/logs
+# unwritable and killed adcp-server at import.
 # The delivery-webhook scheduler runs on the SERVER (adcp-server), gated by this
 # interval. docker-compose.e2e.yml defaults it empty (scheduler off); the host
 # e2e path sets it to 5 via conftest. Mirror that so test_daily_delivery_webhook
 # gets a report. Compose interpolates this into the adcp-server service env.
 export DELIVERY_WEBHOOK_INTERVAL="${DELIVERY_WEBHOOK_INTERVAL:-5}"
+
+# Parallelism defaults, sized against DOCKER'S memory rather than the host's.
+#
+# Every knob below feeds processes that each import the whole application, so the
+# binding constraint is RAM inside the Docker VM -- not host cores and not host
+# RAM. On a Mac those differ wildly: 48GB host / 14 cores, but Docker Desktop
+# defaults its VM to ~16GB. Sizing from `nproc` alone is what produced this,
+# measured on exactly that machine with E2E_WORKERS=4 + unit=14 + integration=4:
+#
+#     bdd_inprocess: FAIL code -9      <- SIGKILL, the VM OOM-killer
+#     e2e:           FAIL code -9
+#     unit.json:        collected 5894 but reported 0
+#     integration.json: collected 2324 but reported 0
+#
+# (The truncation check further down is what surfaced that as a failure rather
+# than a green run with two silently empty suites.)
+#
+# tox -p runs the suites CONCURRENTLY, so the peak is the SUM of every suite's
+# workers plus the per-worker server stacks -- which is why each knob cannot be
+# chosen in isolation. Tiers are keyed on the Docker VM's MemTotal, with the
+# CI-box tier matching what is measured green in-network (16/16/8 at 86-196GB).
+_docker_mem_gb="$(docker info --format '{{.MemTotal}}' 2>/dev/null || echo 0)"
+# `{{.MemTotal}}` renders the literal string `<no value>` when the daemon does
+# not report it. Under `set -euo pipefail` the arithmetic below then aborts the
+# whole run before a single suite starts ("syntax error: operand expected"), so
+# anything non-numeric falls back to the laptop tier rather than killing the
+# run. Empty output is already safe (0 -> laptop tier), which is why the
+# stubbed-docker test never caught this.
+[[ $_docker_mem_gb =~ ^[0-9]+$ ]] || _docker_mem_gb=0
+_docker_mem_gb=$(( _docker_mem_gb / 1073741824 ))
+_cores="$( (nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 4) )"
+
+if [ "$_docker_mem_gb" -ge 64 ]; then
+    # CI box. Per-worker e2e stacks are affordable; cores are the ceiling again.
+    _unit=$(( _cores > 16 ? 16 : _cores )); _integration=8; _e2e_workers=8
+elif [ "$_docker_mem_gb" -ge 32 ]; then
+    _unit=$(( _cores > 8 ? 8 : _cores )); _integration=4; _e2e_workers=2
+else
+    # Developer laptop (a default Docker Desktop VM lands here). No per-worker
+    # server stacks: four app-loading containers alongside the suites is what
+    # OOM-killed the run above. Unit still parallelises -- it has no database and
+    # is the largest suite -- but at half the cores, since it shares the VM with
+    # every other suite tox -p starts at the same time.
+    _unit=$(( _cores / 2 )); [ "$_unit" -lt 2 ] && _unit=2
+    _integration=4; _e2e_workers=0
+fi
+
+export UNIT_XDIST_N="${UNIT_XDIST_N:-$_unit}"
+# Integration is safe to parallelise at any tier: tests/conftest_db.py's
+# `integration_db` fixture creates a uuid-named database PER TEST, so workers
+# never share rows, and tox.ini runs this env with `--dist loadfile`.
+export INTEGRATION_XDIST_N="${INTEGRATION_XDIST_N:-$_integration}"
+# BDD parallelism comes from E2E_WORKERS, NOT from BDD_XDIST_N directly.
+# docker-compose.e2e.yml sets BDD_E2E_ENABLED=true, and tests/bdd/conftest.py
+# raises a UsageError for that together with -n>0 unless E2E_PER_WORKER=1 --
+# because under xdist the e2e_rest transport is silently dropped at collection and
+# the suite would go green without ever having run it. Setting E2E_WORKERS>0 takes
+# the fast path below, which splits `bdd` into `bdd_inprocess` (e2e disabled,
+# freely parallel) plus `bdd_e2e`, and provisions N per-worker server+DB stacks so
+# e2e_rest can run in parallel legally.
+export E2E_WORKERS="${E2E_WORKERS:-$_e2e_workers}"
+# stderr, not stdout: RUN_ALL_TESTS_RESOLVE_ONLY makes stdout a machine-read
+# contract (tests/unit/test_run_all_tests_contract.py parses it), so diagnostics
+# must not land there.
+echo "Parallelism: docker_mem=${_docker_mem_gb}GB cores=${_cores} -> unit=$UNIT_XDIST_N integration=$INTEGRATION_XDIST_N e2e_workers=$E2E_WORKERS" >&2
 # Argument contract — back-compat with the historical MODE words so the
 # pre-existing callers (Makefile quality-full/test-full, docs) keep working:
 #   (no arg) | ci                 -> all six suites, in-network (the default)
@@ -102,13 +163,22 @@ if [ "${E2E_WORKERS:-0}" -gt 0 ] 2>/dev/null; then
     SUITES="${SUITES#,}"; SUITES="${SUITES%,}"
     # bdd_inprocess reads BDD_XDIST_N (compose pins it to 0 = serial by default),
     # so the in-process bulk only parallelizes if we export a worker count here.
-    # Default to `auto` (PYTEST_XDIST_AUTO_NUM_WORKERS) so the swap is actually
-    # fast on its own — without this the ~23m->~3.5m in-process win never lands.
-    export BDD_XDIST_N="${BDD_XDIST_N:-auto}"
+    #
+    # A REAL NUMBER, not `auto`. `auto` resolves through
+    # PYTEST_XDIST_AUTO_NUM_WORKERS, which docker-compose.e2e.yml pins to 1 for
+    # BDD's own benefit -- so `auto` here meant ONE worker for every caller that
+    # does not separately export that variable, and the ~23m->~3.5m in-process win
+    # silently never landed. Matching E2E_WORKERS keeps the two halves of the split
+    # in proportion; both are overridable.
+    export BDD_XDIST_N="${BDD_XDIST_N:-$E2E_WORKERS}"
     echo "Fast bdd path: E2E_WORKERS=$E2E_WORKERS BDD_XDIST_N=$BDD_XDIST_N -> suites=$SUITES"
 fi
 
-RESULTS_DIR="test-results/innet_$(date +%d%m%y_%H%M)"
+# UTC, not local: the runner box and the machine reading the reports are in
+# different zones, so a local-time directory name means each side computes a
+# different one and the results cannot be attributed to the run that produced
+# them ("no confirmed run identity to attribute local test-results/ to").
+RESULTS_DIR="test-results/innet_$(date -u +%d%m%y_%H%M)"
 mkdir -p "$RESULTS_DIR"
 
 dc() { docker compose -f "$COMPOSE_FILE" -p "$COMPOSE_PROJECT_NAME" --profile runner "$@"; }
@@ -132,16 +202,43 @@ dc build postgres adcp-server proxy tests
 
 # Bring up Postgres + the app server + proxy + the pinned creative-agent (and its
 # own registry Postgres). None publish host ports — all reached by service name.
-# Pre-create logs/ group-writable + setgid BEFORE adcp-server starts: it
-# bind-mounts .:/app and creates logs/audit.log at import time (uid 1001,
-# its own baked umask) -- when that umask strips the group-write bit the
-# tests container (a different uid, 1003 here) can create the dir but not
-# write into it, and every suite dies at collection with
-# `PermissionError: '/app/logs/audit.log'`. Owning it here first means
-# adcp-server writes into an already-correct dir instead of racing to
-# create it (confirmed live: sa-93d37d7c, sa-c9acaf66 both landed
-# drwxr-sr-x -- not group-writable -- and are latent failures until fixed).
-mkdir -p logs && chmod 2775 logs
+# Pre-create logs/ AND the specific files src/core/audit_logger.py opens --
+# audit.log/error.log via FileHandler at IMPORT time (crashes collection
+# immediately on PermissionError), structured.jsonl/security.jsonl lazily via
+# open(path, "a"). setgid + 2775 on the directory only controls the GROUP of
+# NEW files, not their write bit, and it does nothing for files that already
+# exist. Worse: chmod cannot fix a file it doesn't own -- only the owner (or
+# root) may change a file's mode, being in the same group is not enough -- so
+# a stale ci:ci 0644 file left by a prior adcp-server run silently defeats
+# both this and the `chmod -R g+w .` sweep below (EPERM, swallowed by its own
+# `|| true`). Removing and recreating is what actually works: unlink is
+# governed by the DIRECTORY's write bit (which we own), not the file's own
+# owner, so `rm -f` succeeds even on a ci-owned file; the fresh file this
+# process then creates is ours. Verified live: ci:ci 0644 -> sacirunner:ci 0664.
+mkdir -p logs
+chmod 2775 logs
+for f in audit.log error.log structured.jsonl security.jsonl; do
+    rm -f "logs/$f" 2>/dev/null || true
+    # Two statements, not `: > "logs/$f" && chmod ...`. errexit exempts every command
+    # in an AND-OR list except the last, so as an &&-list a failed truncate merely
+    # short-circuits: chmod is skipped, the loop continues, and the script still exits
+    # 0. Verified A/B (with a directory planted at logs/audit.log to force the
+    # failure): &&-list -> "REACHED-END", exit 0; split -> exit 1 at the truncate.
+    : > "logs/$f"
+    # 666, not 664. The point of this block is that the adcp-server container can
+    # WRITE these; 664 only achieves that if the container's user shares the file's
+    # group, and it does not. The server runs as the image's `app` (uid/gid 1001,
+    # no supplementary groups), while these files are owned by whoever ran the
+    # script -- and the bind-mount of this directory onto /app SHADOWS the image's
+    # own `chown -R app:app /app`, so host-side permissions are what decide. Group
+    # never matches, so `app` falls through to the OTHER bits: r-- under 664, and
+    # the server dies on PermissionError while opening audit.log at import time,
+    # taking every per-worker server container unhealthy with it.
+    # The setgid bit set on the directory above does not rescue this either: it
+    # controls the GROUP of new files, not their write bit.
+    # These are ephemeral per-run test logs, not durable state.
+    chmod 666 "logs/$f"
+done
 
 dc up -d postgres adcp-server proxy creative-pg creative-agent
 
@@ -155,6 +252,28 @@ while [ "$(date +%s)" -lt "$deadline" ]; do
     sleep 3
 done
 [ "$pg" = true ] || { echo "Postgres never became ready"; dc logs postgres; exit 1; }
+# $srv gets the SAME fail-fast treatment as $pg. It used to be computed, printed
+# on success, and then never checked -- so a stack whose server never became
+# healthy within the 360s deadline proceeded silently into every server-dependent
+# suite. That is not a smaller failure than a dead Postgres, it is a louder one:
+# bdd_e2e/e2e/ui then emit thousands of "live E2E stack is unreachable" /
+# "Server not ready after 60s" / TargetClosedError errors, none of which names
+# the actual cause. Measured on 2026-08-24: the wait spun its full 360s, said
+# only "Postgres ready", and the suites then produced 2537 errors -- one root
+# cause, zero of them a real defect. Infrastructure death must present as ONE
+# infrastructure failure, reported once.
+#
+# Unconditional because THIS path just started the stack a few lines above: if we
+# brought the server up and it never became healthy, that is a failure for every
+# caller, not a caller-specific one. Symmetric with the Postgres guard by design;
+# an asymmetry here is what hid the problem.
+[ "$srv" = true ] || {
+    echo "ERROR: adcp-server never became healthy within the 360s deadline — aborting" >&2
+    echo "       (waited on http://localhost:8080/health inside adcp-server; every" >&2
+    echo "        server-dependent suite would otherwise error en masse)" >&2
+    dc logs --tail=120 adcp-server >&2
+    exit 1
+}
 
 # The suites use the adcp_test database (matches scripts/test-stack.sh).
 dc exec -T postgres psql -U adcp_user -d postgres -c "CREATE DATABASE adcp_test" >/dev/null 2>&1 || true
@@ -169,33 +288,90 @@ E2E_ENV_ARGS=""
 if [ "${E2E_WORKERS:-0}" -gt 0 ] 2>/dev/null; then
     N="$E2E_WORKERS"
     _admin="postgresql://adcp_user:secure_password_change_me@postgres:5432"
-    psql_admin() { dc exec -T postgres psql -U adcp_user -d postgres -c "$1" >/dev/null 2>&1 || true; }
+    # Two admin-SQL helpers, deliberately NOT one. The old single helper ended in
+    # `|| true` and discarded both streams, so a failed CREATE DATABASE was
+    # indistinguishable from a successful one. The failure then resurfaced four
+    # steps later as the opaque "e2e template migration failed", whose real cause
+    # (`database "adcp_e2e_template" does not exist`) was unrecoverable from any
+    # log. A DROP that fails is tolerable; a CREATE that fails is not.
+    _psql_admin() { dc exec -T postgres psql -U adcp_user -d postgres -v ON_ERROR_STOP=1 -c "$1" 2>&1; }
+    # Tolerant: reports, then continues. For DROP ... IF EXISTS, where "it was
+    # already gone" and "the server refused" are both survivable.
+    psql_admin_try() {
+        local out
+        if ! out=$(_psql_admin "$1"); then
+            echo "WARNING: admin SQL failed (continuing): $1" >&2
+            echo "$out" >&2
+        fi
+    }
+    # Fatal: a database the rest of this block depends on either exists or we stop.
+    psql_admin() {
+        local out
+        if ! out=$(_psql_admin "$1"); then
+            echo "ERROR: admin SQL failed: $1" >&2
+            echo "$out" >&2
+            exit 1
+        fi
+    }
     echo "Provisioning $N per-worker e2e server stacks..."
-    psql_admin "DROP DATABASE IF EXISTS adcp_e2e_template"
+    # A crashed previous run leaves backends attached to the template, and
+    # DROP DATABASE refuses while any connection remains. Evict them first so the
+    # DROP below fails only for reasons worth reporting.
+    psql_admin_try "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = 'adcp_e2e_template' AND pid <> pg_backend_pid()"
+    psql_admin_try "DROP DATABASE IF EXISTS adcp_e2e_template"
     psql_admin "CREATE DATABASE adcp_e2e_template"
     # Fail fast: if the template migration fails, every per-worker DB below would
     # be cloned from an un-migrated template and the whole e2e_rest pass would
-    # error confusingly. Surface it here instead.
+    # error confusingly. Surface it here instead -- WITH the migrator's own output,
+    # which this block used to throw away.
+    _migrate_log="$(mktemp)"
     if ! dc run --rm --no-deps -e DATABASE_URL="$_admin/adcp_e2e_template?sslmode=disable" \
-            tests python scripts/ops/migrate.py >/dev/null 2>&1; then
+            tests python scripts/ops/migrate.py >"$_migrate_log" 2>&1; then
         echo "ERROR: e2e template migration failed — aborting per-worker provisioning" >&2
+        echo "--- migrate.py output ---" >&2
+        cat "$_migrate_log" >&2
+        rm -f "$_migrate_log"
         exit 1
     fi
+    rm -f "$_migrate_log"
     for i in $(seq 0 $((N - 1))); do
-        psql_admin "DROP DATABASE IF EXISTS adcp_gw$i"
+        psql_admin_try "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = 'adcp_gw$i' AND pid <> pg_backend_pid()"
+        psql_admin_try "DROP DATABASE IF EXISTS adcp_gw$i"
         psql_admin "CREATE DATABASE adcp_gw$i TEMPLATE adcp_e2e_template"
         dc run -d --no-deps --name "${COMPOSE_PROJECT_NAME}-server-gw$i" \
             -e DATABASE_URL="$_admin/adcp_gw$i?sslmode=disable" adcp-server >/dev/null
     done
     echo "  waiting for $N per-worker servers to become healthy..."
+    # Same fail-fast reasoning as the template-migration check above: a worker
+    # whose server never came up cannot run a single e2e_rest scenario, so
+    # "(continuing)" only converts one infrastructure fault into a flood of
+    # scenario errors attributed to the wrong layer. Collect all of them first
+    # (one pass, so the operator sees every unhealthy worker rather than just
+    # the first) and then abort with the count.
+    _unhealthy=""
     for i in $(seq 0 $((N - 1))); do
         wd=$(( $(date +%s) + 120 )); ok=false
         while [ "$(date +%s)" -lt "$wd" ]; do
             docker exec "${COMPOSE_PROJECT_NAME}-server-gw$i" curl -sf http://localhost:8080/health >/dev/null 2>&1 && ok=true && break
             sleep 2
         done
-        [ "$ok" = true ] && echo "    server-gw$i ready" || echo "    server-gw$i NOT ready (continuing)"
+        if [ "$ok" = true ]; then
+            echo "    server-gw$i ready"
+        else
+            echo "    server-gw$i NOT ready"
+            _unhealthy="$_unhealthy gw$i"
+        fi
     done
+    if [ -n "$_unhealthy" ]; then
+        echo "ERROR: per-worker e2e server(s) never became healthy:$_unhealthy" >&2
+        echo "       aborting — these workers' scenarios would error en masse and" >&2
+        echo "       be misread as test failures rather than a stack failure." >&2
+        for i in $_unhealthy; do
+            echo "--- logs: ${COMPOSE_PROJECT_NAME}-server-$i ---" >&2
+            docker logs --tail 40 "${COMPOSE_PROJECT_NAME}-server-$i" >&2 2>&1 || true
+        done
+        exit 1
+    fi
     # COMPOSE_PROJECT_NAME must reach pytest so conftest e2e_stack builds the FULL
     # server name "<project>-server-gwN" (short "server-gwN" doesn't resolve).
     E2E_ENV_ARGS="-e E2E_PER_WORKER=1 -e BDD_E2E_XDIST_N=$N -e COMPOSE_PROJECT_NAME=$COMPOSE_PROJECT_NAME"
@@ -206,31 +382,54 @@ fi
 # --use-aliases gives this run container the `tests` network alias so the server
 # can call webhooks back to it (ADCP_WEBHOOK_HOST=tests) by name.
 #
-# SERIAL (no `-p`): run_all_tests.sh runs `tox -p` on the HOST, where each env is
-# its own process tree with the full host RAM. Packing all six suites into ONE
-# container and running them concurrently OOM-kills them (exit -9) — and bdd's
-# `-n auto` alone spawns one worker per host CPU (~17), each loading the app.
-# Serial execution keeps peak memory to a single suite; PYTEST_XDIST_AUTO_NUM_WORKERS
-# (set on the tests service) caps bdd's worker count so it can't blow memory or
-# trip the xdist loadscope rescheduler. Same suites, same outcomes — just not
-# wall-clock parallel inside the one container.
-echo "Running suites in-network (serial): $SUITES"
+# PARALLEL (`-p`): this was serial from 2026-06-18
+# to 2026-08-16 over an OOM observed running all six suites concurrently in one
+# container, where bdd's `-n auto` alone could spawn one worker per host CPU
+# (~17), each loading the app. That OOM predates PYTEST_XDIST_AUTO_NUM_WORKERS
+# (added the same day, in response) ever reaching this container correctly —
+# a real, separate export-plumbing bug meant the cap this
+# comment used to cite was, for some callers, never actually applied. With
+# that bug fixed and the cap now confirmed to genuinely reach the container,
+# a real, monitored, disposable-worktree run of the full 7-suite `-p` (unit,
+# integration, bdd_inprocess, bdd_e2e, admin, e2e, ui) measured peak memory at
+# ~35GB of the box's 86.4GB (40.5%), no OOM, pass/fail counts matching a
+# serial baseline, measured on a full in-network run of all 7 suites.
+echo "Running suites in-network (parallel): $SUITES"
 # Capture the suite exit code without aborting under `set -e` — reports must
 # still be extracted and the security audit must still run on a suite failure.
 RC=0
-# Structural backstop, not another one-off path pin: ANY service that writes
-# into the bind-mounted repo before this point (adcp-server, the per-worker
-# gwN servers, postgres, creative-agent) can leave files/dirs non-group-
-# writable depending on its own container's umask -- same class of bug
-# regardless of which path it is (logs/audit.log today, something else
-# tomorrow). Re-sweep the whole tree writable right before the one container
-# that needs it runs, the same way salesagent-remote-run already does once
-# at sync time -- catches whatever showed up in between instead of requiring
-# another bug report + another path pinned by hand.
+# Best-effort backstop, NOT a guarantee: chmod only succeeds on paths this
+# user (the launcher) already owns -- it silently no-ops (EPERM, swallowed by
+# `|| true`) on anything a DIFFERENT uid created, e.g. files adcp-server (uid
+# 1001) writes into this bind mount. That case needs the file recreated by
+# us, not chmod'd -- see the logs/ block above for the pattern. This sweep
+# still earns its keep for paths WE created with a too-strict umask.
 chmod -R g+w . 2>/dev/null || true
 chmod -R go-w .git 2>/dev/null || true
 
-dc run --rm --use-aliases $E2E_ENV_ARGS tests tox -e "$SUITES" || RC=$?
+# Delete every previous run's report BEFORE this run writes its own, and do it in
+# exactly ONE place. `.tox/` is an ordinary persistent bind-mounted directory now
+# (see the extraction note below), so a report left there outlives the run that
+# wrote it. The copy below is per-suite -- it copies only the envs named in
+# $SUITES -- which already stops an env this run never executed from being
+# republished. What the copy cannot do is tell a report THIS run wrote from one a
+# prior run left behind for a suite that DID run and died before writing its own.
+# Purging first makes a stale report unrepresentable rather than merely
+# detectable: after this line, a report exists only if this run produced it, so a
+# suite that died reaches the missing-report arm below instead of quietly
+# republishing its last PASS forever.
+#
+# Blanket (`.tox/*.json`), not a $SUITES-scoped loop: a scoped loop leaves exactly
+# the not-run envs' reports sitting in `.tox/`, which is the class of staleness
+# documented at the copy below (`storyboard.json` republished for three runs). It
+# also bit `bdd`, which is swapped out for `bdd_inprocess,bdd_e2e` whenever
+# E2E_WORKERS>0 (see above): a stale bdd.json from whenever `tox -e bdd` last ran
+# kept being republished -- one was a full DAY older than its directory-mates and
+# reported 6 failures against code that no longer existed, read as a live
+# regression. Purging wholesale plus copying per-suite closes both directions.
+rm -f .tox/*.json
+
+dc run --rm --use-aliases $E2E_ENV_ARGS tests tox -p -e "$SUITES" || RC=$?
 
 # tox writes per-suite JSON into /app/.tox, which is a plain bind-mounted dir
 # now (Aug 2026: the tox_data named volume it used to live on was removed --
@@ -248,13 +447,104 @@ echo "Collecting JSON reports..."
 # insurance against $RESULTS_DIR having been removed or never created for
 # any reason) and let a real failure actually say something instead of
 # vanishing 23 minutes of work without a trace.
+#
+# Copy ONLY the suites THIS invocation ran, never `.tox/*.json` wholesale.
+# `.tox` used to be the tox_data NAMED VOLUME, destroyed by the cleanup trap's
+# `down -v` every run, so a wholesale copy could not pick up anything stale.
+# Removing that volume (so the non-root runner could write `.tox/<env>`) made
+# `.tox` an ordinary bind-mounted directory that PERSISTS between runs -- and
+# silently turned the same wholesale copy into a stale-report generator: a suite
+# this run never executed still contributes its last report, and downstream
+# tooling renders it as freshly measured.
+#
+# That is not hypothetical. `storyboard` is an opt-in env (not in tox's
+# env_list), so a bare `./run_all_tests.sh` never runs it -- yet three
+# consecutive runs published a storyboard.json from hours earlier, and the
+# numbers were read as this run's until an SDK version inside the report
+# contradicted the SDK that was actually installed.
+#
+# A missing report for a suite that DID run is an error, not an omission: it
+# means the suite died before writing one, which is exactly when its absence
+# most needs to be loud.
 mkdir -p "$RESULTS_DIR"
-if ! cp .tox/*.json "$RESULTS_DIR/"; then
-    echo "WARNING: failed to copy JSON reports into $RESULTS_DIR/ -- see error above." >&2
-    echo "         Reports are still in .tox/*.json inside $(pwd) if you need them by hand." >&2
+# Record WHICH suites this invocation ran, next to their reports. Consumers
+# cannot infer it: report timestamps do not separate "stale" from "ran early in
+# a long serial run" (measured: a genuine unit report was 16 min behind the
+# newest, a stale storyboard one 28 min — overlapping bands, so any threshold
+# misfires both ways). An explicit manifest is exact.
+printf '%s\n' "$SUITES" > "$RESULTS_DIR/.suites"
+_missing_reports=""
+for _suite in ${SUITES//,/ }; do
+    if [ -f ".tox/${_suite}.json" ]; then
+        cp ".tox/${_suite}.json" "$RESULTS_DIR/" || _missing_reports="$_missing_reports $_suite(copy-failed)"
+    else
+        _missing_reports="$_missing_reports $_suite"
+    fi
+done
+if [ -n "$_missing_reports" ]; then
+    echo "ERROR: no JSON report for suite(s):$_missing_reports" >&2
+    echo "       The suite ran but produced no report -- it died before writing one." >&2
+    echo "       Reports are how this run is graded; a suite that produced none was not measured." >&2
+    # The comment above already calls this "an error, not an omission". The code
+    # said RC=${RC:-0}, which leaves the exit code untouched — so a dead suite
+    # produced a GREEN run, and the file that publishes the numbers disagreed
+    # with its own docstring.
+    [ "$RC" -eq 0 ] && RC=1
 fi
 echo "Reports: $RESULTS_DIR/"
 ls -1 "$RESULTS_DIR"/*.json 2>/dev/null || echo "  (no JSON reports extracted)"
+
+# A truncated suite is a failed suite, and the whole point is that it must not
+# be mistakable for a green one. The predicate is shared with
+# run_all_tests_host.sh -- see scripts/check_truncated_reports.py for why it
+# lives in its own file rather than inline here.
+if ls "$RESULTS_DIR"/*.json >/dev/null 2>&1; then
+    if ! python3 scripts/check_truncated_reports.py "$RESULTS_DIR"; then
+        RC=1
+    fi
+fi
+
+# Reconcile a non-zero exit against what the suites actually reported. This does
+# NOT change the exit code -- masking a failure is how the real cause of a dead
+# run became unknowable before (the `psql_admin() { ...; } || true` and the
+# discarded migrate.py output). It only says WHICH layer failed, because
+# "exit 125, no explanation, all suites OK" sends you hunting for a test bug
+# that does not exist.
+#
+# Docker reserves 125/126/127 for "the runner itself failed" (125 = the daemon
+# or CLI could not run/wait on the container) as distinct from any code the
+# command inside returned. A long `-p` run that drops its CLI connection at the
+# end lands here with every suite already finished and every report written.
+if [ "$RC" -ne 0 ] && ls "$RESULTS_DIR"/*.json >/dev/null 2>&1; then
+    if python3 - "$RESULTS_DIR" <<'PYEOF'
+import glob, json, os, sys
+bad = []
+for f in sorted(glob.glob(os.path.join(sys.argv[1], "*.json"))):
+    try:
+        s = json.load(open(f)).get("summary", {})
+    except Exception:
+        bad.append(f"{os.path.basename(f)}: unreadable")
+        continue
+    if s.get("failed") or s.get("error"):
+        bad.append(f"{os.path.basename(f)}: failed={s.get('failed', 0)} error={s.get('error', 0)}")
+sys.exit(1 if bad else 0)
+PYEOF
+    then
+        echo ""
+        echo "NOTE: exit code is $RC but every suite report shows 0 failures and 0 errors."
+        case "$RC" in
+            125|126|127)
+                echo "      $RC is Docker's own 'could not run/wait on the container' range, not a"
+                echo "      test result -- the suites finished and wrote their reports first."
+                echo "      Look at the runner (daemon connection, container lifetime), not the tests." ;;
+            *)
+                echo "      The failure is therefore OUTSIDE the suites: check the report-copy step"
+                echo "      and the security audit above." ;;
+        esac
+        echo "      Exit code is left as-is on purpose: this is a diagnostic, not a downgrade."
+        echo ""
+    fi
+fi
 
 # Security audit (uv-secure) — runs on the HOST (scans uv.lock; no Docker). The
 # host runner runs this too; keep parity so the canonical local gate still scans

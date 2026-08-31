@@ -34,6 +34,11 @@ CAPABILITIES_REST_ENDPOINT = "/api/v1/capabilities"
 class CapabilitiesEnv(IntegrationEnv):
     """Integration env for get_adcp_capabilities across impl/mcp/a2a (+ REST GET in-test)."""
 
+    # Dispatch declaration: the base owns call_mcp/call_a2a.
+    MCP_TOOL = "get_adcp_capabilities"
+    A2A_SKILL = "get_adcp_capabilities"
+    RESPONSE_MODEL = GetAdcpCapabilitiesResponse
+
     EXTERNAL_PATCHES: dict[str, str] = {}
     REST_ENDPOINT = CAPABILITIES_REST_ENDPOINT
     REST_METHOD = "get"  # GET discovery endpoint; both REST legs read this (#1329)
@@ -64,11 +69,10 @@ class CapabilitiesEnv(IntegrationEnv):
         kwargs.setdefault("identity", self.identity)
         return _get_adcp_capabilities_impl(**kwargs)
 
-    def call_mcp(self, **kwargs: Any) -> GetAdcpCapabilitiesResponse:
-        return self._run_mcp_client("get_adcp_capabilities", GetAdcpCapabilitiesResponse, **kwargs)
-
-    def call_a2a(self, **kwargs: Any) -> GetAdcpCapabilitiesResponse:
-        return self._run_a2a_handler("get_adcp_capabilities", GetAdcpCapabilitiesResponse, **kwargs)
+    # MCP/A2A dispatch is owned by the base via MCP_TOOL/A2A_SKILL/RESPONSE_MODEL
+    # (deliver_mcp/deliver_a2a stash the real success-path wire). REST is owned by
+    # the base too — REST_METHOD = "get" routes both the in-process and in-network
+    # legs through issue_rest_verb, so no _run_rest_request override is needed.
 
     def parse_rest_response(self, data: dict[str, Any]) -> GetAdcpCapabilitiesResponse:
         return GetAdcpCapabilitiesResponse(**data)

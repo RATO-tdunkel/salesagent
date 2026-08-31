@@ -76,7 +76,7 @@ def make_adapter_update_side_effect() -> Any:
     def _update_response(*args: Any, **kwargs: Any) -> UpdateMediaBuySuccess:
         media_buy_id = kwargs.get("media_buy_id") or (args[0] if args else "")
         today = kwargs.get("today") or datetime.now(UTC)
-        return UpdateMediaBuySuccess(
+        return UpdateMediaBuySuccess.carrier(
             media_buy_id=media_buy_id,
             affected_packages=[],
             implementation_date=today,
@@ -230,10 +230,11 @@ class DeliveryPollMixin:
 
         # Pop identity — it's injected by call_via for transport dispatch
         # but is not a GetMediaBuyDeliveryRequest field.
-        # Use sentinel to distinguish "not provided" from "explicitly None".
-        _no_identity = object()
-        raw_identity = extra.pop("identity", _no_identity)
-        identity = self.identity if raw_identity is _no_identity else raw_identity  # type: ignore[attr-defined]
+        # Sentinel distinguishes "not provided" from "explicitly None".
+        from tests.harness.transport import NO_IDENTITY_OVERRIDE
+
+        raw_identity = extra.pop("identity", NO_IDENTITY_OVERRIDE)
+        identity = self.identity if raw_identity is NO_IDENTITY_OVERRIDE else raw_identity  # type: ignore[attr-defined]
 
         kwargs: dict[str, Any] = {}
         if media_buy_ids is not None:

@@ -85,6 +85,7 @@ from tests.helpers.idempotency_seeds import (
     seed_media_buy,
     seed_principal,
 )
+from tests.helpers.ledger import load_ledger_nodeids
 from tests.helpers.log_assertions import rendered_log_calls
 from tests.helpers.validation_redaction import assert_redacted, extra_forbidden_error
 
@@ -101,6 +102,8 @@ __all__ = [
     "assert_redacted",
     # Capabilities wire assertion
     "assert_declared_capabilities",
+    # Known-failures ledger parsing
+    "load_ledger_nodeids",
     # Log-call assertions
     "rendered_log_calls",
     # Idempotency cache seeding

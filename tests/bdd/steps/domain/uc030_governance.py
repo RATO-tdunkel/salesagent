@@ -37,7 +37,7 @@ from typing import Any
 
 from pytest_bdd import given, parsers, then, when
 
-from tests.bdd.steps._outcome_helpers import _require_response, wire_dict
+from tests.bdd.steps._outcome_helpers import _require_response, wire_dict, wire_error_envelope_or_none
 from tests.bdd.steps.generic._dispatch import dispatch_request
 from tests.factories import AccountFactory
 from tests.factories.principal import _UNSET
@@ -605,7 +605,7 @@ def then_request_verdict(ctx: dict, verdict: str) -> None:
         assert not result.is_error, (
             "a boundary-valid request must be accepted at validation (per-account resolution may "
             "still fail on an unseeded account — the success variant, not a top-level error); "
-            f"got wire error {result.wire_error_envelope!r}"
+            f"got wire error {wire_error_envelope_or_none(ctx)!r}"
         )
     else:
         raise AssertionError(f"unknown request verdict {verdict!r}")

@@ -20,7 +20,6 @@ Usage::
 Available mocks via env.mock:
     "audit_logger" -- get_audit_logger (module-level import)
 
-beads: salesagent-7do
 """
 
 from __future__ import annotations
@@ -48,6 +47,11 @@ class AccountSyncEnv(IntegrationEnv):
     Constructor accepts ``supported_billing`` to configure billing policy
     on the identity (BR-RULE-059).
     """
+
+    # Dispatch declaration: the base owns call_mcp/call_a2a.
+    MCP_TOOL = "sync_accounts"
+    A2A_SKILL = "sync_accounts"
+    RESPONSE_MODEL = SyncAccountsResponse
 
     EXTERNAL_PATCHES = {
         "audit_logger": "src.core.tools.accounts.get_audit_logger",
@@ -162,14 +166,6 @@ class AccountSyncEnv(IntegrationEnv):
         Bridges async _impl for sync callers (BDD steps, dispatchers).
         """
         return asyncio.run(self.call_impl_async(**kwargs))
-
-    def call_a2a(self, **kwargs: Any) -> SyncAccountsResponse:
-        """Call sync_accounts via real AdCPRequestHandler — full A2A pipeline."""
-        return self._run_a2a_handler("sync_accounts", SyncAccountsResponse, **kwargs)
-
-    def call_mcp(self, **kwargs: Any) -> SyncAccountsResponse:
-        """Call sync_accounts via Client(mcp) — full pipeline dispatch."""
-        return self._run_mcp_client("sync_accounts", SyncAccountsResponse, **kwargs)
 
     REST_ENDPOINT = "/api/v1/accounts/sync"
 

@@ -12,38 +12,117 @@ from __future__ import annotations
 
 from typing import Any
 
-from tests.harness.transport import TransportResult
+from tests.harness.transport import Transport
+
+
+def wire_field(ctx: dict, field: str) -> Any:
+    """Return a top-level success-response field as the buyer sees it on the wire.
+
+    REST/A2A/MCP expose the real success-path wire dict via ``ctx["wire_response"]``.
+    IMPL has no wire, so serialize the typed payload through the production
+    serializer — the same path that produces wire bytes for the other transports.
+
+    Loud guard: a real-wire transport (REST/A2A/MCP) that didn't stash
+    ``wire_response`` would otherwise fall through to the ``model_dump`` path and
+    assert nothing on the wire — a silent tautology. A sibling wired against a
+    non-stashing env trips this instead of passing green. IMPL (and the
+    non-parametrized ``None`` default) legitimately have no wire.
+    """
+    return wire_dict(ctx)[field]
 
 
 def wire_dict(ctx: dict) -> dict:
     """Return the full success-path wire body as the buyer sees it on the wire.
 
-    Single guarded wire accessor for BDD Then steps: one line over the typed
-    ``TransportResult.require_wire()`` the When step stashed on ``ctx["result"]``
-    (every dispatch path — ``dispatch_request`` and ``when_request._call_via`` —
-    stashes it). ``require_wire()`` narrows ``wire_response`` in one place and
-    raises transport-named if it is absent (a real-wire transport that failed to
-    stash, or an errored/IMPL result), so a wire-absent regression fails loudly
-    rather than falling back to a ``model_dump`` re-serialization that would assert
-    nothing on the wire. There is no model_dump fallback: BDD dispatches on wire
-    transports only (IMPL is sunset), so "no wire" is always a bug to surface.
+    The dict analogue of :func:`wire_field` — use when an oracle must test key
+    PRESENCE/ABSENCE (e.g. an optional field) rather than read one known field.
+    Shares the same loud guard: a real-wire transport (REST/A2A/MCP) that did not
+    stash ``wire_response`` raises instead of silently asserting nothing. IMPL (and
+    the non-parametrized ``None`` default) serialize the typed payload through the
+    production serializer.
     """
     result = ctx.get("result")
-    assert isinstance(result, TransportResult), (
-        f"Expected ctx['result'] (the TransportResult a When step dispatches) but got {result!r}. "
-        f"Dispatch through dispatch_request / when_request._call_via first. Recorded error: {ctx.get('error')!r}"
-    )
-    return result.require_wire()
+    transport = ctx.get("transport")
+    if transport not in (None, Transport.IMPL):
+        # A real-wire transport: the guarded read lives on TransportResult, which is
+        # the object that holds the wire. One implementation, so a step definition
+        # cannot drift from an integration test asserting the same thing.
+        if result is not None:
+            return result.require_wire()
+        wire = ctx.get("wire_response")
+        if wire is None:
+            raise AssertionError(f"{transport}: wire_response missing — env does not stash success-path wire")
+        return wire
+    # IMPL has no wire — serialize the typed payload through the production
+    # serializer. _require_response preserves the diagnostic if a (reused) sibling
+    # scenario hit an error path, instead of a bare ctx["response"] KeyError.
+    wire = ctx.get("wire_response")
+    return wire if wire is not None else _require_response(ctx).model_dump(mode="json")
 
 
-def wire_field(ctx: dict, field: str) -> Any:
-    """Return one top-level success-response field as the buyer sees it on the wire.
+def _real_wire_error_envelope(ctx: dict) -> dict | None:
+    """Read ``TransportResult.wire_error_envelope`` — the ONE attribute-access site.
 
-    Thin reader over :func:`wire_dict` (the single guarded wire accessor) — use when
-    an oracle reads one known field; use ``wire_dict`` when it must test key
-    presence/absence.
+    Every reader of this field, anywhere in ``tests/bdd/steps/``, must go
+    through this module (:func:`wire_error_envelope_or_none` or
+    :func:`wire_error_dict`) rather than hand-rolling
+    ``getattr(result, "wire_error_envelope", None)`` — enforced by
+    ``test_architecture_bdd_wire_discipline.py``'s access-pattern check.
     """
-    return wire_dict(ctx)[field]
+    result = ctx.get("result")
+    return getattr(result, "wire_error_envelope", None) if result is not None else None
+
+
+def wire_error_envelope_or_none(ctx: dict) -> dict | None:
+    """Return the REAL wire error envelope (REST/A2A/MCP) captured for this dispatch, or ``None``.
+
+    No loud guard, no IMPL-synthesized fallback — the strict counterpart to
+    :func:`wire_error_dict`. Use this when a caller must distinguish "a real
+    wire envelope was captured" from "only the IMPL-synthesized one exists"
+    before delegating to ``TransportResult.assert_wire_error``, which reads
+    ``wire_error_envelope`` specifically and raises its own (misleading)
+    error if handed a synthesized-only result (``then_error_recovery``'s
+    reason for using this instead of ``wire_error_dict``). Returns ``None``
+    on IMPL and on any scenario where no wire envelope was captured —
+    callers fall back to the reconstructed ``ctx['error']``.
+    """
+    return _real_wire_error_envelope(ctx)
+
+
+def wire_error_dict(ctx: dict) -> dict:
+    """Return the full error-path wire envelope as the buyer sees it on the wire.
+
+    The error-path analogue of :func:`wire_dict` — the single guarded accessor
+    for ``TransportResult.wire_error_envelope``, which its own docstring names
+    "the canonical field for error verification" (``tests/CLAUDE.md`` § Error
+    Verification Policy) and whose ``assert_wire_error`` calls "the single
+    harness-provided way to verify an error on the wire — step definitions
+    must not hand-roll envelope parsing." Callers that only need to read a
+    field off the envelope (e.g. ``context.correlation_id`` echo checks) call
+    this directly; callers verifying the error SHAPE should prefer
+    ``result.assert_wire_error(...)``, the single shape authority.
+
+    Shares the same loud guard as ``wire_dict``: a real-wire transport
+    (REST/A2A/MCP) that captured no error envelope raises instead of silently
+    asserting nothing — that combination is a test bug (the operation should
+    have failed through the wire), not a legitimate no-wire case. IMPL has no
+    wire — falls back to ``synthesized_error_envelope`` (what the boundary
+    translator WOULD emit against the caught error), consistent with
+    ``wire_dict``'s IMPL fallback to the serialized typed payload.
+    """
+    result = ctx.get("result")
+    envelope = _real_wire_error_envelope(ctx)
+    transport = ctx.get("transport")
+    if envelope is None and transport not in (None, Transport.IMPL):
+        raise AssertionError(f"{transport}: wire_error_envelope missing — env does not stash the wire error envelope")
+    if envelope is not None:
+        return envelope
+    synthesized = getattr(result, "synthesized_error_envelope", None) if result is not None else None
+    assert synthesized is not None, (
+        f"No wire_error_envelope or synthesized_error_envelope available (result={result!r}) — "
+        "expected an error dispatch"
+    )
+    return synthesized
 
 
 def _require(ctx: dict, key: str, *, hint: str | None = None) -> object:

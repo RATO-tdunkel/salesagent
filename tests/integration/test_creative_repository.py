@@ -3,7 +3,7 @@
 Tests repository methods against real PostgreSQL using factory_boy.
 Replaces mock-session unit tests from test_creative_repository.py.
 
-Covers: salesagent-1m85
+Covers:
 """
 
 from __future__ import annotations
@@ -434,7 +434,7 @@ class TestAssignmentRepoGetExisting:
 class TestAssignmentRepoGetCreativeById:
     """get_creative_by_id — full composite-PK creative lookup (tenant + principal + creative_id).
 
-    Refactor guard for salesagent-qkk4: these pin the behavior that must survive
+    Refactor guard for : these pin the behavior that must survive
     delegation to CreativeRepository.get_by_id (they PASS pre-refactor).
     """
 
@@ -471,7 +471,7 @@ class TestAssignmentRepoGetCreativeById:
 class TestAssignmentRepoGetProductById:
     """get_product_by_id — tenant-scoped product lookup.
 
-    Refactor guard for salesagent-qkk4: these pin the behavior that must survive
+    Refactor guard for : these pin the behavior that must survive
     delegation to ProductRepository.get_by_id (they PASS pre-refactor).
     """
 

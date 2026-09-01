@@ -1251,3 +1251,75 @@ def seed_error_test_tenant(
         "principal_id": principal_id,
         "access_token": access_token,
     }
+
+
+@pytest.fixture
+def live_media_buy_env(integration_db):
+    """A ``MediaBuyDualEnv`` holding one ACTIVE, mid-flight media buy.
+
+    Shared by the two honor-side graders
+    (``test_spec_request_fields_accepted.py`` on the MCP path,
+    ``test_raw_wrapper_spec_fields_accepted.py`` on the raw A2A/REST path), so
+    the "a live buy that a cancellation must actually cancel" setup exists
+    once rather than per file.
+
+    Yields ``(env, media_buy)``. Callers that need the transport-generic
+    dispatcher wrap the env in ``AdCPTestClient`` themselves: the env's own
+    update dispatch flattens an ``UpdateMediaBuyRequest`` and pops
+    ``canceled``/``cancellation_reason`` on the way to the wire
+    (``tests/harness/media_buy_update.py`` ``_WRAPPER_UNSUPPORTED_FIELDS``),
+    which is the harness accommodating the very defect under test.
+    """
+    from datetime import timedelta
+
+    from tests.factories import MediaBuyFactory
+    from tests.harness.media_buy_dual import MediaBuyDualEnv
+
+    with MediaBuyDualEnv(tenant_id="honor-cancel", principal_id="test_principal") as env:
+        tenant, principal, _product, _pricing_option = env.setup_media_buy_data()
+        media_buy = MediaBuyFactory(
+            tenant=tenant,
+            principal=principal,
+            status="active",
+            currency="USD",
+            start_time=datetime.now(UTC) - timedelta(days=1),
+            end_time=datetime.now(UTC) + timedelta(days=30),
+        )
+        env._commit_factory_data()
+        env._seeded_media_buy_id = media_buy.media_buy_id
+        yield env, media_buy
+
+
+@pytest.fixture
+def bound_factory_session(integration_db):
+    """A session bound to every factory for the duration of a test, then restored.
+
+    Depends on ``integration_db`` for correctness, not convenience: that fixture
+    creates a per-test database and REBINDS the global engine, and pytest
+    instantiates same-scope fixtures in argument order. Without this dependency a
+    test written as ``(bound_factory_session, integration_db)`` would bind factories
+    to the pre-swap engine and write to the wrong database with nothing failing.
+    The hand-rolled context manager this replaces could not have that bug — it was
+    entered inside a fixture body that had already taken ``integration_db`` — so the
+    ordering has to be declared here to keep the guarantee.
+
+    The shared alternative to hand-rolling ``factory._meta.sqlalchemy_session = s``
+    and nulling it afterwards. Nulling is only correct when the fixture is
+    guaranteed outermost; ``bind_factories_to_session`` saves and restores the
+    previous binding instead, which is correct either way.
+
+    Owns the session as well as the binding: it creates it, binds it, and closes it,
+    because a caller that only borrowed the binding would still have to manage the
+    SASession itself and that is where the hand-rolled versions diverge.
+    """
+    from sqlalchemy.orm import Session as SASession
+
+    from src.core.database.database_session import get_engine
+    from tests.utils.database_helpers import bind_factories_to_session
+
+    session = SASession(bind=get_engine())
+    try:
+        with bind_factories_to_session(session):
+            yield session
+    finally:
+        session.close()

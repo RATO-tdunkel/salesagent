@@ -2,14 +2,13 @@
 
 UC-026 scenarios use both create and update flows within the same test:
 Given steps create a media buy (create path), then When steps update it
-(update path). UC-003 (salesagent-8hu9) drives the update path directly against
+(update path). UC-003 drives the update path directly against
 a pre-seeded media buy to grade the manual-approval UpdateMediaBuySubmitted
 envelope cross-transport. This env extends MediaBuyCreateEnv with update-module
 patches and delegates update requests to the appropriate production code —
 A2A/MCP go through the real on_message_send / FastMCP Client pipelines so the
 serialized wire (and the A2A submitted reconstruction) are genuinely exercised.
 
-beads: salesagent-a3xo, salesagent-8hu9
 """
 
 from __future__ import annotations
@@ -20,7 +19,7 @@ from unittest.mock import MagicMock, patch
 from src.core.schemas import UpdateMediaBuyRequest
 from tests.harness._mixins import make_adapter_update_side_effect
 from tests.harness.media_buy_create import MediaBuyCreateEnv
-from tests.harness.media_buy_update import _WRAPPER_UNSUPPORTED_FIELDS
+from tests.harness.transport import DeliverResult
 
 _UPDATE_MODULE = "src.core.tools.media_buy_update"
 
@@ -32,8 +31,24 @@ _UPDATE_PATCHES = {
 
 
 def _is_update_request(kwargs: dict[str, Any]) -> bool:
+    """Route to the update wrappers for a typed request OR a RAW flat update body.
+
+    ``req=UpdateMediaBuyRequest(...)`` is the typed dispatch every UC-003/UC-026
+    scenario uses. The RAW form (flat kwargs, no ``req``) exists for scenarios
+    whose payload the LOCAL ``UpdateMediaBuyRequest`` must reject: constructing
+    the model in the test process would raise inside the step, so the rejection
+    would never reach a wire and could not be graded as an envelope. Dispatching
+    the flat body sends it through the real route + production Pydantic instead,
+    mirroring the create side's ``dispatch_mode="create_raw"``.
+
+    ``media_buy_id`` is the discriminator: it identifies the buy being updated and
+    is absent from every create request (the seller assigns it), so a flat body
+    carrying it is unambiguously an update.
+    """
     req = kwargs.get("req")
-    return isinstance(req, UpdateMediaBuyRequest)
+    if isinstance(req, UpdateMediaBuyRequest):
+        return True
+    return req is None and "media_buy_id" in kwargs
 
 
 class MediaBuyDualEnv(MediaBuyCreateEnv):
@@ -90,15 +105,24 @@ class MediaBuyDualEnv(MediaBuyCreateEnv):
             return self._call_update_impl(**kwargs)
         return super().call_impl(**kwargs)
 
-    def call_a2a(self, **kwargs: Any) -> Any:
+    def deliver_a2a(self, **kwargs: Any) -> DeliverResult:
+        # JUSTIFIED OVERRIDE: this env selects BOTH the tool and the parser from
+        # request CONTENT, so it can declare no single A2A_SKILL.
         if _is_update_request(kwargs):
+            # Returned AS IS: _call_update_a2a drives _run_a2a_handler, which
+            # already yields a DeliverResult carrying the REAL artifact wire.
+            # Re-wrapping it would both double-nest the payload and throw that
+            # wire away.
             return self._call_update_a2a(**kwargs)
-        return super().call_a2a(**kwargs)
+        return super().deliver_a2a(**kwargs)
 
-    def call_mcp(self, **kwargs: Any) -> Any:
+    def deliver_mcp(self, **kwargs: Any) -> DeliverResult:
+        # JUSTIFIED OVERRIDE: see deliver_a2a above.
         if _is_update_request(kwargs):
+            # As in deliver_a2a: _call_update_mcp already returns a DeliverResult
+            # carrying the real structured_content wire.
             return self._call_update_mcp(**kwargs)
-        return super().call_mcp(**kwargs)
+        return super().deliver_mcp(**kwargs)
 
     def _run_rest_request(self, endpoint: str, **kwargs: Any) -> Any:
         # Set the update-vs-create routing flag and leave it set THROUGH the base
@@ -179,12 +203,10 @@ class MediaBuyDualEnv(MediaBuyCreateEnv):
         if req is None:
             return dict(kwargs)
         flat = req.model_dump(mode="json", exclude_none=True)
-        for key in _WRAPPER_UNSUPPORTED_FIELDS:
-            flat.pop(key, None)
         flat.update(kwargs)
         return flat
 
-    def _call_update_a2a(self, **kwargs: Any) -> Any:
+    def _call_update_a2a(self, **kwargs: Any) -> DeliverResult:
         # Drive the REAL on_message_send → _serialize_for_a2a → Task/Artifact
         # pipeline (mirrors MediaBuyCreateEnv.call_a2a), so _run_a2a_handler stashes
         # the true artifact DataPart as the wire_response and the submitted
@@ -200,7 +222,7 @@ class MediaBuyDualEnv(MediaBuyCreateEnv):
             **self._flatten_update_request(kwargs),
         )
 
-    def _call_update_mcp(self, **kwargs: Any) -> Any:
+    def _call_update_mcp(self, **kwargs: Any) -> DeliverResult:
         # Drive the REAL FastMCP Client pipeline (mirrors MediaBuyCreateEnv.call_mcp) so the
         # structured_content — the real MCP wire body — is stashed as wire_response and the
         # full middleware/auth chain runs, including the production with_error_logging
@@ -261,5 +283,8 @@ class MediaBuyDualEnv(MediaBuyCreateEnv):
         if data.get("status") == "submitted":
             return UpdateMediaBuySubmitted(**data)
         if "media_buy_id" in data:
+            # Bare construction on purpose, not carrier(): this reconstructs a response
+            # FROM THE WIRE, so a missing spec-required `revision` must raise here rather
+            # than be filled in with a placeholder that hides the gap.
             return UpdateMediaBuySuccess(**data)
         return UpdateMediaBuyError(**data)

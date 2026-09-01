@@ -18,14 +18,20 @@ with a reason (e.g., "MCP wrapper does not accept disclosure_positions").
 
 from __future__ import annotations
 
+import dataclasses
 import os
 import re
-from collections.abc import Generator
+from collections.abc import Callable, Generator
 from contextlib import AbstractContextManager, contextmanager, nullcontext
+from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, NamedTuple
 
 import pytest
+
+from scripts.audit import storyboard_spec
+from tests.helpers.ledger import load_ledger_nodeids
+from tests.helpers.marker_names import derive_marker_names
 
 # Known mock-incompatible e2e_rest BDD scenarios — these dispatch over real HTTP
 # to the separate server, so in-process mock injection (set_registry_formats /
@@ -33,20 +39,21 @@ import pytest
 # the scenario cannot pass. xfail(strict=False)'d by exact nodeid in the
 # collection hook. Regenerate from a clean in-network e2e_rest run. See the beads
 # ledger task. File lives next to this conftest.
-_E2E_REST_KNOWN_FAILURES: frozenset[str] = frozenset(
-    line.strip()
-    for line in (Path(__file__).parent / "e2e_rest_known_failures.txt").read_text().splitlines()
-    if line.strip() and not line.lstrip().startswith("#")
-)
+_E2E_REST_KNOWN_FAILURES: frozenset[str] = load_ledger_nodeids(Path(__file__).parent / "e2e_rest_known_failures.txt")
 
 if TYPE_CHECKING:
-    pass
+    # Real types for the EnvRoute callbacks. Under TYPE_CHECKING so
+    # the annotations stay honest without importing the harness at conftest
+    # import time.
+    from tests.harness._base import BaseTestEnv
+    from tests.harness.transport import E2EConfig
 
 # Register step definition modules as pytest plugins so that the fixtures
 # created by @given/@when/@then decorators are visible to pytest-bdd's
 # fixture lookup. Simple ``import`` is not enough — pytest only discovers
 # fixtures from conftest files and registered plugins.
 pytest_plugins = [
+    "tests.bdd.scenario_liveness",
     "tests.bdd.steps.generic.given_auth",
     "tests.bdd.steps.generic.given_config",
     "tests.bdd.steps.generic.given_entities",
@@ -55,12 +62,15 @@ pytest_plugins = [
     "tests.bdd.steps.generic.then_success",
     "tests.bdd.steps.generic.then_error",
     "tests.bdd.steps.generic.then_payload",
+    "tests.bdd.steps.generic.then_schema",
     "tests.bdd.steps.domain.uc004_delivery",
     "tests.bdd.steps.domain.uc002_create_media_buy",
     "tests.bdd.steps.domain.uc002_nfr",
     "tests.bdd.steps.domain.uc003_update_media_buy",
     "tests.bdd.steps.domain.uc003_ext_error_scenarios",
+    "tests.bdd.steps.domain.uc003_storyboard_generic_client",
     "tests.bdd.steps.domain.uc006_sync_creatives",
+    "tests.bdd.steps.domain.uc006_storyboard_creative_sync",
     "tests.bdd.steps.domain.uc005_format_id_shape",
     "tests.bdd.steps.domain.uc005_format_id_roundtrip",
     "tests.bdd.steps.domain.uc005_format_id_third_party",
@@ -69,6 +79,7 @@ pytest_plugins = [
     "tests.bdd.steps.domain.uc_get_products_inventory",
     "tests.bdd.steps.domain.uc_brand_shorthand",
     "tests.bdd.steps.domain.compat_normalization",
+    "tests.bdd.steps.domain.local_constraint_relaxations",
 ]
 
 # ---------------------------------------------------------------------------
@@ -163,27 +174,71 @@ def pytest_configure(config: pytest.Config) -> None:
 # Each xfail has a FIXME pointing to the work needed.
 
 _XFAIL_TAGS: dict[str, str] = {
-    # FIXME(salesagent-ghgx): UC-003 main/alt-timing — production doesn't populate these fields
+    # ── Wired by this sweep; they FAIL, and that failure is the finding. ──
+    # These three scenarios were dormant on main (routed to the uc003/uc006
+    # not-wired catch-alls). This sweep wired them deliberately, because a
+    # storyboard step graded them and the matching BDD scenario existed. They
+    # now execute and fail, which CORROBORATES an already-filed gap from the
+    # opposite direction: the GitHub issue predicted the storyboard step was
+    # unreachable; the BDD scenario independently shows the behavior is absent.
+    #
+    # Ledgered, not hidden: each carries the issue that owns the fix, and each
+    # graduates the moment that issue lands. See the PR description's
+    # "corroborated gaps" table for the full evidence chain.
+    #
+    # Re-derived at this head; the previous reason here was wrong in both of its
+    # claims. Re-cancel does NOT return silent success and production DOES have a
+    # terminal-state guard: src/core/tools/media_buy_update.py:411 raises
+    # AdCPGoneError, which the boundary translates to INVALID_STATE
+    # ("Cannot update media buy in terminal state: canceled"). The scenario fails
+    # on the CODE, not on the absence of enforcement.
+    #
+    # The gap is code specialization. The pinned enum carries both codes, both
+    # `recovery: correctable` (tests/fixtures/adcp_schemas_pinned/enums/error-code.json),
+    # and BR-UC-003-update-media-buy.feature:2094-2097 states the split correctly:
+    # INVALID_STATE covers non-cancel updates to a terminal buy, while
+    # NOT_CANCELLABLE is reserved for re-cancel attempts specifically.
+    #
+    # Graduation trigger: NOT #1261 (silent-ignore of `canceled`) -- landing that
+    # leaves INVALID_STATE in place and this scenario still red. #1961 is the
+    # sibling on the A2A `on_cancel_task` surface, not this one. No issue
+    # currently owns specializing the code on update_media_buy; this entry
+    # graduates when one lands.
+    "T-UC-003-storyboard-not-cancellable-on-recancel": (
+        "re-cancel is refused with the generic INVALID_STATE; the pinned enum reserves "
+        "NOT_CANCELLABLE for a refused cancel specifically — a code-specialization gap, "
+        "not a missing terminal-state guard (that guard is media_buy_update.py:411)"
+    ),
+    # GH #1075 -- idempotency_key support on update_media_buy and sync_creatives.
+    "T-UC-006-idempotency-replay": (
+        "sync_creatives re-executes the write on a repeated idempotency_key; no replay "
+        "record exists in production — GH #1075"
+    ),
+    "T-UC-006-idempotency-conflict": (
+        "sync_creatives does not detect a materially different payload under a reused "
+        "idempotency_key; no payload hash is stored — GH #1075"
+    ),
+    # FIXME: UC-003 main/alt-timing — production doesn't populate these fields
     # Steps have hard assertions now; xfail at scenario level until production catches up.
     "T-UC-003-main": "implementation_date, budget, sandbox not populated in update response — spec-production gap",
     "T-UC-003-alt-timing": "implementation_date not populated in update response — spec-production gap",
-    # FIXME(salesagent-ghgx): UC-003 pause — sandbox flag not populated in update response
+    # FIXME: UC-003 pause — sandbox flag not populated in update response
     "T-UC-003-alt-pause": "sandbox not populated in pause response — spec-production gap",
-    # FIXME(salesagent-ghgx): UC-003 optimization_goals — affected_packages empty in response
+    # FIXME: UC-003 optimization_goals — affected_packages empty in response
     "T-UC-003-alt-optimization-goals": "affected_packages not populated for optimization_goals changes — spec-production gap",
-    # FIXME(salesagent-javy): UC-003 ext-t — invoice_recipient authorization (BR-RULE-214) not implemented;
+    # FIXME: UC-003 ext-t — invoice_recipient authorization (BR-RULE-214) not implemented;
     # production accepts the override without an authorization check, so no VALIDATION_ERROR is raised.
-    "T-UC-003-ext-t": "invoice_recipient authorization not implemented (BR-RULE-214) — production gap salesagent-javy",
-    # FIXME(salesagent-u35g): UC-003 ext-u — new_packages midflight-additions capability check
+    "T-UC-003-ext-t": "invoice_recipient authorization not implemented (BR-RULE-214) — production gap",
+    # FIXME: UC-003 ext-u — new_packages midflight-additions capability check
     # (BR-RULE-217 -> UNSUPPORTED_FEATURE) not implemented; production accepts new_packages unhandled.
-    "T-UC-003-ext-u": "new_packages midflight capability check not implemented (BR-RULE-217) — production gap salesagent-u35g",
-    # FIXME(salesagent-12nd): UC-002 ASAP — response doesn't expose resolved start_time
+    "T-UC-003-ext-u": "new_packages midflight capability check not implemented (BR-RULE-217) — production gap",
+    # FIXME: UC-002 ASAP — response doesn't expose resolved start_time
     "T-UC-002-alt-asap": "response lacks resolved start_time field — spec-production gap",
-    # FIXME(salesagent-fie): UC-002 error code mismatch — Pydantic VALIDATION_ERROR vs spec INVALID_REQUEST
+    # FIXME: UC-002 error code mismatch — Pydantic VALIDATION_ERROR vs spec INVALID_REQUEST
     "T-UC-002-inv-087-5": "duplicate optimization_goals priority: VALIDATION_ERROR instead of INVALID_REQUEST — spec-production gap",
     "T-UC-002-inv-087-6": "empty optimization_goals array: VALIDATION_ERROR instead of INVALID_REQUEST — spec-production gap",
     "T-UC-002-inv-087-7": "per_ad_spend without value_field: VALIDATION_ERROR instead of INVALID_REQUEST — spec-production gap",
-    # FIXME(beads-dul): disclosure_positions filter not implemented in production
+    # FIXME(#1660): disclosure_positions filter not implemented in production
     # Note: violated/nofield pass vacuously (field rejected at schema level)
     "T-UC-005-inv-049-8-holds": "disclosure_positions filter not implemented",
     # adcp 3.12: FormatCategory/type filter removed from ListCreativeFormatsRequest.
@@ -205,23 +260,23 @@ _XFAIL_TAGS: dict[str, str] = {
     "production populates >=DEFAULT_AGENT over real transports (mock limitation, not a spec-production gap)",
     # FIXME: T-UC-005-main — format 'audio-spot' has no assets or renders (all transports)
     "T-UC-005-main": "some formats (e.g. audio-spot) lack asset_requirements and render_capabilities — spec-production gap",
-    # Partially graduated: dispatch fix landed (salesagent-40kk); error code mismatch remains
-    # FIXME(salesagent-40kk): production raises AUTH_REQUIRED, spec expects TENANT_REQUIRED
+    # Partially graduated: dispatch fix landed; error code mismatch remains
+    # FIXME: production raises AUTH_REQUIRED, spec expects TENANT_REQUIRED
     "T-UC-005-ext-a": "error code AUTH_REQUIRED instead of TENANT_REQUIRED — spec-production gap",
-    # Graduated: creative agent partition/boundary tests (salesagent-7fqx)
+    # Graduated: creative agent partition/boundary tests
     # Steps now dispatch through harness — all 34 tests pass across 4 transports.
-    # FIXME(beads-dul): suggestion field not in production error model
+    # FIXME(#1660): suggestion field not in production error model
     # NOTE(ah98 red-step inspection, 2026-07-06): NOT graduatable as-is — the
     # When step no-ops (type filter removed in adcp 3.12), so the scenario
     # fails on "operation should fail", not on the missing suggestion.
     # Suggestion parity for list_creative_formats is pinned instead by
     # tests/integration/test_request_validation_suggestion_parity.py.
     "T-UC-005-ext-b": "suggestion field not implemented in error responses",
-    # FIXME(beads-dul): disclosure validation errors not implemented
+    # FIXME(#1660): disclosure validation errors not implemented
     "T-UC-005-ext-b-disclosure-invalid": "disclosure_positions validation not implemented",
     "T-UC-005-ext-b-disclosure-empty": "disclosure_positions validation not implemented",
     "T-UC-005-ext-b-disclosure-dupes": "disclosure_positions validation not implemented",
-    # FIXME(beads-dul): specific error codes (OUTPUT_FORMAT_IDS_EMPTY etc.)
+    # FIXME(#1660): specific error codes (OUTPUT_FORMAT_IDS_EMPTY etc.)
     # not produced by production — Pydantic gives generic VALIDATION_ERROR
     "T-UC-005-ext-b-output-empty": "specific validation error codes not implemented",
     "T-UC-005-ext-b-output-invalid": "specific validation error codes not implemented",
@@ -229,30 +284,30 @@ _XFAIL_TAGS: dict[str, str] = {
     "T-UC-005-ext-b-input-empty": "specific validation error codes not implemented",
     "T-UC-005-ext-b-input-invalid": "specific validation error codes not implemented",
     "T-UC-005-ext-b-input-noid": "specific validation error codes not implemented",
-    # FIXME(salesagent-9vgz.5): unknown targeting field caught at wrong layer
+    # FIXME: unknown targeting field caught at wrong layer
     # Targeting uses extra=get_pydantic_extra_mode(): 'forbid' in dev (ValidationError at parse time),
     # 'ignore' in prod (field silently dropped). Neither produces INVALID_REQUEST.
     # Spec expects business-logic validation with INVALID_REQUEST code and suggestion field.
     "T-UC-002-ext-f": "unknown targeting field caught by Pydantic (VALIDATION_ERROR), not business logic (INVALID_REQUEST) — spec-production gap",
-    # FIXME(salesagent-scxw): the error CODE is fixed (currency-not-supported now
+    # FIXME: the error CODE is fixed (currency-not-supported now
     # raises AdCPCapabilityNotSupportedError -> UNSUPPORTED_FEATURE, verified by
     # tests/integration/test_currency_not_supported_error_code.py). But this scenario
     # selects a non-default-currency pricing_option_id, and create_media_buy derives
     # request_currency from the product's FIRST pricing option — it never validates the
     # SELECTED option's currency — so the create SUCCEEDS instead of failing. Graduates
     # once selected-option currency validation lands (#1417).
-    "T-UC-002-ext-d": "selected pricing-option currency not validated against CurrencyLimit; create succeeds instead of UNSUPPORTED_FEATURE — spec-production gap (salesagent-scxw)",
+    "T-UC-002-ext-d": "selected pricing-option currency not validated against CurrencyLimit; create succeeds instead of UNSUPPORTED_FEATURE — spec-production gap",
     # Graduated (#1417/gh8p.10): duplicate product_id now raises AdCPValidationError
     # with a buyer-facing suggestion ("Each package must reference a distinct
     # product_id ..."), surfaced on the wire. T-UC-002-ext-e passes.
-    # FIXME(salesagent-lp0x): stale .feature expectation, NOT a production gap.
+    # FIXME: stale .feature expectation, NOT a production gap.
     # Production correctly emits BUDGET_EXCEEDED for "daily budget exceeds cap"
     # (AdCPBudgetExceededError; verified at wire on mcp/rest/a2a). v3.1 renamed the
     # code BUDGET_TOO_LOW -> BUDGET_EXCEEDED for BR-RULE-012 "exceeds cap"
     # (adcp-req .impl-coverage/BR-UC-002.yaml:1198); the generated .feature still
     # asserts the pre-v3.1 BUDGET_TOO_LOW. Graduates once adcp-req is reconciled and
     # BR-UC-002 is regenerated (#1417). Strict xfail; assertion unchanged.
-    "T-UC-002-ext-k": "generated .feature asserts pre-v3.1 BUDGET_TOO_LOW; production correctly emits BUDGET_EXCEEDED — stale spec, pending upstream regen (salesagent-lp0x)",
+    "T-UC-002-ext-k": "generated .feature asserts pre-v3.1 BUDGET_TOO_LOW; production correctly emits BUDGET_EXCEEDED — stale spec, pending upstream regen",
     # FIXME(#1417): proposal-based create_media_buy is an unbuilt spec feature.
     # BR-UC-002-alt-proposal (status: active) + BR-UC-002-ext-l/ext-m define a full
     # proposal flow: resolve proposal_id, expiry check (PROPOSAL_EXPIRED), and
@@ -267,20 +322,20 @@ _XFAIL_TAGS: dict[str, str] = {
     # Graduated (#1417): the .feature now asserts the standard VALIDATION_ERROR
     # (PRICING_ERROR is not in the AdCP vocabulary @04f59d2d5) and production emits it with
     # a recovery suggestion. T-UC-002-ext-n / -ext-n-bid / -ext-n-floor pass; xfails removed.
-    # FIXME(salesagent-9vgz.15): production errors lack suggestion field
+    # FIXME: production errors lack suggestion field
     # AdCPNotFoundError/AdCPValidationError/AdCPAdapterError raised with details={"error_code": ...}
     # but no details["suggestion"]. Spec requires suggestion for buyer remediation.
-    # FIXME(salesagent-9vgz.6): creative/format_id validation errors lack suggestion field
+    # FIXME: creative/format_id validation errors lack suggestion field
     # ext-g: _validate_creatives_before_adapter_call raises INVALID_CREATIVES without suggestion
     # ext-h: plain string format_id caught by Pydantic, not structured AdCPError
     # ext-h-agent: _validate_and_convert_format_ids is dead code — unregistered agent not detected
     "T-UC-002-ext-h": "plain string format_id produces Pydantic error, not AdCPError with suggestion",
     "T-UC-002-ext-h-agent": "unregistered agent_url validation not wired — _validate_and_convert_format_ids is dead code",
-    # FIXME(salesagent-9vgz.8): auth error lacks suggestion field
+    # FIXME: auth error lacks suggestion field
     # AdCPAuthenticationError("Principal ID not found...") has no details["suggestion"].
     # Spec requires suggestion for buyer remediation (POST-F3).
     "T-UC-002-ext-i": "auth error lacks suggestion field — spec-production gap",
-    # FIXME(salesagent-9vgz.8): adapter failure raises exception instead of returning failed result
+    # FIXME: adapter failure raises exception instead of returning failed result
     # Production wraps adapter exceptions as AdCPAdapterError and re-raises instead of
     # returning CreateMediaBuyResult(status="failed"). Also no suggestion field on error.
     "T-UC-002-ext-j": "adapter failure raises exception, no failed result envelope or suggestion — spec-production gap",
@@ -290,43 +345,43 @@ _XFAIL_TAGS: dict[str, str] = {
     # field-aware suggestion (suggest_validation_fix) and attaches it to the
     # AdCPValidationError, so a missing idempotency_key rejects with a non-empty
     # wire suggestion. T-UC-002-v31-idempotency-missing passes.
-    # FIXME(salesagent-9vgz.17): optimization_goals not in adcp v3.6.0 or production schemas
+    # FIXME: optimization_goals not in adcp v3.6.0 or production schemas
     # PackageRequest(extra='forbid') rejects the field with generic validation error,
     # not spec-expected UNSUPPORTED_FEATURE / INVALID_REQUEST with structured codes.
     "T-UC-002-ext-u": "optimization_goals not in production schemas — spec-production gap",
     "T-UC-002-ext-u-event": "optimization_goals not in production schemas — spec-production gap",
-    # RESOLVED(salesagent-fpi): optimization_goals now accepted by production schemas (UC-003).
+    # RESOLVED: optimization_goals now accepted by production schemas (UC-003).
     # Removed stale xfails: T-UC-002-partition-optimization-goals, T-UC-002-boundary-optimization-goals
     # Valid rows now pass; invalid rows xfail via _assert_error_outcome _SPEC_PRODUCTION_CODE_MAP.
     # Removed: T-UC-003-partition-optimization-goals, T-UC-003-boundary-optimization-goals, T-UC-003-alt-optimization-goals
     # NOTE: principal-ownership error code gap handled in _assert_error_outcome (PERMISSION_DENIED→AUTHORIZATION_ERROR)
-    # RESOLVED(salesagent-0t6h): UpdateMediaBuySuccess status="submitted" now handled
+    # RESOLVED: UpdateMediaBuySuccess status="submitted" now handled
     # by then_response_status (empty affected_packages = approval pending).
     # Removed T-UC-003-alt-manual xfail — tests pass with the fix.
-    # FIXME(salesagent-9vgz.19): catalog validation not implemented in production
+    # FIXME: catalog validation not implemented in production
     # PackageRequest accepts catalogs (inherited from adcp library) but production
     # code never validates duplicate types or catalog_id existence.
     "T-UC-002-ext-v": "catalog validation not implemented in production — spec-production gap",
     "T-UC-002-ext-v-notfound": "catalog validation not implemented in production — spec-production gap",
-    # FIXME(salesagent-9vgz.2): proposal-based creation not implemented in production
+    # FIXME: proposal-based creation not implemented in production
     # proposal_id exists on adcp library CreateMediaBuyRequest but production code
     # never reads it — no proposal store, no allocation derivation, no budget distribution.
     "T-UC-002-alt-proposal": "proposal-based creation not implemented in production — spec-production gap",
-    # FIXME(salesagent-9vgz.23): pricing XOR invariant not enforced during create_media_buy
+    # FIXME: pricing XOR invariant not enforced during create_media_buy
     # Schema-level validate_pricing_option() enforces XOR but _validate_pricing_model_selection()
     # works at ORM level (is_fixed + rate + price_guidance) and doesn't check for both/neither.
     "T-UC-002-inv-006-3": "pricing XOR invariant (both set) not validated in create flow — spec-production gap",
     "T-UC-002-inv-006-4": "pricing XOR invariant (neither set) error lacks suggestion field — spec-production gap",
-    # RESOLVED(salesagent-bo6): budget positivity validation now works — removed stale xfail T-UC-002-inv-008-2
-    # FIXME(salesagent-9vgz.27): ASAP case sensitivity error code mismatch
+    # RESOLVED: budget positivity validation now works — removed stale xfail T-UC-002-inv-008-2
+    # FIXME: ASAP case sensitivity error code mismatch
     # Production: Pydantic rejects "ASAP" → ValidationError, spec expects INVALID_REQUEST.
     "T-UC-002-inv-013-5": "INVALID_REQUEST error code not implemented for wrong-case ASAP — spec-production gap",
-    # FIXME(salesagent-9vgz.94): sandbox mode not implemented in create_media_buy
+    # FIXME: sandbox mode not implemented in create_media_buy
     # CreateMediaBuyResult has no sandbox field; no sandbox suppression logic exists.
     # sandbox-production passes vacuously (sandbox absent from response by default).
     "T-UC-002-sandbox-happy": "sandbox mode not implemented in create_media_buy — spec-production gap",
     "T-UC-002-sandbox-validation": "sandbox mode not implemented in create_media_buy — spec-production gap",
-    # FIXME(salesagent-gh8p.13 / production-gap bead): natural-key sandbox resolution
+    # FIXME(production-gap bead): natural-key sandbox resolution
     # without prior provisioning is unimplemented. _resolve_by_natural_key
     # (account_helpers.py:110) requires the sandbox account to already exist —
     # raises ACCOUNT_NOT_FOUND rather than auto-provisioning — and
@@ -334,8 +389,8 @@ _XFAIL_TAGS: dict[str, str] = {
     # real natural-key create on the wire; flips to a pass when sandbox
     # auto-provisioning + the sandbox echo land. BR-RULE-209 INV-8.
     "T-UC-002-sandbox-natural-key": "natural-key sandbox auto-provisioning + sandbox echo not implemented "
-    "in create_media_buy (ACCOUNT_NOT_FOUND without prior provisioning) — spec-production gap (salesagent-gh8p.13)",
-    # FIXME(salesagent-9vgz.1): inline creative upload not persisted in create_media_buy
+    "in create_media_buy (ACCOUNT_NOT_FOUND without prior provisioning) — spec-production gap",
+    # FIXME: inline creative upload not persisted in create_media_buy
     # process_and_upload_package_creatives → _sync_creatives_impl should persist
     # creatives to DB, but the Then step "upload creatives to creative library" fails
     # because no Creative rows exist after creation. Gap was previously masked by
@@ -345,16 +400,16 @@ _XFAIL_TAGS: dict[str, str] = {
     # Test passes trivially; real HMAC assertion gap tracked separately.
     # RESOLVED: T-UC-004-webhook-creds-short — DB setup fix exposed that Then steps are pending (no-op).
     # Test passes trivially; real credential assertion gap tracked separately.
-    # FIXME(salesagent-n3y): UC-002 account field absent — production doesn't require account field
+    # FIXME: UC-002 account field absent — production doesn't require account field
     # Spec says account is required (BR-RULE-080 INV-1), but production accepts requests without it.
     "T-UC-002-inv-080-1": "account field not required by production — spec-production gap",
-    # FIXME(salesagent-9vgz.92): rate limiting + payload size validation not implemented
+    # FIXME: rate limiting + payload size validation not implemented
     # Rate limiting middleware does not exist (AdCPRateLimitError never raised).
     # No ASGI middleware checks content-length for oversized bodies.
     "T-UC-002-nfr-001": "rate limiting + payload size validation not implemented — spec-production gap",
 }
 
-# FIXME(beads-dul): Selective xfail for parametrized scenarios where only
+# Selective xfail for parametrized scenarios where only
 # some examples exercise unimplemented features. Each entry: (tag, node_id
 # substrings that should xfail, reason).
 _SELECTIVE_XFAIL: list[tuple[str, set[str], str]] = [
@@ -429,7 +484,7 @@ _SELECTIVE_XFAIL: list[tuple[str, set[str], str]] = [
     # Graduated: T-UC-005-boundary-asset-types (all 4 transports pass — brief/catalog now in enum)
     # Graduated: T-UC-005-partition-agent-type, T-UC-005-boundary-agent-type,
     # T-UC-005-boundary-agent-asset — all pass now that When steps dispatch through harness.
-    # FIXME(salesagent-4ydt): BR-RULE-029 defines 4 notification types but production
+    # FIXME: BR-RULE-029 defines 4 notification types but production
     # WebhookDeliveryService only emits {scheduled, final, adjusted}. No is_delayed flag.
     (
         "T-UC-004-webhook-notification-type",
@@ -455,6 +510,99 @@ _MCP_SELECTIVE_XFAIL: list[tuple[str, set[str], str, bool]] = []
 # UC-005 filter tags that still cannot hold are not REST-specific: inv-031-1-holds
 # / inv-031-1-violated stay xfailed via _XFAIL_TAGS because adcp 3.12 removed the
 # `type` filter for ALL transports (not a REST body issue).
+
+
+#: Causes a typed xfail reason may declare. A reason whose ``cause=`` is not here is a
+#: typo or an invention, and either way the row it exempts would be silently mis-routed.
+#:
+#: ENUMERATED FROM THE TREE, not chosen. The first version of this set was written from
+#: imagination -- "spec-gap", "harness-gap", "upstream-defect" -- none of which exists
+#: here, while the real "harness-limitation" was missing, so every typed reason in the
+#: suite failed to parse. An AST scan of the strings that actually BEGIN with "cause="
+#: gives the population; extend these sets from that scan, never from a guess.
+_XFAIL_CAUSES = frozenset({"transport-drops-parameter", "production-gap", "harness-limitation"})
+
+#: Scopes a typed xfail reason may declare.
+_XFAIL_SCOPES = frozenset({"per-transport", "transport-independent"})
+
+#: The DECLARATION: a run of ``key=value`` tokens at the HEAD of the reason, ending at
+#: the first word that is not one. Anchored with ``\A`` so prose later in the string is
+#: not part of the declaration -- which is the entire point of parsing instead of
+#: substring-matching.
+_XFAIL_DECLARATION_RE = re.compile(r"\A(?:\s*(?:cause|scope|ref)=\S+)+")
+_XFAIL_TOKEN_RE = re.compile(r"(?P<key>cause|scope|ref)=(?P<value>\S+)")
+
+
+class XfailReasonError(AssertionError):
+    """A typed xfail reason declares a token this suite does not recognise."""
+
+
+class XfailReason(NamedTuple):
+    """The parsed form of a ``cause=... scope=... ref=...`` xfail reason."""
+
+    cause: str
+    scope: str
+    ref: str
+
+
+def parse_xfail_reason(reason: str) -> XfailReason | None:
+    """Parse a typed xfail reason, or return None if it is free text.
+
+    Why a parse and not a tighter substring match. The predicate this replaces asked
+    ``"scope=per-transport" in reason``, and that is satisfied by any text CONTAINING the
+    phrase -- including a sentence *describing* the token. Measured: retyping the
+    declaration at :687 while leaving the prose at :706 ("scope=per-transport because each
+    transport enforces ... independently") changed the collected set by ZERO rows. The
+    declaration was decorative and the English sentence was load-bearing, by accident.
+    A substring predicate cannot tell a declaration from a description of one; only
+    position can, so ONLY the leading run of ``key=value`` tokens is read — the
+    declaration ends at the first word that is not one, and everything after it is prose
+    the parser never consults.
+
+    Free text returns None rather than raising: 62 reasons in this tree are prose, three
+    of them carrying unrelated ``k=`` pairs, and sweeping them is not this change's job.
+    Only a reason that ANNOUNCES itself typed -- by OPENING with a run of ``key=value``
+    tokens, in any order -- is held to the vocabulary. A reason that merely mentions one
+    later is prose.
+
+    The residue, stated rather than papered over: a typo in ``cause=`` ITSELF -- or in the
+    leading token's key, which is the same thing -- degrades the reason into free text and
+    returns None. So this DETECTS an unknown value; it does not make one unrepresentable.
+    Leading whitespace is tolerated (``lstrip``) so that a reason indented in a source
+    literal is still recognised as typed rather than silently becoming prose.
+    """
+    # Recognition is the leading TOKEN RUN, not the literal "cause=". Gating on that
+    # keyword made a complete, in-vocabulary declaration whose tokens were written in a
+    # different ORDER — `scope=... cause=... ref=...` — classify as free text and route
+    # nothing, silently: exactly the drop this function exists to prevent, reachable by
+    # word order rather than by a typo. All three live reasons happen to lead with
+    # `cause=`, so it was latent, in the same way the first-occurrence bug was.
+    # Only the leading declaration is parsed. Scanning the whole string was the first
+    # version of this function and it carried the defect it was written to remove:
+    #   'cause=production-gap — unlike scope=per-transport rows this one is global.
+    #    scope=transport-independent ref=#1607'
+    # parsed to scope='per-transport', because finditer took the first match ANYWHERE and
+    # the first one was inside an English sentence. A reason DECLARING
+    # transport-independent would have been routed per-transport by its own prose. The
+    # live reason at conftest.py:781 contains 'This is NOT scope=per-transport' and
+    # parsed correctly only because its declaration happened to come first — one word
+    # order away from wrong.
+    declaration = _XFAIL_DECLARATION_RE.match(reason.lstrip())
+    if declaration is None:
+        return None
+    found: dict[str, str] = {}
+    for match in _XFAIL_TOKEN_RE.finditer(declaration.group(0)):
+        found.setdefault(match.group("key"), match.group("value").rstrip(",;."))
+    missing = {"cause", "scope", "ref"} - found.keys()
+    if missing:
+        raise XfailReasonError(f"typed xfail reason is missing {sorted(missing)}: {reason!r}")
+    if found["cause"] not in _XFAIL_CAUSES:
+        raise XfailReasonError(f"unknown xfail cause={found['cause']!r} in {reason!r}; known: {sorted(_XFAIL_CAUSES)}")
+    if found["scope"] not in _XFAIL_SCOPES:
+        raise XfailReasonError(f"unknown xfail scope={found['scope']!r} in {reason!r}; known: {sorted(_XFAIL_SCOPES)}")
+    if not found["ref"].startswith("#"):
+        raise XfailReasonError(f"xfail ref={found['ref']!r} must be an issue reference like '#1607': {reason!r}")
+    return XfailReason(cause=found["cause"], scope=found["scope"], ref=found["ref"])
 
 
 def pytest_collection_modifyitems(items: list[pytest.Item]) -> None:
@@ -516,7 +664,7 @@ def pytest_collection_modifyitems(items: list[pytest.Item]) -> None:
                         item.add_marker(pytest.mark.xfail(reason=reason, strict=strict))
                     break
 
-        # UC-011 REST: per-request auth implemented (salesagent-xms)
+        # UC-011 REST: per-request auth implemented
         # UC-011 MCP: billing policy and approval mode now populated from DB via
         # account_approval_mode column + proper harness writes (#1184 complete).
 
@@ -562,7 +710,7 @@ def pytest_collection_modifyitems(items: list[pytest.Item]) -> None:
         #   the last_a2a_task guard is Transport.A2A-gated and inert on e2e_rest.
         # No UC-003 entries remain in e2e_rest_known_failures.txt — no sibling conflict.
 
-        # FIXME(salesagent-nmg9, salesagent-rwly, salesagent-hamk): E2E_REST —
+        # FIXME: E2E_REST —
         # set_registry_formats has no sidecar mock path. Docker's real creative
         # agent serves its own catalog, so scenarios that inject specific format
         # fixtures via Given steps and assert on those names can't run against
@@ -594,7 +742,7 @@ def pytest_collection_modifyitems(items: list[pytest.Item]) -> None:
                 )
             )
 
-        # FIXME(salesagent-got8): E2E_REST — webhook/circuit assertions observe
+        # FIXME: E2E_REST — webhook/circuit assertions observe
         # env.mock['post'] or CircuitBreaker state, neither of which is visible
         # through the Docker HTTP path. Remove when an E2E webhook receiver or
         # circuit-breaker introspection is available.
@@ -629,7 +777,7 @@ def pytest_collection_modifyitems(items: list[pytest.Item]) -> None:
         # (GA L3 error-handling). The two Scenario-Outline rows that asserted
         # VALIDATION_ERROR were corrected to INVALID_REQUEST in the same change.
 
-        # FIXME(salesagent-9vgz.14): UC-003 keyword_targets_add — production applies the
+        # FIXME: UC-003 keyword_targets_add — production applies the
         # keyword additions but returns empty affected_packages. All transports pass the When
         # step (no error) but the Then step "affected_packages including pkg_001" fails.
         if "T-UC-003-alt-keyword-ops" in marker_names:
@@ -640,7 +788,7 @@ def pytest_collection_modifyitems(items: list[pytest.Item]) -> None:
                 )
             )
 
-        # FIXME(salesagent-9vgz.11): UC-003 inline creatives — _sync_creatives_impl
+        # FIXME: UC-003 inline creatives — _sync_creatives_impl
         # FK violation: creative_assignments references creative before commit.
         # _sync_creatives_impl uses its own UoW scope; assignment FK check fails
         # because the creative hasn't been committed in the outer transaction yet.
@@ -652,7 +800,89 @@ def pytest_collection_modifyitems(items: list[pytest.Item]) -> None:
                 )
             )
 
-        # FIXME(salesagent-05b): UC-003 extension/error scenarios — production uses
+        # T-UC-003-boundary-revision is wired (see _UC003_REVISION_TAGS and the
+        # uc003-manual-approval row in the routing registry below), so its steps
+        # RUN and each row fails or passes on its own assertion. Routing is per ROW,
+        # selected on the Examples `outcome` column rather than a node-id substring, so
+        # a row that changes its expected outcome stops matching instead of silently
+        # keeping someone else's exemption.
+        #
+        # Two rows expect CONFLICT and are the coverage half of #1607. Verified failure:
+        # `_assert_error_outcome` raises `AssertionError: Expected an error for outcome:
+        # error "CONFLICT" with suggestion` — an assertion about a response that came
+        # back 200 OK, NOT a StepDefinitionNotFoundError. Production accepts the stale
+        # and ahead tokens on a2a, mcp and rest and returns success; enforcement is what
+        # #1607 owns. strict=True so implementing it XPASSes and the graduation workflow
+        # catches the row rather than letting it sit green-by-omission.
+        #
+        # One row expects INVALID_REQUEST for revision 0 and fails for a DIFFERENT
+        # reason, which is why it is not filed under #1607: production DOES reject it,
+        # but `UpdateMediaBuyRequest.revision` carries `ge=1`, so pydantic raises during
+        # request construction inside the step — before any transport dispatch. The row
+        # cannot grade the seller's response because the request never reaches the
+        # seller. That is a harness limitation, not a production gap, and calling it one
+        # is the exact mislabelling this task exists to stop.
+        if marker_names & {"T-UC-003-boundary-revision", "T-UC-003-partition-revision"}:
+            # pytest-bdd nests a Scenario Outline's Examples row under the single
+            # `_pytest_bdd_example` param rather than exposing each column, so reading
+            # `params["outcome"]` returns None and every row falls through unrouted.
+            _row = (getattr(item, "callspec", None) and item.callspec.params.get("_pytest_bdd_example")) or {}
+            _row_outcome = str(_row.get("outcome") or "")
+            if "CONFLICT" in _row_outcome and is_a2a:
+                # a2a fails EARLIER than the others and for a different reason, so it
+                # does not carry #1607's label. Measured: a probe in _update_media_buy_impl
+                # reads `req.revision=None` on a2a and `6` on mcp/rest, because
+                # _handle_update_media_buy_skill rebuilds the request from five hand-listed
+                # fields and forwards another hand-listed subset — `revision` is in neither.
+                # Implementing CONFLICT would NOT xpass this row; the token never arrives.
+                item.add_marker(
+                    pytest.mark.xfail(
+                        reason=(
+                            "cause=transport-drops-parameter scope=per-transport ref=#1885 — the "
+                            "a2a skill handler discards `revision` before it reaches the tool, so "
+                            "this row cannot grade CONFLICT enforcement on a2a at all. NOT #1607: "
+                            "enforcing the check would leave this row red. #1885 is the remedy — "
+                            "route the handler through media_buy_update._build_update_request, which "
+                            "already forwards every field — so closing it makes this row gradeable. "
+                            "#1259 owns the separate question of why no guard sees the drop."
+                        ),
+                        strict=True,
+                    )
+                )
+            elif "CONFLICT" in _row_outcome:
+                item.add_marker(
+                    pytest.mark.xfail(
+                        reason=(
+                            "cause=production-gap scope=per-transport ref=#1607 — update_media_buy "
+                            "accepts a stale or ahead revision and returns success; the spec MUST "
+                            "reject it with CONFLICT. Steps execute, the token arrives (probed: "
+                            "req.revision=6 on mcp and rest), and the failure is the missing "
+                            "rejection. scope=per-transport because each transport enforces (or "
+                            "fails to enforce) independently, so each must xpass on its own when "
+                            "#1607 lands."
+                        ),
+                        strict=True,
+                    )
+                )
+            elif "INVALID_REQUEST" in _row_outcome:
+                item.add_marker(
+                    pytest.mark.xfail(
+                        reason=(
+                            "cause=harness-limitation scope=transport-independent ref=#1607 — "
+                            "revision 0 is rejected by UpdateMediaBuyRequest's ge=1 during request "
+                            "construction in the step, so the request never reaches the seller and "
+                            "this row cannot grade the seller's INVALID_REQUEST response. Not a "
+                            "production gap. REMEDY: build the raw payload instead of the typed "
+                            "model, so the seller sees the request. Note the scenario only means "
+                            "anything against a NON-conforming client — a conforming one is stopped "
+                            "by its own SDK before the wire, which is why the request-construction "
+                            "path has to be bypassed deliberately rather than fixed."
+                        ),
+                        strict=True,
+                    )
+                )
+
+        # FIXME: UC-003 extension/error scenarios — production uses
         # different error codes than spec, or doesn't validate at all. These are
         # spec-production gaps where the step definitions are correct but production
         # code doesn't implement the expected validation.
@@ -669,19 +899,19 @@ def pytest_collection_modifyitems(items: list[pytest.Item]) -> None:
             # Production doesn't validate these cases at all
             "T-UC-003-ext-e": "production doesn't validate end_time < start_time on update",
             "T-UC-003-ext-e-equal": "production doesn't validate end_time == start_time on update",
-            # FIXME(salesagent-lp0x): stale .feature expectation, NOT a production gap.
+            # FIXME: stale .feature expectation, NOT a production gap.
             # Production validates currency on update and correctly emits
             # UNSUPPORTED_FEATURE (AdCPCapabilityNotSupportedError, media_buy_update.py:441;
             # verified at wire on mcp/rest/a2a). The generated .feature asserts INVALID_REQUEST.
             # UNSUPPORTED_FEATURE is the authoritative code (adcp-req BR-UC-002 impl-coverage;
             # matches UC-002 ext-d). Graduates after upstream regen.
-            "T-UC-003-ext-f": "generated .feature asserts INVALID_REQUEST; production correctly emits UNSUPPORTED_FEATURE for unsupported currency on update — stale spec, pending upstream regen (salesagent-lp0x)",
-            # FIXME(salesagent-lp0x): stale .feature expectation, NOT a production gap.
+            "T-UC-003-ext-f": "generated .feature asserts INVALID_REQUEST; production correctly emits UNSUPPORTED_FEATURE for unsupported currency on update — stale spec, pending upstream regen",
+            # FIXME: stale .feature expectation, NOT a production gap.
             # Production validates the daily spend cap on update and correctly emits
             # BUDGET_EXCEEDED (AdCPBudgetExceededError, media_buy_update.py:484;
             # verified at wire on mcp/rest/a2a). The generated .feature asserts the
             # pre-v3.1 BUDGET_TOO_LOW (see UC-002 ext-k). Graduates after upstream regen.
-            "T-UC-003-ext-g": "generated .feature asserts pre-v3.1 BUDGET_TOO_LOW; production validates and correctly emits BUDGET_EXCEEDED — stale spec, pending upstream regen (salesagent-lp0x)",
+            "T-UC-003-ext-g": "generated .feature asserts pre-v3.1 BUDGET_TOO_LOW; production validates and correctly emits BUDGET_EXCEEDED — stale spec, pending upstream regen",
             # Graduated (#1417/gh8p.10): a failed creative sync no longer crashes with an
             # FK violation. _process_assignments skips assignment for un-synced creatives,
             # and update_media_buy raises a clean retryable AdCPAdapterError carrying a
@@ -710,7 +940,7 @@ def pytest_collection_modifyitems(items: list[pytest.Item]) -> None:
                 )
                 break  # One xfail per scenario is sufficient
 
-        # FIXME(salesagent-gh8p.11 / production-gap bead): UC-003 ext-n insufficient
+        # FIXME(production-gap bead): UC-003 ext-n insufficient
         # privileges. Storyboard BR-UC-003-ext-n grounds an ADMIN-only adapter gate
         # (e.g. GAM guaranteed-item activation) that emits the canonical
         # PERMISSION_DENIED (pinned enum @04f59d2d5; reconciled from the prose's
@@ -728,12 +958,12 @@ def pytest_collection_modifyitems(items: list[pytest.Item]) -> None:
                     reason="production gap: no admin-only privilege gate on update_media_buy; "
                     "AdCP buyers have no principal-role concept and the fields-less request "
                     "short-circuits via empty-update INVALID_REQUEST before any adapter call "
-                    "(canonical target: PERMISSION_DENIED) — salesagent-gh8p.11",
+                    "(canonical target: PERMISSION_DENIED)",
                     strict=True,
                 )
             )
 
-        # FIXME(salesagent-gh8p.13 / production-gap bead): UC-003 ext-v cancellation
+        # FIXME(production-gap bead): UC-003 ext-v cancellation
         # refused. canceled IS a valid UpdateMediaBuyRequest field but production
         # never reads it, has no state-based NOT_CANCELLABLE check, and
         # has_updatable_fields() omits canceled — so a media_buy_id+canceled
@@ -746,7 +976,7 @@ def pytest_collection_modifyitems(items: list[pytest.Item]) -> None:
                 pytest.mark.xfail(
                     reason="production gap: update_media_buy never reads canceled and has no state-based "
                     "cancellation gate; has_updatable_fields() omits canceled so the request short-circuits "
-                    "via empty-update INVALID_REQUEST (canonical target: NOT_CANCELLABLE) — salesagent-gh8p.13",
+                    "via empty-update INVALID_REQUEST (canonical target: NOT_CANCELLABLE)",
                     strict=True,
                 )
             )
@@ -759,7 +989,7 @@ def pytest_collection_modifyitems(items: list[pytest.Item]) -> None:
         # would XPASS-fail.
 
         # --- UC-005: disclosure/asset scenarios with partial impl ---
-        # FIXME(beads-dul): disclosure_positions and brief/catalog asset types
+        # FIXME(#1660): disclosure_positions and brief/catalog asset types
         # partially implemented — some transport variants pass, others fail.
         # Must run BEFORE selective xfails (which use strict=True) to avoid
         # XPASS failures on transport variants that now pass.
@@ -789,7 +1019,7 @@ def pytest_collection_modifyitems(items: list[pytest.Item]) -> None:
             for tag, substrings, reason in _SELECTIVE_XFAIL:
                 if tag in marker_names:
                     if is_e2e_rest and tag in uc005_filter_e2e_untestable:
-                        # tolerate either outcome — see uc005_filter_e2e_reason (salesagent-7fye)
+                        # tolerate either outcome — see uc005_filter_e2e_reason
                         item.add_marker(pytest.mark.xfail(reason=uc005_filter_e2e_reason, strict=False))
                         break
                     if any(s in item.nodeid for s in substrings):
@@ -837,7 +1067,7 @@ def pytest_collection_modifyitems(items: list[pytest.Item]) -> None:
                     # stays strict for in-process transports where the registry mock is empty.
                     break
                 if is_e2e_rest and tag in uc005_filter_e2e_untestable:
-                    # tolerate either outcome — see uc005_filter_e2e_reason (salesagent-7fye)
+                    # tolerate either outcome — see uc005_filter_e2e_reason
                     item.add_marker(pytest.mark.xfail(reason=uc005_filter_e2e_reason, strict=False))
                     break
                 item.add_marker(pytest.mark.xfail(reason=reason, strict=True))
@@ -852,7 +1082,7 @@ def pytest_collection_modifyitems(items: list[pytest.Item]) -> None:
         # boundary as VALIDATION_ERROR. The feature outcomes were reconciled to
         # match production and the scenarios now pass on a2a/mcp/rest.
         _UC002_VALIDATION_XFAIL: list[tuple[str, set[str], str]] = [
-            # FIXME(salesagent-9vgz.61): daily spend cap error code mismatch
+            # FIXME: daily spend cap error code mismatch
             # Production raises plain ValueError → code="validation_error", no suggestion.
             # Spec expects BUDGET_TOO_LOW with suggestion field.
             (
@@ -865,7 +1095,7 @@ def pytest_collection_modifyitems(items: list[pytest.Item]) -> None:
                 {"daily budget > cap"},
                 "daily spend cap returns validation_error, not BUDGET_TOO_LOW — spec-production gap",
             ),
-            # FIXME(salesagent-9vgz.72): creative error code mismatch
+            # FIXME: creative error code mismatch
             # Production uses CREATIVES_NOT_FOUND / VALIDATION_ERROR / INVALID_CREATIVES,
             # spec expects CREATIVE_REJECTED. No max_creatives limit in production either.
             (
@@ -993,6 +1223,61 @@ def pytest_collection_modifyitems(items: list[pytest.Item]) -> None:
         # Production uses generic error codes / plain-string errors where the spec
         # demands specific codes and structured AdCPError with suggestion fields.
         _UC006_SPECGAP_XFAIL_TAGS: dict[str, str] = {
+            # Split out of @T-UC-006-storyboard-multi-format-sync.
+            # While the status obligation shared a scenario with the action
+            # obligations, its xfail ABORTED the scenario and the sibling
+            # action-value assertion never ran on any transport. It now owns a
+            # scenario, so the action half runs LIVE and this half is ledgered.
+            # Production defect: SyncCreativeResult deliberately never populates
+            # the inherited spec `status` (src/core/schemas/creative.py) — it
+            # stays None on the wire rather than carrying a creative-status enum.
+            # e2e_rest decision (owed explicitly by the lane's design): NO
+            # e2e_rest_known_failures.txt entry is required. These tag markers are
+            # applied here in pytest_collection_modifyitems with no transport
+            # gate, so they cover the e2e_rest param identically to a2a/mcp/rest.
+            # Routing the gap through the tag ledger therefore registers it once
+            # and grows NO ratchet — which is the whole point of preferring it to
+            # a per-nodeid entry.
+            "T-UC-006-storyboard-multi-format-sync-status": (
+                "SPEC-PRODUCTION GAP: SyncCreativeResult.status is never populated by production; "
+                "every per-creative status is None on the wire, not a creative-status enum value"
+            ),
+            # ── Storyboard provenance scenarios (#1858) ──────────────
+            # These carried per-assertion pytest.xfail() calls inside the step
+            # bodies, which turned ANY failure (a 401, a 500, a timeout) into a
+            # green "known gap". The gaps are real, so they are registered here
+            # the one sanctioned way — by scenario tag, strict=True — and the
+            # steps now assert unconditionally.
+            #
+            # Production defect: check_provenance_required
+            # (src/core/tools/creatives/_validation.py) only ever emits a soft
+            # WARNING on missing/incomplete provenance. It never produces a
+            # per-creative action="failed" nor the spec's PROVENANCE_REQUIRED /
+            # PROVENANCE_DIGITAL_SOURCE_TYPE_MISSING / PROVENANCE_DISCLOSURE_MISSING
+            # error codes.
+            "T-UC-006-storyboard-provenance-required-rejection": (
+                "SPEC-PRODUCTION GAP: structural provenance rejection is not implemented — "
+                "check_provenance_required emits a soft warning, never action='failed' with "
+                "PROVENANCE_REQUIRED"
+            ),
+            "T-UC-006-storyboard-provenance-digital-source-type-missing": (
+                "SPEC-PRODUCTION GAP: structural provenance rejection is not implemented — "
+                "no action='failed' with PROVENANCE_DIGITAL_SOURCE_TYPE_MISSING"
+            ),
+            "T-UC-006-storyboard-provenance-disclosure-missing": (
+                "SPEC-PRODUCTION GAP: structural provenance rejection is not implemented — "
+                "no action='failed' with PROVENANCE_DISCLOSURE_MISSING"
+            ),
+            # Distinct defect, same family: the internal Creative.provenance model
+            # (src/core/schemas/creative.py) is structurally incompatible with the
+            # wire-level adcp.types Provenance it is converted from (disclosure: str
+            # vs a Disclosure object, human_oversight: bool vs an enum, verification:
+            # dict vs a list), so even a well-formed corrected resubmission is rejected.
+            "T-UC-006-storyboard-provenance-corrected-acceptance": (
+                "SPEC-PRODUCTION GAP: internal Creative.provenance is structurally incompatible "
+                "with the wire-level adcp.types Provenance shape, so a spec-compliant corrected "
+                "resubmission is not accepted"
+            ),
             # Error-path scenarios: production returns CREATIVE_VALIDATION_FAILED or
             # plain-string errors[] instead of spec-specific error codes / AdCPError.
             # See _processing.py error handling paths.
@@ -1113,13 +1398,13 @@ def pytest_collection_modifyitems(items: list[pytest.Item]) -> None:
         # (integration CircuitBreakerEnv now has make_webhook_config/set_db_webhooks
         # so webhook POST fires on all transports)
 
-        # Graduated (salesagent-jr5b): UC-004 boundary-account a2a valid rows
+        # Graduated: UC-004 boundary-account a2a valid rows
         # ("account exists" / "single match" / "sandbox account exists") now resolve
         # once their accounts are seeded — the former "dict lacks .root serialization
         # gap" xfail was masking the missing seed, not a real transport gap.
 
         # --- UC-004: xfails for unimplemented production features ---
-        # FIXME(salesagent-ckb): These production features are not yet implemented.
+        # FIXME: These production features are not yet implemented.
         # strict=True: test MUST fail. strict=False: test MAY pass (some examples work).
         _UC004_XFAIL_TAGS: dict[str, tuple[str, bool]] = {
             # Empty array validation: schema allows [] but spec says reject
@@ -1156,7 +1441,7 @@ def pytest_collection_modifyitems(items: list[pytest.Item]) -> None:
                 break
 
         # UC-004: additional xfails for features needing production enhancements
-        # FIXME(salesagent-a0o): These require production changes, not BDD wiring.
+        # FIXME: These require production changes, not BDD wiring.
         _UC004_XFAIL_ADDITIONAL: dict[str, tuple[str, bool]] = {
             # Delivery response reports a date-derived status (media_buy_delivery.py
             # status computation casts to a Literal that excludes the pending_* states),
@@ -1183,7 +1468,7 @@ def pytest_collection_modifyitems(items: list[pytest.Item]) -> None:
             # regex step, so the window reaches production and INV-5 fires VALIDATION_ERROR
             # with a suggestion on a2a and e2e_rest). The old transport-blind strict marker
             # was stale — removed rather than re-scoped (BDD has no in-process/_impl variant).
-            # FIXME(salesagent-7ag5): _impl uses str(enum) instead of enum.value for sort_by metric
+            # FIXME: _impl uses str(enum) instead of enum.value for sort_by metric
             # T-UC-004-dim-sortby-valid: resolved — sort_by now works in _impl
             # Graduated: T-UC-004-dim-sortby-fallback (impl, mcp, rest pass — only a2a still fails)
             # T-UC-004-dim-supported: resolved — by_device_type now populated by _impl (#1376)
@@ -1290,7 +1575,7 @@ def pytest_collection_modifyitems(items: list[pytest.Item]) -> None:
             # outcome assertion (expects AdCPError/ValidationError) fails.
             # Same C4 transport-boundary error-normalization gap. These rows
             # were previously covered by the blanket _UC004_BOUNDARY_TAGS
-            # strict=False, which 18h.10 Phase-2 (salesagent-04zf et al.)
+            # strict=False, which 18h.10 Phase-2 (et al.)
             # emptied; restored here as PRECISE strict=True tied to the real
             # gap (no vacuous blanket). Forces marker removal when the
             # transport-boundary error translator lands.
@@ -1333,21 +1618,21 @@ def pytest_collection_modifyitems(items: list[pytest.Item]) -> None:
                 "(a2a RuntimeError-wrap, rest 422 detail). impl passes. "
                 "See docs/test-debt-bdd-strict-markers.md item C4.",
             ),
-            # C11 retired (salesagent-18h.1): the "production ignores buyer
+            # C11 retired: the "production ignores buyer
             # start_date" failure was an artefact of the greedy with-params
             # step shadowing when_request_date_range and mis-parsing the
             # request. With correct step routing, production echoes the
             # buyer-supplied start_date/end_date in response.reporting_period,
             # so T-UC-004-daterange now genuinely passes (no strict xfail).
             #
-            # date-range partition (salesagent-x18x, #1545): the a2a rows GRADUATED —
+            # date-range partition (#1545): the a2a rows GRADUATED —
             # the Examples now name the wire code (error "VALIDATION_ERROR" with
             # suggestion) and production emits exactly that on the a2a wire ("Start date
             # must be before end date", media_buy_delivery.py:209-218 via
             # AdCPValidationError). Under the transport-aware harness (e2e-harness-wiring)
             # mcp/rest ARE parametrized for this partition and still gap, so they retain a
             # marker below.
-            # date-range partition/boundary (salesagent-04zf, 18h.10 Phase-2):
+            # date-range partition/boundary (18h.10 Phase-2):
             # when_partition/boundary_date_range now translate the descriptor
             # into real start_date/end_date (previously the axis name was sent
             # as a literal request field and rejected by extra=forbid, so the
@@ -1384,7 +1669,7 @@ def pytest_collection_modifyitems(items: list[pytest.Item]) -> None:
                 "(impl passes). Same gap as T-UC-004-daterange-invalid/-equal. "
                 "See docs/test-debt-bdd-strict-markers.md item C4.",
             ),
-            # end-only date_range default (salesagent-losz / debt C7, Gap G40):
+            # end-only date_range default (debt C7, Gap G40):
             # when only end_date is provided, the spec says start_date defaults
             # to MediaBuy.created_at but production sets start = today-30d
             # (src/core/tools/media_buy_delivery.py:162-165). The scenario's
@@ -1407,7 +1692,7 @@ def pytest_collection_modifyitems(items: list[pytest.Item]) -> None:
             # production gap, so they carry strict=True (forces marker removal
             # the moment the gap closes). See docs/test-debt-bdd-strict-markers.md.
             #
-            # daily-breakdown (salesagent-1pl): include_package_daily_breakdown
+            # daily-breakdown: include_package_daily_breakdown
             # is a real bool field; production lax-coerces non-boolean strings
             # ("yes"/"true" → True) instead of raising INVALID_REQUEST.
             (
@@ -1422,7 +1707,7 @@ def pytest_collection_modifyitems(items: list[pytest.Item]) -> None:
                 "production lax-coerces non-boolean strings to bool (no strict-bool "
                 "validation). See docs/test-debt-bdd-strict-markers.md item C4.",
             ),
-            # account (salesagent-8n9): only the omitted/(field absent) rows
+            # account: only the omitted/(field absent) rows
             # pass on every transport. The other rows fail transport-asym-
             # metrically — a2a/mcp/rest never parse/resolve AccountReference
             # at the boundary (resolve_account does account_ref.root on a raw
@@ -1439,7 +1724,7 @@ def pytest_collection_modifyitems(items: list[pytest.Item]) -> None:
                     # valid rows (explicit_account_id / natural_key) now resolve the
                     # account on a2a/mcp/rest — the delivery When seeds the named valid
                     # accounts via _seed_valid_account_if_named / seed_account_with_access
-                    # (salesagent-jr5b, #1545), which is exactly the "seed the account in the
+                    # (#1545), which is exactly the "seed the account in the
                     # delivery Given" follow-up the e2e-harness-wiring branch flagged as the
                     # condition for graduation. That seeding is present in the merged tree,
                     # so the earlier REVERT no longer applies — the valid rows are removed.
@@ -1465,7 +1750,7 @@ def pytest_collection_modifyitems(items: list[pytest.Item]) -> None:
                     "impl-account_id present + not found",
                     # Valid rows (account exists / single match = "brand + operator
                     # present", incl. the sandbox:true variant) now resolve on a2a/mcp/rest
-                    # once their accounts are seeded (salesagent-jr5b, present in the merged
+                    # once their accounts are seeded (present in the merged
                     # tree) — removed. a2a invalid rows (both / not found / empty) already
                     # raise AdCPError (wire-drop XPASS, #1417) — removed.
                     "mcp-both account_id and brand/operator",
@@ -1477,7 +1762,7 @@ def pytest_collection_modifyitems(items: list[pytest.Item]) -> None:
                 "into an AdCPError(INVALID_REQUEST) at the transport boundary; these rows "
                 "raise ValidationError instead. See docs/test-debt-bdd-strict-markers.md items C1/C2/C4.",
             ),
-            # sampling (salesagent-03q): sampling_method is NOT a
+            # sampling: sampling_method is NOT a
             # GetMediaBuyDeliveryRequest field — the artifact-sampling feature
             # is entirely unimplemented. Only (omitted)/not_provided genuinely
             # pass; rest silently drops the unknown param so its named-method
@@ -1525,7 +1810,7 @@ def pytest_collection_modifyitems(items: list[pytest.Item]) -> None:
                 "field); ValidationError not AdCPError (rest silently drops it). "
                 "See docs/test-debt-bdd-strict-markers.md item C4.",
             ),
-            # resolution (salesagent-x18x, #1545): GRADUATED on all transports. The
+            # resolution (#1545): GRADUATED on all transports. The
             # Examples now name error "VALIDATION_ERROR" with suggestion, and the empty
             # media_buy_ids=[] hits the SDK min_length=1 constraint, surfacing as
             # AdCPValidationError(VALIDATION_ERROR)+suggestion on the a2a/mcp/rest wire
@@ -1540,7 +1825,7 @@ def pytest_collection_modifyitems(items: list[pytest.Item]) -> None:
             # reject (wire-drop confirmed XPASS, #1417); the only remaining
             # transport-aware failure (a2a empty array) is handled below — entry removed
             # here so it does not blanket-xfail every boundary-resolution row.
-            # ownership (salesagent-lzf3): owner-matches rows pass on all
+            # ownership: owner-matches rows pass on all
             # transports. owner-mismatch is the C3 security gap — cross-
             # principal access returns 200+empty instead of MEDIA_BUY_NOT_FOUND.
             (
@@ -1565,7 +1850,7 @@ def pytest_collection_modifyitems(items: list[pytest.Item]) -> None:
                 "AdCPError(MEDIA_BUY_NOT_FOUND). impl genuinely passes. "
                 "See docs/test-debt-bdd-strict-markers.md item C3.",
             ),
-            # status-filter (salesagent-6vu): all valid single statuses +
+            # status-filter: all valid single statuses +
             # arrays + (field absent) pass. pending_activation rows fail
             # (Gherkin uses a non-spec MediaBuyStatus — item B1); empty-array /
             # unknown-value "failed" rows raise ValidationError not
@@ -1611,7 +1896,7 @@ def pytest_collection_modifyitems(items: list[pytest.Item]) -> None:
                 "(item B1). failed/[]: ValidationError not AdCPError on a2a/mcp (item C4). "
                 "See docs/test-debt-bdd-strict-markers.md.",
             ),
-            # credentials (salesagent-f8u4): FULLY reconciled — the When step
+            # credentials: FULLY reconciled — the When step
             # now validates the real AdCP reporting_webhook Authentication
             # model (scheme enum + credentials min_length=32). All 40 rows
             # genuinely PASS on all transports; NO strict=True entry needed
@@ -1777,7 +2062,7 @@ def pytest_collection_modifyitems(items: list[pytest.Item]) -> None:
         # INVALID_REQUEST mis-pin per the AdCP graded error-compliance storyboard), the
         # step asserts it on the harness wire envelope. interval=0 / unit=weeks /
         # model=last_click PASS on a2a/mcp/rest (VALIDATION_ERROR).
-        # GRADUATED (salesagent-x18x, #1545): the partition "campaign with interval=2"
+        # GRADUATED (#1545): the partition "campaign with interval=2"
         # (campaign_interval_not_one) now passes on a2a — the only transport parametrized
         # for that row — because the attribution_window.post_click reaches production and
         # INV-5 fires (VALIDATION_ERROR "interval must be 1 when unit is 'campaign'"), which
@@ -1801,7 +2086,7 @@ def pytest_collection_modifyitems(items: list[pytest.Item]) -> None:
             item.add_marker(
                 pytest.mark.xfail(
                     reason="attribution_window partition: the generic 'with {request_params}' step "
-                    "shadows the specific partition step and drops the window (salesagent-50hl); "
+                    "shadows the specific partition step and drops the window; "
                     "validation never fires so the rejection assertion can't pass",
                     strict=True,
                 )
@@ -1816,7 +2101,7 @@ def pytest_collection_modifyitems(items: list[pytest.Item]) -> None:
             # a2a now raises AdCPError on invalid-account rows (both / empty / not found)
             # (wire-drop confirmed XPASS, #1417). Valid rows (account exists / single
             # match / sandbox account exists) now pass on mcp/rest once their accounts
-            # are seeded (salesagent-jr5b) — the former "production gaps" mask hid the
+            # are seeded — the former "production gaps" mask hid the
             # missing seed. mcp still gaps on the oneOf/empty invalid rows; impl still
             # gaps on not-found (impl is not in the default BDD parametrization).
             _acc_invalid_fail = is_mcp and any(s in nodeid for s in ("both account_id", "empty object"))
@@ -1891,7 +2176,7 @@ def pytest_collection_modifyitems(items: list[pytest.Item]) -> None:
         # "both provided" resolution scenario sends both media_buy_ids and buyer_refs,
         # but buyer_refs no longer exists, so the scenario is obsolete. strict=False
         # tolerates it (in-process xfails, e2e_rest xpasses) until PR #1417 retires the
-        # obligation + feature rows upstream. (salesagent-uw8f)
+        # obligation + feature rows upstream.
         if "T-UC-004-boundary-resolution" in marker_names and "both provided" in nodeid:
             item.add_marker(
                 pytest.mark.xfail(
@@ -1920,7 +2205,7 @@ def pytest_collection_modifyitems(items: list[pytest.Item]) -> None:
         # mock state invisible to the live server, so the fallback is untestable over
         # e2e_rest (the buyer-facing assertions pass without exercising it). strict=False
         # tolerates the hollow pass; wiring the injector so a2a/mcp/rest genuinely test
-        # it is the follow-up. (salesagent-04im)
+        # it is the follow-up.
         if "T-UC-004-dim-sortby-fallback" in marker_names and is_e2e_rest:
             item.add_marker(
                 pytest.mark.xfail(
@@ -1947,7 +2232,7 @@ def pytest_collection_modifyitems(items: list[pytest.Item]) -> None:
             )
 
         # --- UC-004 partition: selective xfail for error-expecting examples ---
-        # FIXME(salesagent-7wan): Graduated partition tags still have invalid-value
+        # FIXME: Graduated partition tags still have invalid-value
         # examples that expect INVALID_REQUEST/ACCOUNT_NOT_FOUND but production
         # doesn't validate. Only xfail the failing subset; valid-value examples pass.
         _UC004_PARTITION_SELECTIVE: list[tuple[str, set[str], str]] = [
@@ -1963,16 +2248,16 @@ def pytest_collection_modifyitems(items: list[pytest.Item]) -> None:
             # "with {request_params}" step shadows the specific "with attribution_window
             # {value}" step and _parse_request_params drops the space-form window
             # (#1417) — a TEST step-binding bug, not the #1462 in-process gap.
-            # campaign_interval_not_one removed (salesagent-x18x, #1545): the only
+            # campaign_interval_not_one removed (#1545): the only
             # transport parametrized for it (a2a) now emits VALIDATION_ERROR+suggestion
             # for the named Example and passes unmasked. interval_zero/negative/unit/model
             # remain: those rows XPASS on a2a/rest but genuinely XFAIL on mcp under the
-            # salesagent-50hl generic-step-shadowing debt (out of scope for x18x).
+            # generic-step-shadowing debt (out of scope for x18x).
             (
                 "T-UC-004-partition-attribution",
                 {"interval_zero", "interval_negative", "invalid_unit", "invalid_model"},
                 "attribution_window partition rows never reach validation — generic with-{request_params} "
-                "step shadows the specific partition step and drops the window (salesagent-50hl)",
+                "step shadows the specific partition step and drops the window",
             ),
             # daily breakdown: production doesn't validate non-boolean values
             (
@@ -1982,8 +2267,8 @@ def pytest_collection_modifyitems(items: list[pytest.Item]) -> None:
             ),
             # account: production doesn't validate the oneOf constraint / empty object
             # on the wire (raises ValidationError, not AdCPError(INVALID_REQUEST)).
-            # account_not_found is NOT here: with the valid siblings seeded
-            # (salesagent-jr5b), resolution runs and the unseeded id correctly
+            # account_not_found is NOT here: with the valid siblings seeded,
+            # resolution runs and the unseeded id correctly
             # raises ACCOUNT_NOT_FOUND on every transport.
             (
                 "T-UC-004-partition-account",
@@ -1999,13 +2284,13 @@ def pytest_collection_modifyitems(items: list[pytest.Item]) -> None:
                 {"unknown_value", "empty_array"},
                 "status_filter validation not implemented — production accepts invalid values",
             ),
-            # date range partition GRADUATED (salesagent-x18x, #1545): only [a2a-…] is
+            # date range partition GRADUATED (#1545): only [a2a-…] is
             # parametrized for start_equals_end/start_after_end, and a2a now emits
             # VALIDATION_ERROR+suggestion ("Start date must be before end date",
             # media_buy_delivery.py:209-218) for the named Examples — passes unmasked. Entry
             # removed. (mcp/rest are only parametrized on the BOUNDARY counterpart, which
             # stays masked in _UC004_GENUINE_XFAIL_ROWS above.)
-            # resolution partition GRADUATED (salesagent-x18x, #1545): empty media_buy_ids=[]
+            # resolution partition GRADUATED (#1545): empty media_buy_ids=[]
             # hits the SDK min_length=1 constraint -> VALIDATION_ERROR+suggestion on the
             # a2a/mcp/rest wire (all three empirically PASS the named Example). Entry removed.
             # ownership: production doesn't validate principal mismatch
@@ -2051,7 +2336,7 @@ def pytest_collection_modifyitems(items: list[pytest.Item]) -> None:
                     )
                 )
 
-        # FIXME(salesagent-9vgz.80): catalog distinct type partition/boundary
+        # FIXME: catalog distinct type partition/boundary
         # Production accepts catalogs but never validates duplicate types or catalog_id
         # existence. Valid partitions pass; invalid partitions succeed when they should fail.
         # Graduated (all 4 transports pass with strong assertions):
@@ -2307,20 +2592,20 @@ def pytest_collection_modifyitems(items: list[pytest.Item]) -> None:
                         strict=False,
                     )
                 )
-            # Graduated: T-UC-019-inv-152-1/2/5 (salesagent-kgmm: creative approval data seeded)
+            # Graduated: T-UC-019-inv-152-1/2/5 (: creative approval data seeded)
             # — only in-process transports graduated; e2e_rest still fails (below).
 
             # principal_scoping_boundary error cases are excluded on e2e_rest
             # (handled by the REST+e2e_rest block below, outside this if-block).
 
             # Graduated: T-UC-019-inv-152-1, T-UC-019-inv-152-2, T-UC-019-inv-152-5
-            # (salesagent-pzqp: creative approval data now visible to e2e_rest Docker)
+            # (: creative approval data now visible to e2e_rest Docker)
 
         # --- UC-026: xfails for spec-production gaps ---
         # Transport wiring done (a3xo: MediaBuyDualEnv routes updates correctly).
         # Remaining failures are production-level: AffectedPackage lacks full state,
         # keyword targeting ops not implemented, error codes/suggestions missing.
-        # FIXME(salesagent-av7): UC-026 production gaps in update response and validation.
+        # FIXME: UC-026 production gaps in update response and validation.
         _UC026_XFAIL_TAGS: set[str] = {
             # Graduated: T-UC-026-main-explicit-formats (qq6f: format_ids now echoed)
             # Full-config: optimization_goals missing `kind`, targeting_overlay.audiences extra_forbidden
@@ -2389,7 +2674,7 @@ def pytest_collection_modifyitems(items: list[pytest.Item]) -> None:
             )
 
         # --- UC-026 partition/boundary: selective xfail for graduated tags ---
-        # FIXME(salesagent-7wan): Remaining failures are production-level gaps.
+        # FIXME: Remaining failures are production-level gaps.
         # x2l0: narrowed from set() (all-fail) after a3xo MediaBuyDualEnv wiring
         # graduated most partition/boundary examples. Two failure patterns remain:
         #   1. REST update dispatch: REST success-path update tests fail (error-path
@@ -2416,7 +2701,7 @@ def pytest_collection_modifyitems(items: list[pytest.Item]) -> None:
                 {"valid_with_max_bid"},
                 "max_bid pricing validation rejects valid ceiling semantics — spec-production gap",
             ),
-            # FIXME(salesagent-e4ij): pricing option not-found / wrong-product returns
+            # FIXME: pricing option not-found / wrong-product returns
             # 'validation_error' instead of AdCP-spec 'INVALID_REQUEST'.
             (
                 "T-UC-026-partition-pricing-option",
@@ -2680,7 +2965,7 @@ def pytest_collection_modifyitems(items: list[pytest.Item]) -> None:
                     item.add_marker(pytest.mark.xfail(reason=reason, strict=False))
 
         # --- UC-011: xfails for spec-production gaps ---
-        # FIXME(salesagent-7wan): Production doesn't implement these UC-011 features.
+        # FIXME: Production doesn't implement these UC-011 features.
         # Graduated: T-UC-011-list-status-filter payment_required (all 4 transports pass — status now mapped)
         # Graduated: T-UC-011-ext-g-echo list_accounts (all 4 transports pass — context echo implemented)
 
@@ -2751,6 +3036,17 @@ def pytest_collection_modifyitems(items: list[pytest.Item]) -> None:
     # xfail still proves out and an xpass is still caught when production catches
     # up) and deselect the redundant ones.
     #
+    # That rationale holds only when the failure IS transport-independent. It is
+    # not always: an obligation each transport enforces separately fails three
+    # times for three reasons, and each has to xpass on its own when production
+    # catches up — deselecting two of them would grade a cross-transport MUST on
+    # one transport and call it covered.
+    #
+    # So the exemption is keyed on the xfail reason declaring `scope=per-transport`,
+    # not on a list of node ids. A node list is an allowlist under another name and
+    # rots the moment someone adds a row; a declared property is inherited by every
+    # future row that carries it. See the cause taxonomy the UC-003 revision rows
+    # use above (`cause=... scope=... ref=...`).
     # IMPL was dropped from the BDD default parametrization (#1417), so
     # a2a is now the canonical transport that always runs; mcp/rest are the
     # redundant transports deselected when the scenario carries a strict xfail.
@@ -2761,6 +3057,11 @@ def pytest_collection_modifyitems(items: list[pytest.Item]) -> None:
     if not os.environ.get("BDD_ALL_TRANSPORTS"):
         deselected: list[pytest.Item] = []
         remaining: list[pytest.Item] = []
+        # Collected rather than raised in-loop: an exception escaping
+        # pytest_collection_modifyitems surfaces as INTERNALERROR, which reports the
+        # hook rather than the malformed reason and truncates the run. Gathering them
+        # and failing once at the end names every offender.
+        reason_errors: list[str] = []
         for item in items:
             nodeid = item.nodeid
             is_redundant_transport = "[mcp]" in nodeid or "[mcp-" in nodeid or "[rest]" in nodeid or "[rest-" in nodeid
@@ -2768,11 +3069,29 @@ def pytest_collection_modifyitems(items: list[pytest.Item]) -> None:
                 remaining.append(item)
                 continue
             # Check if this item has a strict xfail marker
-            has_strict_xfail = any(m.name == "xfail" and m.kwargs.get("strict", False) for m in item.iter_markers())
-            if has_strict_xfail:
+            strict_xfails = [m for m in item.iter_markers() if m.name == "xfail" and m.kwargs.get("strict", False)]
+            # Consult the PARSE, not the string. A substring match here was satisfied by
+            # prose quoting the token, so the declaration it appeared to read was
+            # decorative.
+            per_transport = False
+            for marker in strict_xfails:
+                try:
+                    parsed = parse_xfail_reason(str(marker.kwargs.get("reason", "")))
+                except XfailReasonError as exc:
+                    reason_errors.append(f"{item.nodeid}: {exc}")
+                    parsed = None
+                if parsed is not None and parsed.scope == "per-transport":
+                    per_transport = True
+            if strict_xfails and not per_transport:
                 deselected.append(item)
             else:
                 remaining.append(item)
+
+        if reason_errors:
+            raise pytest.UsageError(
+                "malformed typed xfail reason(s) — a row whose reason does not parse would be "
+                "routed by accident:\n  " + "\n  ".join(reason_errors)
+            )
 
         if deselected:
             items[:] = remaining
@@ -2816,11 +3135,14 @@ _UC002_IDEMPOTENCY_WIRED: set[str] = {
 _UC002_MANUAL_APPROVAL_WIRED: set[str] = {
     "T-UC-002-alt-manual",
 }
-
-
-def _is_brand_shorthand_media_buy(marker_names: set[str]) -> bool:
-    """True when a brand_shorthand scenario targets create_media_buy (UC-002 harness)."""
-    return "brand_shorthand" in marker_names and "create_media_buy" in marker_names
+# The v3.1 sync-success envelope scenario. It was dormant because it had no step
+# definitions, not because the harness could not reach it — it needs exactly the full
+# create the manual-approval arm already runs. It grades revision / confirmed_at /
+# valid_actions on the response the buyer meets first, which is the surface where
+# those three were being fabricated from schema defaults.
+_UC002_V31_SUCCESS_WIRED: set[str] = {
+    "T-UC-002-v31-success-revision-and-actions",
+}
 
 
 # Admin scenarios have their own transport (Flask test_client / requests.Session).
@@ -3072,76 +3394,226 @@ def _setup_existing_media_buy(ctx: dict, env: object, tenant: object, principal:
     _register_package(ctx, "pkg_001", pkg)
 
 
-def _detect_uc(request: pytest.FixtureRequest) -> str | None:
-    """Detect which use case a BDD scenario belongs to via its tags."""
-    marker_names = {m.name for m in request.node.iter_markers()}
-    if any(t.startswith("T-UC-002") for t in marker_names):
-        return "UC-002"
-    if any(t.startswith("T-UC-003") for t in marker_names):
-        return "UC-003"
-    if any(t.startswith("T-UC-006") for t in marker_names):
-        return "UC-006"
-    if any(t.startswith("T-UC-005") for t in marker_names):
-        return "UC-005"
-    if any(t.startswith("T-UC-004") for t in marker_names):
-        return "UC-004"
-    if any(t.startswith("T-UC-011") for t in marker_names):
-        return "UC-011"
-    if any(t.startswith("T-UC-018") for t in marker_names):
-        return "UC-018"
-    if any(t.startswith("T-UC-019") for t in marker_names):
-        return "UC-019"
-    if any(t.startswith(_ADMIN_TAG_PREFIX) for t in marker_names):
-        return "ADMIN"
-    if "inventory_profile" in marker_names or (
-        "brand_shorthand" in marker_names and not _is_brand_shorthand_media_buy(marker_names)
-    ):
-        return "UC-GET-PRODUCTS"
-    if _is_brand_shorthand_media_buy(marker_names):
-        return "UC-002"
-    if any(t.startswith("T-COMPAT") for t in marker_names):
-        return "COMPAT"
-    return None
+@dataclass(frozen=True)
+class EnvRoute:
+    """One row of the declarative BDD env-routing registry.
 
+    ``env_builder`` constructs the harness env (a ``BaseTestEnv`` context
+    manager, not yet entered); ``seed`` — given the entered ``env`` — stashes
+    ``ctx["env"]`` plus whatever tenant/principal/client/existing-data a
+    scenario's steps need. ``xfail_reason``, when set, means this row is a
+    placeholder: the generic consumer xfails immediately instead of building
+    anything, so a UC can be registered ahead of a harness existing for it.
 
-def _detect_uc011_harness(marker_names: set[str]) -> str:
-    """Detect which UC-011 harness a scenario needs based on tags.
+    The registry exists so authoring a new routing case is adding a row —
+    there is no field for hand-rolling seeding or skipping DB scoping.
 
-    When both @sync and @list are present (cross-cutting scenarios like
-    sync-then-list), use sync harness — it's the superset and already has
-    a cross-cutting list path via _list_accounts_impl.
+    ``when``, when set, is the row's ROUTING PREDICATE over the scenario's
+    marker-name set. Rows carrying one are tried before the coarse ``uc``
+    buckets. These predicates used to live as a hardcoded ``elif`` chain inside
+    ``_harness_env``, invisible to ``scripts/audit``'s join — which knew only
+    about the buckets and therefore reported every predicate-routed scenario as
+    dormant. Moving them into rows is what lets ONE resolver answer for both
+    sides.
+
+    ``uc`` is the coarse bucket this row serves, matched against
+    ``storyboard_spec.detect_uc``. A row sets ``when`` or ``uc``, not both.
     """
-    has_list = "list" in marker_names
-    has_sync = "sync" in marker_names
-    if has_sync and has_list:
-        return "sync"
-    if has_list:
-        return "list"
-    if has_sync:
-        return "sync"
-    if "context-echo" in marker_names or "sandbox" in marker_names:
-        return "sync"
-    return "unknown"
+
+    tag: str
+    env_builder: Callable[[E2EConfig | None], AbstractContextManager[BaseTestEnv]]
+    seed: Callable[[dict, BaseTestEnv], None] | None = None
+    xfail_reason: str | None = None
+    when: Callable[[frozenset[str]], bool] | None = None
+    uc: str | None = None
 
 
-def _detect_delivery_harness(request: pytest.FixtureRequest) -> str:
-    """Detect which delivery harness a UC-004 scenario needs."""
-    marker_names = {m.name for m in request.node.iter_markers()}
-    # Webhook-credential-length scenarios assert that a too-short reporting_webhook
-    # credential is rejected at the create_media_buy boundary (the SDK
-    # Authentication.credentials MinLen=32 fires on the wire). They need the
-    # create transport wrappers, not the delivery/circuit-breaker harness — route
-    # them to MediaBuyCreateEnv so production Pydantic does the rejecting.
-    if {"T-UC-004-webhook-creds-short", "T-UC-004-webhook-creds-valid"} & marker_names:
-        return "create"
-    if "webhook-reliability" in marker_names:
-        return "circuit-breaker"
-    if "webhook" in marker_names:
-        # Webhook scenarios (HMAC, bearer, sequence, notification_type) use
-        # WebhookDeliveryService which lives in CircuitBreakerEnv, not the
-        # older deliver_webhook_with_retry from WebhookEnv.
-        return "circuit-breaker"
-    return "poll"
+def _seed_uc003_storyboard_generic_client(ctx: dict, env: object) -> None:
+    """Seed ctx for the UC-003 storyboard scenarios that dispatch via AdCPTestClient.
+
+    Demonstrator: dispatches through the transport-
+    generic ``AdCPTestClient`` (``tests/harness/client.py``) instead of
+    ``MediaBuyDualEnv``/``dispatch_request`` — see
+    ``tests/bdd/steps/domain/uc003_storyboard_generic_client.py``. Background
+    still seeds "mb_existing" (BR-UC-003-update-media-buy.feature:24-28 runs
+    for this scenario too), so seeding reuses ``_setup_existing_media_buy``
+    (the same named helper the ext-/targeting-overlay branch uses) instead of
+    a hand-rolled ``MediaBuyFactory``/``_commit_factory_data`` block —
+    ``given_buyer_owns_media_buy_by_id`` registers whatever real id the
+    factory generates under the Gherkin "mb_existing" label, so the literal
+    id is not required. ``BareIntegrationEnv`` has no product dependency
+    chain, so a minimal ``Product`` row is created here purely to satisfy
+    ``_setup_existing_media_buy``'s package_config.product_id.
+    """
+    from tests.factories import ProductFactory
+
+    tenant, principal = env.setup_default_data()
+    product = ProductFactory(tenant=tenant)
+    # ctx["client"] is built once by _run_env_route for every row (B8).
+    ctx["tenant"] = tenant
+    ctx["principal"] = principal
+    _setup_existing_media_buy(ctx, env, tenant, principal, product)
+
+
+def _build_uc003_storyboard_generic_client_env(e2e_config: object | None) -> AbstractContextManager:
+    from tests.harness._base import BareIntegrationEnv
+
+    return BareIntegrationEnv(e2e_config=e2e_config)
+
+
+def _build_admin_env(e2e_config: object | None) -> AbstractContextManager:
+    """ADMIN scenarios always run the Flask test_client, never e2e_rest.
+
+    ``pytest_generate_tests`` never parametrizes ADMIN scenarios under
+    e2e_rest, so ``e2e_config`` is always ``None`` here.
+    """
+    from tests.harness.admin_accounts import AdminAccountEnv
+
+    return AdminAccountEnv(mode="integration")
+
+
+def _build_product_env(e2e_config: object | None) -> AbstractContextManager:
+    """Shared by COMPAT and UC-GET-PRODUCTS — both are read-only product listing."""
+    from tests.harness.product import ProductEnv
+
+    return ProductEnv(e2e_config=e2e_config)
+
+
+def _build_creative_formats_env(e2e_config: object | None) -> AbstractContextManager:
+    from tests.harness.creative_formats import CreativeFormatsEnv
+
+    return CreativeFormatsEnv(e2e_config=e2e_config)
+
+
+def _seed_uc005(ctx: dict, env: object) -> None:
+    """Seed a tenant ONLY in e2e mode.
+
+    The live server authenticates the token against the DB tenant, and UC-005
+    baseline scenarios carry no account/tenant Given step to seed it (unlike
+    UC-006/UC-011). In-process the registry is mocked and the DB is per-test,
+    so the in-process status quo must stay unseeded. Mirrors the UC-004 poll
+    branch (#1417).
+    """
+    if env.e2e_config is not None:
+        env.setup_default_data()
+
+
+def _build_media_buy_list_env(e2e_config: object | None) -> AbstractContextManager:
+    """get_media_buys — MediaBuyListEnv runs the real _get_media_buys_impl and
+    its A2A/MCP wrappers against a real DB (no adapter mock; list is a pure
+    read). Genuine spec-production gaps stay xfailed via _UC019_XFAIL_TAGS /
+    the selective blocks in the UC-002 branch above.
+    """
+    from tests.harness.media_buy_list import MediaBuyListEnv
+
+    return MediaBuyListEnv(principal_id="buyer-001", e2e_config=e2e_config)
+
+
+def _build_media_buy_create_list_env(e2e_config: object | None) -> AbstractContextManager:
+    """UC-019 @post-create-poll — create_media_buy AND get_media_buys in ONE
+    scenario on ONE identity; a factory-seeded buy would make the poll vacuous.
+    MediaBuyCreateListEnv extends MediaBuyCreateEnv with the shared get_media_buys
+    dispatch and routes a GetMediaBuysRequest to it (same shape as UC-003's
+    MediaBuyDualEnv fork). Seeded with _seed_media_buy_chain, which runs
+    setup_media_buy_data — the full create dependency chain (property tag, product,
+    pricing option, authorized property).
+    """
+    from tests.harness.media_buy_create_list import MediaBuyCreateListEnv
+
+    return MediaBuyCreateListEnv(principal_id="buyer-001", e2e_config=e2e_config)
+
+
+def _seed_uc019(ctx: dict, env: object) -> None:
+    """Scenarios seed buys via factories under ctx["tenant"]/["principal"]
+    (principal "buyer-001" matches the feature files)."""
+    tenant, principal = env.setup_default_data()
+    ctx["tenant"] = tenant
+    ctx["principal"] = principal
+
+
+# ── Seeds extracted from the former _harness_env elif chain ────
+# Each was an inline body inside a marker-keyed branch. As rows they are visible
+# to storyboard_spec.resolve_env_route, which is what lets scripts/audit resolve
+# the SAME route instead of re-implementing a coarser lookup.
+
+
+def _seed_media_buy_chain(ctx: dict, env: object) -> None:
+    """Seed the full create dependency chain (tenant/principal/product/pricing)."""
+    tenant, principal, product, pricing_option = env.setup_media_buy_data()
+    ctx["tenant"] = tenant
+    ctx["principal"] = principal
+    ctx["default_product"] = product
+    ctx["default_pricing_option"] = pricing_option
+
+
+def _seed_media_buy_chain_create_dispatch(ctx: dict, env: object) -> None:
+    """The chain, plus the flag telling the shared When step to dispatch a create."""
+    _seed_media_buy_chain(ctx, env)
+    ctx["dispatch_mode"] = "create"
+
+
+def _seed_media_buy_chain_full_create(ctx: dict, env: object) -> None:
+    """The chain, plus the manual-approval full-create flag (PR #1567)."""
+    _seed_media_buy_chain(ctx, env)
+    ctx["uc002_full_create"] = True
+
+
+def _seed_update_with_existing_buy(ctx: dict, env: object) -> None:
+    """The chain plus an existing media buy + package for UC-003 update scenarios."""
+    _seed_media_buy_chain(ctx, env)
+    _setup_existing_media_buy(ctx, env, ctx["tenant"], ctx["principal"], ctx["default_product"])
+    env._seeded_media_buy_id = ctx["existing_media_buy"].media_buy_id
+
+
+def _seed_update_with_mb_existing(ctx: dict, env: object) -> None:
+    """The chain plus a standalone MediaBuy carrying the literal Background id."""
+    from tests.factories import MediaBuyFactory
+
+    _seed_media_buy_chain(ctx, env)
+    existing_media_buy = MediaBuyFactory(
+        tenant=ctx["tenant"],
+        principal=ctx["principal"],
+        media_buy_id="mb_existing",
+        status="active",
+    )
+    env._commit_factory_data()
+    env._seeded_media_buy_id = "mb_existing"
+    ctx["existing_media_buy"] = existing_media_buy
+
+
+def _seed_default_data(ctx: dict, env: object) -> None:
+    """Envs whose setup is a bare ``setup_default_data()``."""
+    env.setup_default_data()
+
+
+def _seed_delivery_poll(ctx: dict, env: object) -> None:
+    """UC-004 polling: stash the tenant/principal under the keys its steps read."""
+    tenant, principal = env.setup_default_data()
+    ctx["db_tenant"] = tenant
+    ctx[f"db_principal_{env._principal_id}"] = principal
+
+
+def _env(factory_path: str, **kwargs: object) -> Callable[[object | None], AbstractContextManager]:
+    """Build an env_builder that imports its harness lazily, as the branches did."""
+
+    def _builder(e2e_config: object | None) -> AbstractContextManager:
+        import importlib
+
+        module_name, _, class_name = factory_path.rpartition(".")
+        env_cls = getattr(importlib.import_module(module_name), class_name)
+        return env_cls(e2e_config=e2e_config, **kwargs)
+
+    return _builder
+
+
+def _uc(uc_name: str, predicate: Callable[[frozenset[str]], bool]) -> Callable[[frozenset[str]], bool]:
+    """Scope a marker predicate to one UC bucket.
+
+    The former chain tested ``uc == "UC-00N"`` FIRST and only then the markers,
+    so a bare marker predicate would over-match across UCs (``account`` and
+    ``BR-RULE-034`` are both carried by more than one use case).
+    """
+    return lambda markers: storyboard_spec.detect_uc(markers) == uc_name and predicate(markers)
 
 
 @contextmanager
@@ -3191,17 +3663,340 @@ def _db_scope_for(request: pytest.FixtureRequest, e2e_config: object | None) -> 
     return _production_db_pointed_at(e2e_config.postgres_url)  # type: ignore[attr-defined]
 
 
+def _run_env_route(
+    request: pytest.FixtureRequest, ctx: dict, route: EnvRoute, e2e_config: object | None
+) -> Generator[None, None, None]:
+    """The one generic ``ENV_ROUTES`` consumer.
+
+    Enters ``_db_scope_for`` — the structural DB-scoping entry point — before
+    the row's ``env_builder`` runs, so on the e2e_rest parametrization
+    production's cached engine is pointed at the live server DB (not an empty
+    per-test DB) before any factory writes happen. Stashes the entered env on
+    ``ctx["env"]``, runs the row's ``seed`` callback if present, then yields
+    control to the scenario. A row with ``xfail_reason`` set never builds an
+    env at all.
+    """
+    from tests.harness.client import AdCPTestClient
+
+    if route.xfail_reason is not None:
+        pytest.xfail(route.xfail_reason)
+    with _db_scope_for(request, e2e_config), route.env_builder(e2e_config) as env:
+        ctx["env"] = env
+        # Build the client ONCE, here, for every row — it used to be constructed
+        # inside a single hand-wired seed callback, so only that one row could
+        # dispatch via the client and any new row wanting it had to remember to
+        # repeat the line. Construction is cheap and
+        # side-effect-free; a row that never dispatches via the client simply
+        # does not read the key.
+        ctx["client"] = AdCPTestClient(env)
+        if route.seed is not None:
+            route.seed(ctx, env)
+        yield
+
+
+_UC_BUCKET_ROUTES: dict[str, EnvRoute] = {
+    "T-UC-003-storyboard-media-buy-not-found": EnvRoute(
+        tag="T-UC-003-storyboard-media-buy-not-found",
+        env_builder=_build_uc003_storyboard_generic_client_env,
+        seed=_seed_uc003_storyboard_generic_client,
+    ),
+    # Same env + same seed as the row above: the re-cancel scenario also needs
+    # the Background's "mb_existing" buy plus a client that sends the buyer's
+    # literal payload (`canceled` must reach the
+    # seller rather than being dropped by a harness flattener).
+    "T-UC-003-storyboard-not-cancellable-on-recancel": EnvRoute(
+        tag="T-UC-003-storyboard-not-cancellable-on-recancel",
+        env_builder=_build_uc003_storyboard_generic_client_env,
+        seed=_seed_uc003_storyboard_generic_client,
+    ),
+    # The five rows below are keyed by the coarse `uc` bucket (from
+    # _detect_uc), not a per-scenario tag: they are what a scenario in these
+    # UCs falls back to when no predicate row above claims it. ADMIN, COMPAT,
+    # UC-GET-PRODUCTS and UC-005 have no predicate rows at all — one env + one
+    # seed serves every scenario. UC-019 does have one (@post-create-poll needs
+    # create + list in a single scenario), so its bucket row is the remainder.
+    "ADMIN": EnvRoute(tag="ADMIN", env_builder=_build_admin_env),
+    "COMPAT": EnvRoute(tag="COMPAT", env_builder=_build_product_env),
+    "UC-GET-PRODUCTS": EnvRoute(tag="UC-GET-PRODUCTS", env_builder=_build_product_env),
+    "UC-005": EnvRoute(tag="UC-005", env_builder=_build_creative_formats_env, seed=_seed_uc005),
+    "UC-019": EnvRoute(tag="UC-019", env_builder=_build_media_buy_list_env, seed=_seed_uc019),
+}
+
+# Tag sets the routing predicates below key on. They were inline `if` conditions
+# in the former _harness_env elif chain; as named sets they are readable from the
+# rows AND from scripts/audit, which now resolves through the same table.
+_UC002_MANUAL_APPROVAL_ROW_TAGS = _UC002_MANUAL_APPROVAL_WIRED
+_UC003_TARGETING_OVERLAY_TAGS = frozenset(
+    {"T-UC-003-partition-targeting-overlay", "T-UC-003-boundary-targeting-overlay"}
+)
+_UC003_MANUAL_APPROVAL_TAGS = frozenset(
+    {"T-UC-003-alt-manual", "T-UC-003-approval-tenant", "T-UC-003-approval-adapter"}
+)
+# The BR-RULE-215 revision scenarios. They were dormant for a reason that was not
+# "the harness cannot reach them": they had NO step definitions at all, so the
+# not-wired row was standing in for missing work rather than for a production gap.
+# The steps exist now, and these grade the obligation the whole revision surface
+# rests on — a mutating update advances the buyer's optimistic-concurrency token
+# and REPORTS the advanced value. They need the same seeded existing buy as the
+# manual-approval arm, so they share its row.
+_UC003_REVISION_TAGS = frozenset(
+    {
+        "T-UC-003-revision-success-increments",
+        "T-UC-003-revision-and-idempotency-independent",
+        "T-UC-003-boundary-revision",
+        "T-UC-003-partition-revision",
+    }
+)
+_UC003_STORYBOARD_CLIENT_TAGS = frozenset(
+    {"T-UC-003-storyboard-media-buy-not-found", "T-UC-003-storyboard-not-cancellable-on-recancel"}
+)
+
+ENV_ROUTES: list[EnvRoute] = [
+    # ── UC-002 ──────────────────────────────────────────────────────────────
+    EnvRoute(
+        tag="uc002-account",
+        when=_uc("UC-002", lambda m: "account" in m),
+        env_builder=_env("tests.harness.media_buy_create.MediaBuyCreateEnv"),
+        seed=_seed_media_buy_chain,
+    ),
+    EnvRoute(
+        tag="uc002-ext",
+        when=_uc(
+            "UC-002",
+            lambda m: (
+                any(t.startswith("T-UC-002-ext-") for t in m)
+                or "nfr-highvalue" in m
+                or "T-UC-002-nfr-001-enforcement" in m
+            ),
+        ),
+        env_builder=_env("tests.harness.media_buy_create.MediaBuyCreateEnv"),
+        seed=_seed_media_buy_chain_create_dispatch,
+    ),
+    EnvRoute(
+        tag="uc002-manual-approval",
+        # Also claims the v3.1 sync-success envelope scenario: it needs exactly the
+        # full create this arm already runs, so it shares the row rather than
+        # duplicating the seed. The former chain expressed the same thing by OR-ing
+        # _UC002_V31_SUCCESS_WIRED into the manual-approval full-create flag.
+        when=_uc("UC-002", lambda m: bool(m & (_UC002_MANUAL_APPROVAL_ROW_TAGS | _UC002_V31_SUCCESS_WIRED))),
+        env_builder=_env("tests.harness.media_buy_create.MediaBuyCreateEnv"),
+        seed=_seed_media_buy_chain_full_create,
+    ),
+    EnvRoute(
+        tag="uc002-idempotency",
+        when=_uc(
+            "UC-002",
+            lambda m: bool(m & _UC002_IDEMPOTENCY_WIRED) or storyboard_spec.is_brand_shorthand_media_buy(m),
+        ),
+        env_builder=_env("tests.harness.media_buy_create.MediaBuyCreateEnv"),
+        seed=_seed_media_buy_chain,
+    ),
+    EnvRoute(
+        tag="uc002-inv-015-6",
+        when=_uc("UC-002", lambda m: "T-UC-002-inv-015-6" in m),
+        env_builder=_env("tests.harness.media_buy_create.MediaBuyCreateEnv"),
+        xfail_reason="T-UC-002-inv-015-6 create_media_buy harness wiring is tracked in #1652",
+    ),
+    EnvRoute(
+        tag="uc002-not-wired",
+        when=_uc("UC-002", lambda m: True),
+        env_builder=_env("tests.harness.media_buy_create.MediaBuyCreateEnv"),
+        xfail_reason="UC-002 harness not yet wired for non-extension scenarios",
+    ),
+    # ── UC-003 ──────────────────────────────────────────────────────────────
+    EnvRoute(
+        tag="uc003-ext",
+        when=_uc(
+            "UC-003",
+            lambda m: any(t.startswith("T-UC-003-ext-") for t in m) or bool(m & _UC003_TARGETING_OVERLAY_TAGS),
+        ),
+        env_builder=_env("tests.harness.media_buy_dual.MediaBuyDualEnv"),
+        seed=_seed_update_with_existing_buy,
+    ),
+    EnvRoute(
+        tag="uc003-manual-approval",
+        when=_uc("UC-003", lambda m: bool(m & (_UC003_MANUAL_APPROVAL_TAGS | _UC003_REVISION_TAGS))),
+        env_builder=_env("tests.harness.media_buy_dual.MediaBuyDualEnv"),
+        seed=_seed_update_with_mb_existing,
+    ),
+    EnvRoute(
+        tag="uc003-storyboard-generic-client",
+        when=_uc("UC-003", lambda m: bool(m & _UC003_STORYBOARD_CLIENT_TAGS)),
+        env_builder=_build_uc003_storyboard_generic_client_env,
+        seed=_seed_uc003_storyboard_generic_client,
+    ),
+    EnvRoute(
+        tag="uc003-not-wired",
+        when=_uc("UC-003", lambda m: True),
+        env_builder=_env("tests.harness.media_buy_dual.MediaBuyDualEnv"),
+        xfail_reason=(
+            "UC-003 harness not yet wired for non-extension scenarios (full graduation pending, PR #1567 follow-up)"
+        ),
+    ),
+    # ── UC-006 ──────────────────────────────────────────────────────────────
+    EnvRoute(
+        tag="uc006-creative-sync",
+        when=_uc(
+            "UC-006",
+            lambda m: bool(
+                m
+                & {
+                    "account",
+                    "creative-invariant",
+                    "BR-RULE-034",
+                    "webhook-ssrf",
+                    "uc006-storyboard-routing",
+                    "uc006-idempotency",
+                }
+            ),
+        ),
+        env_builder=_env("tests.harness.creative_sync.CreativeSyncEnv"),
+    ),
+    EnvRoute(
+        tag="uc006-not-wired",
+        when=_uc("UC-006", lambda m: True),
+        env_builder=_env("tests.harness.creative_sync.CreativeSyncEnv"),
+        xfail_reason="UC-006 harness not yet wired for non-account scenarios",
+    ),
+    # ── UC-018 ──────────────────────────────────────────────────────────────
+    # The @BR-RULE-146 explicit-statuses success invariants (#1502, statuses
+    # match-any) are admitted by EXACT scenario id, not the shared @BR-RULE-146
+    # tag, because the tag also covers rows that are still dormant. The dormant
+    # statuses siblings fall through to uc018-not-wired below:
+    #   Genuinely blocked (need unimplemented work): inv-146-1-holds + the
+    #     @default-query `empty_request`/`filters_no_status` rows (no-filter
+    #     archival-DEFAULT exclusion is unimplemented — #1738; inv-146-1-holds has
+    #     its own named xfail row) and the validation-error rows (`[]`/`["unknown"]`/
+    #     `["deleted"]`) needing dict-passthrough validation wiring (#1652).
+    #   Implementable but not yet split out of their generated outlines (#2067):
+    #     the `processing`/`archived`/multi-status and explicit-status default-query rows.
+    EnvRoute(
+        tag="uc018-list",
+        when=_uc(
+            "UC-018",
+            lambda m: bool(
+                m
+                & {
+                    "list-after-sync",
+                    "concept-id",
+                    "BR-RULE-034",
+                    "T-UC-018-inv-146-2-holds",
+                    "T-UC-018-inv-146-2-violated",
+                    "T-UC-018-inv-146-3-holds",
+                }
+            ),
+        ),
+        env_builder=_env("tests.harness.creative_list.CreativeListEnv"),
+    ),
+    EnvRoute(
+        tag="uc018-ext-c",
+        when=_uc("UC-018", lambda m: "T-UC-018-ext-c" in m),
+        env_builder=_env("tests.harness.creative_list.CreativeListEnv"),
+        xfail_reason="T-UC-018-ext-c list_creatives validation harness wiring is tracked in #1652",
+    ),
+    EnvRoute(
+        tag="uc018-inv-146-1",
+        when=_uc("UC-018", lambda m: "T-UC-018-inv-146-1-holds" in m),
+        env_builder=_env("tests.harness.creative_list.CreativeListEnv"),
+        xfail_reason=(
+            "BR-RULE-146 INV-1 (no-filter archival-DEFAULT exclusion) is dormant for two "
+            "reasons: (1) the archival-default exclusion is an unimplemented production "
+            "feature (#1738), and (2) its 'list_creatives request with no filters' When "
+            "phrasing has no UC-018 step binding yet. Both the #1738 implementation and the "
+            "When binding must land before this scenario can grade a real red."
+        ),
+    ),
+    # When the dormant all-fields boundary scenarios are wired, their Then must
+    # assert value-when-present, not key-presence-of-13: list_creatives drops a
+    # corrupt tags/assets blob to absent and collapses an empty stored tags list
+    # to omission (both conformant at 3.1.1) -- see the #1508 reconciliation note
+    # in test_uc018_list_creatives.py's module docstring.
+    EnvRoute(
+        tag="uc018-not-wired",
+        when=_uc("UC-018", lambda m: True),
+        env_builder=_env("tests.harness.creative_list.CreativeListEnv"),
+        xfail_reason=(
+            "UC-018 harness wired only for the @list-after-sync (#1405), @concept-id (#1407), "
+            "@BR-RULE-034 isolation (#1503), and @BR-RULE-146 statuses invariants (#1502) scenarios"
+        ),
+    ),
+    # ── UC-011 ──────────────────────────────────────────────────────────────
+    EnvRoute(
+        tag="uc011-list",
+        when=_uc("UC-011", lambda m: storyboard_spec.uc011_harness(m) == "list"),
+        env_builder=_env("tests.harness.account_list.AccountListEnv"),
+    ),
+    EnvRoute(
+        tag="uc011-sync",
+        when=_uc("UC-011", lambda m: storyboard_spec.uc011_harness(m) == "sync"),
+        env_builder=_env("tests.harness.account_sync.AccountSyncEnv"),
+    ),
+    EnvRoute(
+        tag="uc011-not-wired",
+        when=_uc("UC-011", lambda m: True),
+        env_builder=_env("tests.harness.account_sync.AccountSyncEnv"),
+        xfail_reason="UC-011 harness not yet wired for these markers",
+    ),
+    # ── UC-004 ──────────────────────────────────────────────────────────────
+    EnvRoute(
+        tag="uc004-create",
+        when=_uc("UC-004", lambda m: storyboard_spec.uc004_harness(m) == "create"),
+        env_builder=_env("tests.harness.media_buy_create.MediaBuyCreateEnv"),
+        seed=_seed_media_buy_chain,
+    ),
+    EnvRoute(
+        tag="uc004-circuit-breaker",
+        when=_uc("UC-004", lambda m: storyboard_spec.uc004_harness(m) == "circuit-breaker"),
+        env_builder=_env("tests.harness.delivery_circuit_breaker.CircuitBreakerEnv"),
+        seed=_seed_default_data,
+    ),
+    EnvRoute(
+        tag="uc004-poll",
+        when=_uc("UC-004", lambda m: storyboard_spec.uc004_harness(m) == "poll"),
+        env_builder=_env("tests.harness.delivery_poll.DeliveryPollEnv", principal_id="buyer-001"),
+        seed=_seed_delivery_poll,
+    ),
+    # ── UC-019 ──────────────────────────────────────────────────────────────
+    EnvRoute(
+        tag="uc019-post-create-poll",
+        when=_uc("UC-019", lambda m: "post-create-poll" in m),
+        env_builder=_build_media_buy_create_list_env,
+        seed=_seed_media_buy_chain,
+    ),
+]
+
+# The coarse uc-bucket rows come last: a predicate row above always wins, which
+# preserves the former chain's order (it matched the bucket first only for UCs
+# that had NO predicate branches). Tag-keyed rows are already represented above
+# as predicate rows, so only the bucket keys are appended.
+ENV_ROUTES += [
+    dataclasses.replace(route, uc=key) for key, route in _UC_BUCKET_ROUTES.items() if not key.startswith("T-")
+]
+
+
 @pytest.fixture(autouse=True)
 def _harness_env(request: pytest.FixtureRequest, ctx: dict) -> Generator[None, None, None]:
     """Provide the appropriate harness for each BDD scenario.
 
-    - UC-005 → CreativeFormatsEnv
+    - A ``uc`` bucket with no marker_names-based sub-branching (ADMIN, COMPAT,
+      UC-GET-PRODUCTS, UC-005, UC-019) is a row in ``ENV_ROUTES`` and goes
+      through the one generic ``_run_env_route`` consumer.
     - UC-004 @polling → DeliveryPollEnv
     - UC-004 @webhook → WebhookEnv (unit variant, no DB needed)
     - UC-004 @webhook-reliability → CircuitBreakerEnv (unit variant)
-    - Unknown UC → no harness (yields immediately)
+    - A UC recognized by ``storyboard_spec.detect_uc`` but not (yet) claimed by a row
+      xfails with a UC-specific reason via the catch-all at the bottom.
+    - A tag ``_detect_uc`` does not recognize at all falls through to the
+      same catch-all as ``uc=None`` -- an opaque "No harness wired for None".
+      That is a bug, not intended behavior: widen ``_detect_uc`` instead of
+      relying on this fixture to paper over it.
     """
-    uc = _detect_uc(request)
+    # ONE derivation, ONE routing call. The marker set comes from the
+    # shared accessor so the conftest and the liveness plugin cannot narrow it
+    # differently, and the route comes from the shared resolver so scripts/audit
+    # answers the same question the same way.
+    marker_names = derive_marker_names(request.node)
+    uc = storyboard_spec.detect_uc(marker_names)
     e2e_config = ctx.get("e2e_config")
 
     # E2E shares one live DB across all scenarios; flush it to a clean baseline so
@@ -3210,380 +4005,10 @@ def _harness_env(request: pytest.FixtureRequest, ctx: dict) -> Generator[None, N
     if e2e_config is not None:
         _reset_e2e_db(e2e_config)
 
-    if uc == "UC-002":
-        marker_names = {m.name for m in request.node.iter_markers()}
-        # Tags that need the full create_media_buy flow (MediaBuyCreateEnv)
-        # rather than account resolution only (MediaBuyAccountEnv).
-        if "account" in marker_names:
-            # Account-resolution scenarios run a full create_media_buy on the wire
-            # (#1417): production resolves the account at the transport
-            # boundary (enrich_identity_with_account → resolve_account) and emits
-            # ACCOUNT_NOT_FOUND/AMBIGUOUS/SETUP_REQUIRED/PAYMENT_REQUIRED/SUSPENDED
-            # — or succeeds — on the wire. MediaBuyCreateEnv gives the create
-            # transport wrappers + the full product/pricing dependency chain; the
-            # account Given steps seed the account rows on top.
-            from tests.harness.media_buy_create import MediaBuyCreateEnv
-
-            with _db_scope_for(request, e2e_config), MediaBuyCreateEnv(e2e_config=e2e_config) as env:
-                tenant, principal, product, pricing_option = env.setup_media_buy_data()
-                ctx["env"] = env
-                ctx["tenant"] = tenant
-                ctx["principal"] = principal
-                ctx["default_product"] = product
-                ctx["default_pricing_option"] = pricing_option
-                yield
-        elif (
-            any(t.startswith("T-UC-002-ext-") for t in marker_names)
-            or "nfr-highvalue" in marker_names
-            or "T-UC-002-nfr-001-enforcement" in marker_names
-        ):
-            # Extension/error scenarios: budget validation, pricing errors, etc.
-            # Plus the nfr-highvalue >$10k Seller-alert scenario (#1417),
-            # and the nfr-001 no-auth rejection scenario (#1417), which
-            # needs the same full create dispatch so each transport's REAL auth
-            # gate (A2A on_message_send no-token gate, REST _require_auth_dep,
-            # MCP boundary) produces the wire rejection.
-            # which needs the same full create_media_buy flow to reach the
-            # pending-approval audit feed.
-            # Use MediaBuyCreateEnv which calls _create_media_buy_impl with real DB.
-            from tests.harness.media_buy_create import MediaBuyCreateEnv
-
-            with _db_scope_for(request, e2e_config), MediaBuyCreateEnv(e2e_config=e2e_config) as env:
-                tenant, principal, product, pricing_option = env.setup_media_buy_data()
-                ctx["env"] = env
-                ctx["tenant"] = tenant
-                ctx["principal"] = principal
-                ctx["default_product"] = product
-                ctx["default_pricing_option"] = pricing_option
-                ctx["dispatch_mode"] = "create"
-                yield
-        elif marker_names & (_UC002_IDEMPOTENCY_WIRED | _UC002_MANUAL_APPROVAL_WIRED) or _is_brand_shorthand_media_buy(
-            marker_names
-        ):
-            if marker_names & _UC002_MANUAL_APPROVAL_WIRED:
-                # Tells the shared When step to dispatch a FULL create through
-                # the parametrized transport (not account resolution). (PR #1567)
-                ctx["uc002_full_create"] = True
-            # v3.1 idempotency replay/missing scenarios — MediaBuyCreateEnv runs a
-            # real create_media_buy through every transport (the replay scenario
-            # creates once, then sends the same key again to exercise the
-            # production replay path). Only the two wired tags go live here; the
-            # remaining @idempotency-key scenarios (in-flight, expired, conflict,
-            # pattern, canonical) stay blanket-xfailed below until their
-            # production gaps + steps are wired.
-            from tests.harness.media_buy_create import MediaBuyCreateEnv
-
-            with _db_scope_for(request, e2e_config), MediaBuyCreateEnv(e2e_config=e2e_config) as env:
-                tenant, principal, product, pricing_option = env.setup_media_buy_data()
-                ctx["env"] = env
-                ctx["tenant"] = tenant
-                ctx["principal"] = principal
-                ctx["default_product"] = product
-                ctx["default_pricing_option"] = pricing_option
-                yield
-        elif "T-UC-002-inv-015-6" in marker_names:
-            pytest.xfail("T-UC-002-inv-015-6 create_media_buy harness wiring is tracked in #1652")
-        else:
-            # Restore the xfail guard every other use case keeps on its catch-all:
-            # non-account / non-extension UC-002 scenarios are NOT yet wired (no
-            # dispatch_mode -> they route to resolve_account_or_error and fail with
-            # "Account reference is required"). Mirror UC-003/004/006/011: xfail them
-            # until each is explicitly wired into a run branch above. Dropping this
-            # line is what flipped ~800 dormant scenarios from xfail to fail.
-            pytest.xfail("UC-002 harness not yet wired for non-extension scenarios")
-
-    elif uc == "UC-003":
-        marker_names = {m.name for m in request.node.iter_markers()}
-        # The targeting-overlay partition/boundary outlines (#1417) need the
-        # same full update flow as ext- scenarios to reach the overlay-validation raise
-        # at media_buy_update.py:444; wire them through MediaBuyDualEnv too.
-        _UC003_TARGETING_OVERLAY = {
-            "T-UC-003-partition-targeting-overlay",
-            "T-UC-003-boundary-targeting-overlay",
-        }
-        # The 3 manual-approval submitted-envelope scenarios (PR #1567) are graded
-        # too (they exercise UpdateMediaBuySubmitted cross-transport, adcp 6.6 /
-        # spec 3.1.1). Every other UC-003 scenario stays dormant; graduating the
-        # full UC-003 file is tracked separately. See the BOUNDED branch below.
-        _UC003_MANUAL_APPROVAL = {
-            "T-UC-003-alt-manual",
-            "T-UC-003-approval-tenant",
-            "T-UC-003-approval-adapter",
-        }
-        if any(t.startswith("T-UC-003-ext-") for t in marker_names) or (marker_names & _UC003_TARGETING_OVERLAY):
-            # Extension/error scenarios: budget, currency, auth, creative,
-            # placement, keyword, and immutable-field validation on the update
-            # path. MediaBuyDualEnv extends MediaBuyCreateEnv with update-module
-            # patches and dispatches UpdateMediaBuyRequest through the update
-            # transport wrappers (_update_media_buy_impl / update_media_buy_raw /
-            # MCP / REST), so update scenarios actually exercise the update flow
-            # against the real DB instead of falling through to _create_media_buy_impl.
-            from tests.harness.media_buy_dual import MediaBuyDualEnv
-
-            with _db_scope_for(request, e2e_config), MediaBuyDualEnv(e2e_config=e2e_config) as env:
-                tenant, principal, product, pricing_option = env.setup_media_buy_data()
-                ctx["env"] = env
-                ctx["tenant"] = tenant
-                ctx["principal"] = principal
-                ctx["default_product"] = product
-                ctx["default_pricing_option"] = pricing_option
-                # Seed an existing media buy + package for update scenarios and
-                # tell the env which media_buy_id the REST update endpoint targets.
-                _setup_existing_media_buy(ctx, env, tenant, principal, product)
-                env._seeded_media_buy_id = ctx["existing_media_buy"].media_buy_id
-                yield
-        elif marker_names & _UC003_MANUAL_APPROVAL:
-            # BOUNDED (PR #1567): the 3 manual-approval submitted-envelope
-            # scenarios are graded here (they exercise UpdateMediaBuySubmitted
-            # cross-transport). Every other non-extension UC-003 scenario stays
-            # dormant via the else below — graduating the full UC-003 file is a
-            # tracked PR #1567 follow-up. This guard is what keeps un-dormanting
-            # UC-003 from turning the suite red.
-            #
-            # UpdateMediaBuy manual-approval scenarios. MediaBuyDualEnv (an IntegrationEnv)
-            # routes an UpdateMediaBuyRequest through IMPL/A2A/MCP/REST. Seed the full create
-            # dependency chain plus a standalone MediaBuy with the literal id the
-            # Background references ("mb_existing") so the update path has a target.
-            request.getfixturevalue("integration_db")
-            from tests.factories import MediaBuyFactory
-            from tests.harness.media_buy_dual import MediaBuyDualEnv
-
-            with MediaBuyDualEnv(e2e_config=ctx.get("e2e_config")) as env:
-                tenant, principal, product, pricing_option = env.setup_media_buy_data()
-                existing_media_buy = MediaBuyFactory(
-                    tenant=tenant,
-                    principal=principal,
-                    media_buy_id="mb_existing",
-                    status="active",
-                )
-                env._commit_factory_data()
-                env._seeded_media_buy_id = "mb_existing"
-                ctx["env"] = env
-                ctx["tenant"] = tenant
-                ctx["principal"] = principal
-                ctx["default_product"] = product
-                ctx["default_pricing_option"] = pricing_option
-                ctx["existing_media_buy"] = existing_media_buy
-                yield
-        else:
-            pytest.xfail(
-                "UC-003 harness not yet wired for non-extension scenarios (full graduation pending, PR #1567 follow-up)"
-            )
-
-    elif uc == "UC-006":
-        marker_names = {m.name for m in request.node.iter_markers()}
-        if marker_names & {"account", "creative-invariant", "BR-RULE-034", "webhook-ssrf"}:
-            # CreativeSyncEnv exercises the full sync_creatives transport wrappers.
-            # @account scenarios drive account resolution (enrich_identity_with_account());
-            # @creative-invariant scenarios (#1399 R3-F2) drive the success-variant
-            # response invariants (e.g. all-failed still returns the success variant);
-            # @BR-RULE-034 scenarios drive cross-principal isolation (triple-key
-            # creative lookup) — dormant until the cross-principal existence-gate
-            # fix (PR #1430 review) made the surface safe to grade.
-            # @webhook-ssrf scenarios grade registration SSRF on push_notification_config.url.
-            from tests.harness.creative_sync import CreativeSyncEnv
-
-            with _db_scope_for(request, e2e_config), CreativeSyncEnv(e2e_config=e2e_config) as env:
-                ctx["env"] = env
-                yield
-        else:
-            pytest.xfail("UC-006 harness not yet wired for non-account scenarios")
-
-    elif uc == "UC-005":
-        from tests.harness.creative_formats import CreativeFormatsEnv
-
-        with _db_scope_for(request, e2e_config), CreativeFormatsEnv(e2e_config=e2e_config) as env:
-            # Seed a tenant ONLY in e2e mode: the live server authenticates the token
-            # against the DB tenant, and UC-005 baseline scenarios carry no account/tenant
-            # Given step to seed it (unlike UC-006/UC-011). In-process the registry is mocked
-            # and the DB is per-test, so the in-process status quo must stay unseeded.
-            # Mirrors the UC-004 poll branch (#1417).
-            if env.e2e_config is not None:
-                env.setup_default_data()
-            ctx["env"] = env
-            yield
-
-    elif uc == "UC-018":
-        # list_creatives — the wired scenarios are @list-after-sync (#1405),
-        # @concept-id (#1407), the @BR-RULE-034 cross-principal isolation
-        # invariants (#1503), and the @BR-RULE-146 explicit-statuses success
-        # invariants (#1502). The remaining UC-018 scenarios (main/partition/
-        # boundary/other filter siblings) have no step definitions yet, so xfail
-        # fast at the fixture (mirrors UC-002/006/011) rather than spinning up a
-        # DB per scenario only to auto-xfail at the first missing step.
-        #
-        # When the dormant all-fields boundary scenarios are wired, their Then must
-        # assert value-when-present, not key-presence-of-13: list_creatives drops a
-        # corrupt tags/assets blob to absent and collapses an empty stored tags list
-        # to omission (both conformant at 3.1.1) — see the #1508 reconciliation note
-        # in test_uc018_list_creatives.py's module docstring.
-        #
-        # BR-RULE-034 is unambiguous here: this branch only runs for T-UC-018-*
-        # scenarios (see _detect_uc), so the tag never collides with the UC-006
-        # BR-RULE-034 scenarios routed elsewhere.
-        marker_names = {m.name for m in request.node.iter_markers()}
-        # @BR-RULE-146 explicit-statuses success invariants wired for #1502 (statuses
-        # match-any). Admitted by exact scenario id, NOT the shared @BR-RULE-146 tag,
-        # because the tag also covers rows that are still dormant. Full dormancy account
-        # for the statuses family (all stay xfailed here, none routed into a failing run):
-        #
-        #   Genuinely blocked (need unimplemented work):
-        #     - inv-146-1-holds + the @default-query `empty_request` / `filters_no_status`
-        #       rows + the @creative-status `Not provided` / @boundary-default-query
-        #       `Empty request` / `filters={}` rows: all depend on the no-filter
-        #       archival-DEFAULT exclusion, a separate unimplemented production feature
-        #       (#1738; inv-146-1-holds has its own named xfail below).
-        #     - the validation-error rows — @creative-status `["deleted"]`, and the
-        #       `[]` (empty-array) / `["unknown"]` rows across @default-query,
-        #       @boundary-default-query and @ext-c: need dict-passthrough validation-error
-        #       wiring so the malformed filter reaches the wire instead of raising
-        #       client-side in the CreativeFilters build (#1652).
-        #
-        #   Implementable but not yet wired (same match-any behavior the wired invariants
-        #   grade, different phrasings — tracked in #2067): the @creative-status
-        #   `processing` / `archived` / `["approved","rejected"] (multi-status)` rows and
-        #   the @default-query `explicit_non_archived_status` / `explicit_archived_status`
-        #   / `mixed_statuses` / `all_statuses_explicit` rows. They sit in Scenario Outlines
-        #   mixed with the #1738/#1652 rows above, so admitting them means splitting those
-        #   generated outlines by tag first (#2067) — until then they stay dormant rather
-        #   than admitted-and-failing on the blocked siblings.
-        _wired_statuses_scenarios = {
-            "T-UC-018-inv-146-2-holds",
-            "T-UC-018-inv-146-2-violated",
-            "T-UC-018-inv-146-3-holds",
-        }
-        if marker_names & ({"list-after-sync", "concept-id", "BR-RULE-034"} | _wired_statuses_scenarios):
-            # CreativeListEnv mocks only the audit logger; DB, repository, and
-            # query building are real. The Background auth step switches the env
-            # principal; the seed step owns the creatives under it.
-            from tests.harness.creative_list import CreativeListEnv
-
-            with _db_scope_for(request, e2e_config), CreativeListEnv(e2e_config=e2e_config) as env:
-                ctx["env"] = env
-                yield
-        elif "T-UC-018-ext-c" in marker_names:
-            pytest.xfail("T-UC-018-ext-c list_creatives validation harness wiring is tracked in #1652")
-        elif "T-UC-018-inv-146-1-holds" in marker_names:
-            pytest.xfail(
-                "BR-RULE-146 INV-1 (no-filter archival-DEFAULT exclusion) is dormant for two "
-                "reasons: (1) the archival-default exclusion is an unimplemented production "
-                "feature (#1738), and (2) its 'list_creatives request with no filters' When "
-                "phrasing has no UC-018 step binding yet. Both the #1738 implementation and the "
-                "When binding must land before this scenario can grade a real red."
-            )
-        else:
-            pytest.xfail(
-                "UC-018 harness wired only for the @list-after-sync (#1405), @concept-id (#1407), "
-                "@BR-RULE-034 isolation (#1503), and @BR-RULE-146 statuses invariants (#1502) scenarios"
-            )
-
-    elif uc == "UC-011":
-        marker_names = {m.name for m in request.node.iter_markers()}
-        harness_type = _detect_uc011_harness(marker_names)
-
-        if harness_type == "list":
-            from tests.harness.account_list import AccountListEnv
-
-            with _db_scope_for(request, e2e_config), AccountListEnv(e2e_config=e2e_config) as env:
-                ctx["env"] = env
-                yield
-        elif harness_type == "sync":
-            from tests.harness.account_sync import AccountSyncEnv
-
-            with _db_scope_for(request, e2e_config), AccountSyncEnv(e2e_config=e2e_config) as env:
-                ctx["env"] = env
-                yield
-        else:
-            pytest.xfail(f"UC-011 harness not yet wired for markers: {marker_names}")
-
-    elif uc == "ADMIN":
-        request.getfixturevalue("integration_db")
-        from tests.harness.admin_accounts import AdminAccountEnv
-
-        # BDD suite always uses integration mode (Flask test_client).
-        # E2E mode (requests.Session + Docker) is tested separately.
-        with AdminAccountEnv(mode="integration") as env:
-            ctx["env"] = env
-            yield
-
-    elif uc == "COMPAT":
-        from tests.harness.product import ProductEnv
-
-        with _db_scope_for(request, e2e_config), ProductEnv(e2e_config=e2e_config) as env:
-            ctx["env"] = env
-            yield
-
-    elif uc == "UC-004":
-        harness_type = _detect_delivery_harness(request)
-
-        if harness_type == "poll":
-            from tests.harness.delivery_poll import DeliveryPollEnv
-
-            # Use "buyer-001" as principal — matches most UC-004 scenarios.
-            # _ensure_media_buy_in_db creates media buys owned by the
-            # scenario's "owner" (usually "buyer-001"), and _impl filters
-            # by the identity's principal. They must match.
-            with (
-                _db_scope_for(request, e2e_config),
-                DeliveryPollEnv(principal_id="buyer-001", e2e_config=e2e_config) as env,
-            ):
-                tenant, principal = env.setup_default_data()
-                ctx["env"] = env
-                ctx["db_tenant"] = tenant
-                ctx[f"db_principal_{env._principal_id}"] = principal
-                yield
-        elif harness_type == "webhook":
-            from tests.harness.delivery_webhook import WebhookEnv
-
-            with _db_scope_for(request, e2e_config), WebhookEnv(e2e_config=e2e_config) as env:
-                env.setup_default_data()
-                ctx["env"] = env
-                yield
-        elif harness_type == "circuit-breaker":
-            from tests.harness.delivery_circuit_breaker import CircuitBreakerEnv
-
-            with _db_scope_for(request, e2e_config), CircuitBreakerEnv(e2e_config=e2e_config) as env:
-                env.setup_default_data()
-                ctx["env"] = env
-                yield
-        elif harness_type == "create":
-            # Webhook-credential-length scenarios dispatch a real create_media_buy
-            # carrying a reporting_webhook so production's Pydantic boundary
-            # (Authentication.credentials MinLen=32) accepts/rejects on the wire.
-            from tests.harness.media_buy_create import MediaBuyCreateEnv
-
-            with _db_scope_for(request, e2e_config), MediaBuyCreateEnv(e2e_config=e2e_config) as env:
-                tenant, principal, product, pricing_option = env.setup_media_buy_data()
-                ctx["env"] = env
-                ctx["tenant"] = tenant
-                ctx["principal"] = principal
-                ctx["default_product"] = product
-                ctx["default_pricing_option"] = pricing_option
-                yield
-        else:
-            pytest.xfail(f"UC-004 harness not yet wired for type: {harness_type}")
-    elif uc == "UC-GET-PRODUCTS":
-        from tests.harness.product import ProductEnv
-
-        with _db_scope_for(request, e2e_config), ProductEnv(e2e_config=e2e_config) as env:
-            ctx["env"] = env
-            yield
-    elif uc == "UC-019":
-        # get_media_buys — MediaBuyListEnv runs the real _get_media_buys_impl and
-        # its A2A/MCP wrappers against a real DB (no adapter mock; list is a pure
-        # read). Scenarios seed buys via factories under ctx["tenant"]/["principal"]
-        # (principal "buyer-001" matches the feature files). Genuine spec-production
-        # gaps stay xfailed via _UC019_XFAIL_TAGS / the selective blocks above.
-        from tests.harness.media_buy_list import MediaBuyListEnv
-
-        with (
-            _db_scope_for(request, e2e_config),
-            MediaBuyListEnv(principal_id="buyer-001", e2e_config=e2e_config) as env,
-        ):
-            tenant, principal = env.setup_default_data()
-            ctx["env"] = env
-            ctx["tenant"] = tenant
-            ctx["principal"] = principal
-            yield
-    else:
-        pytest.xfail(f"No harness wired for {uc}")
+    route = storyboard_spec.resolve_env_route(marker_names, ENV_ROUTES)
+    if route is None:
+        # NOT WIRED is a real answer, not an absence. Each branch UC keeps its own
+        # catch-all row (below) carrying the reason it used to xfail with inline;
+        # reaching here means no row claimed the scenario at all.
+        pytest.xfail(f"No harness wired for {uc} (markers: {sorted(marker_names)})")
+    yield from _run_env_route(request, ctx, route, e2e_config)

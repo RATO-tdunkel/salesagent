@@ -119,6 +119,13 @@ def _assert_one_products_warning(caplog, needle: str):
         f"captured: {[(r.name, r.levelname, r.getMessage()) for r in caplog.records]}"
     )
     assert matches[0].levelno == logging.WARNING, matches[0].levelname
+    # One record, one line. These messages interpolate values that originate outside
+    # the process — a tenant identifier, a provider exception's text — and a line break
+    # in one of them forges a second entry an operator cannot tell from a real one
+    # (CWE-117; CodeQL flagged three sites in this module). Vacuously true for ordinary
+    # values, which is why a caller passing a line-breaking one is what grades it.
+    message = matches[0].getMessage()
+    assert len(message.splitlines()) == 1, f"an interpolated value forged a log line: {message!r}"
     return matches[0]
 
 
@@ -1294,6 +1301,70 @@ class TestRankingFailureAdvisories:
             assert recovery == pinned[code], f"{code}: emit {recovery!r}, pin says {pinned[code]!r}"
             # And the builder actually uses the table rather than a literal of its own.
             assert _unranked_products_advisory("t", code=code, cause="x").recovery == pinned[code]
+
+    @pytest.mark.asyncio
+    async def test_a_tenant_identifier_cannot_forge_a_log_line(self, monkeypatch, caplog):
+        """Both seller-facing warnings that interpolate the tenant id, in one request.
+
+        A tenant carrying BOTH a ranking prompt and an enabled advertising policy, with
+        no AI configuration, trips the ranking notice and the policy notice — the two
+        sites CodeQL flagged besides the provider-exception one. Neither was graded:
+        reverting either ``log_safe`` call left the whole suite green.
+
+        The platform key is removed for the same reason as the sibling advisory test —
+        ``is_ai_enabled`` returns True on it alone, so the ranking notice would not fire.
+        """
+        monkeypatch.delenv("GEMINI_API_KEY", raising=False)
+        monkeypatch.delenv("PYDANTIC_AI_PROVIDER", raising=False)
+
+        from src.services.ai.factory import AIServiceFactory
+
+        keyless_factory = AIServiceFactory()
+
+        forged = "acme\nWARNING [GET_PRODUCTS] ranking completed normally"
+        tenant = _make_tenant()
+        tenant["tenant_id"] = forged
+        tenant["product_ranking_prompt"] = "rank by relevance"
+        tenant["advertising_policy"] = '{"enabled": true}'
+        identity = _make_identity(principal_id="user-1", tenant_id=forged, tenant=tenant)
+
+        mock_uow = _mock_uow_with_products([create_test_product(product_id="prod-a")])
+
+        with contextlib.ExitStack() as stack:
+            for p in _standard_patches(mock_uow):
+                stack.enter_context(p)
+            stack.enter_context(patch("src.services.ai.factory.get_factory", return_value=keyless_factory))
+            stack.enter_context(caplog.at_level(logging.WARNING, logger="src.core.tools.products"))
+
+            from src.core.tools.products import _get_products_impl
+
+            await _get_products_impl(_make_request(), identity)
+
+        # Each helper call asserts the record is a single line.
+        ranking = _assert_one_products_warning(caplog, "no usable AI configuration")
+        policy = _assert_one_products_warning(caplog, "no AI configuration for tenant")
+        for record in (ranking, policy):
+            assert "ranking completed normally" in record.getMessage(), "escaped, not deleted"
+
+    @pytest.mark.asyncio
+    async def test_provider_exception_text_cannot_forge_a_log_line(self, caplog):
+        """The text kept off the wire still reaches the LOG, so it is escaped there.
+
+        CodeQL flagged this site (CWE-117). A provider exception carries the remote
+        response body verbatim, so its text is the one value in this log entry an
+        outside party writes; a newline in it forges a second entry that an operator
+        cannot distinguish from one the application emitted.
+        """
+        forged = "429 Too Many Requests\nWARNING [GET_PRODUCTS] ranking completed normally"
+
+        with caplog.at_level(logging.WARNING, logger="src.core.tools.products"):
+            await self._run_with_failing_rank(RuntimeError(forged))
+
+        records = [r for r in caplog.records if r.name == "src.core.tools.products"]
+        assert len(records) == 1, f"expected one WARNING, got {[r.getMessage() for r in records]}"
+        message = records[0].getMessage()
+        assert len(message.splitlines()) == 1, f"the exception text forged a line: {message!r}"
+        assert "ranking completed normally" in message, "escaped, not deleted — the operator still sees it"
 
 
 class TestAdapterPricingAnnotation:

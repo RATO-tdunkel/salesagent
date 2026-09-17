@@ -39,6 +39,7 @@ from src.core.schemas import (
 from src.core.testing_hooks import AdCPTestContext
 from src.core.tool_context import ToolContext
 from src.core.transport_helpers import resolve_identity_from_context
+from src.core.utils.log_safe import log_safe
 from src.core.validation_helpers import adcp_validation_boundary, safe_parse_json_field
 from src.services.ai.config import TenantAIConfig
 from src.services.policy_check_service import PolicyCheckService, PolicyStatus
@@ -270,7 +271,7 @@ async def _rank_products_with_ai(
             "[GET_PRODUCTS] AI ranking is configured for tenant %s but no usable AI configuration "
             "resolved (tenant ai_config/gemini_api_key: %s; platform environment key: absent). "
             "Returning products unranked.",
-            tenant_id,
+            log_safe(tenant_id),
             "present but unusable" if tenant_ai_config is not None else "absent",
         )
         advisories.append(
@@ -313,11 +314,13 @@ async def _rank_products_with_ai(
             if isinstance(e, AdCPConfigurationError)
             else ("SERVICE_UNAVAILABLE", "the ranking call did not complete")
         )
+        # log_safe on e: a provider exception carries the remote response body
+        # verbatim, so its text is the one value here an outside party writes.
         logger.warning(
             "[GET_PRODUCTS] AI ranking did not run for tenant %s (%s). Returning products unranked. Cause: %s",
-            tenant_id,
+            log_safe(tenant_id),
             cause,
-            e,
+            log_safe(e),
         )
         advisories.append(_unranked_products_advisory(tenant_id, code=code, cause=f"{cause} ({type(e).__name__})"))
         return products
@@ -445,7 +448,7 @@ async def _get_products_impl(
             # No AI configuration - cannot run policy checks
             policy_result = None
             policy_disabled_reason = "no_ai_configuration"
-            logger.warning(f"Policy checks enabled but no AI configuration for tenant {tenant['tenant_id']}")
+            logger.warning("Policy checks enabled but no AI configuration for tenant %s", log_safe(tenant["tenant_id"]))
         else:
             # tenant_ai_config=, not the deprecated gemini_api_key=: that parameter pins
             # provider/model instead of honouring the tenant's own, and its _UNSET
